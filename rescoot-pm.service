@@ -1,0 +1,15 @@
+[Unit]
+Description=Rescoot Power Management Service
+After=redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pm-service
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
