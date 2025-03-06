@@ -1,4 +1,4 @@
-module github.com/rescoot/pm-service
+module github.com/librescoot/pm-service
 
 go 1.22.1
 

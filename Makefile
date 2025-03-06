@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "0.1.0")
 LDFLAGS := -X main.version=$(VERSION)
 GOFLAGS := -trimpath
-BINARY_NAME := rescoot-pm
+BINARY_NAME := librescoot-pm
 INSTALL_PATH := /usr/bin
 
 # Target architecture: ARMv7 for iMX6UL
@@ -38,7 +38,7 @@ deploy-prod: build
 	scp $(BINARY_NAME) $(DEV_TARGET_HOST):$(INSTALL_PATH)/
 	ssh $(DEV_TARGET_HOST) "chmod +x $(INSTALL_PATH)/$(BINARY_NAME)"
 	@echo "To start the service, run:"
-	@echo "  ssh $(DEV_TARGET_HOST) 'systemctl restart rescoot-pm.service'"
+	@echo "  ssh $(DEV_TARGET_HOST) 'systemctl restart librescoot-pm.service'"
 
 clean:
 	@echo "Cleaning..."
@@ -47,13 +47,13 @@ clean:
 
 install: build
 	@echo "Installing $(BINARY_NAME) to $(DEV_TARGET_HOST):$(INSTALL_PATH)..."
-	ssh $(DEV_TARGET_HOST) "systemctl stop rescoot-pm.service"
+	ssh $(DEV_TARGET_HOST) "systemctl stop librescoot-pm.service"
 	scp $(BINARY_NAME) $(DEV_TARGET_HOST):$(INSTALL_PATH)/
 	ssh $(DEV_TARGET_HOST) "chmod +x $(INSTALL_PATH)/$(BINARY_NAME)"
 	@echo "Installing systemd service..."
-	scp rescoot-pm.service $(DEV_TARGET_HOST):/etc/systemd/system/
+	scp librescoot-pm.service $(DEV_TARGET_HOST):/etc/systemd/system/
 	@echo "Reloading systemd and enabling service..."
-	ssh $(DEV_TARGET_HOST) "systemctl daemon-reload && systemctl enable --now rescoot-pm.service"
+	ssh $(DEV_TARGET_HOST) "systemctl daemon-reload && systemctl enable --now librescoot-pm.service"
 	@echo "Installation complete. Service should be running on target device."
 
 test:

@@ -6,7 +6,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/rescoot/pm-service/internal/systemd"
+	"github.com/librescoot/pm-service/internal/systemd"
 )
 
 type PowerState string

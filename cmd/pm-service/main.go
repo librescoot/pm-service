@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/rescoot/pm-service/internal/config"
-	"github.com/rescoot/pm-service/internal/service"
+	"github.com/librescoot/pm-service/internal/config"
+	"github.com/librescoot/pm-service/internal/service"
 )
 
 var version = "0.1.0" // Default version, can be overridden during build
@@ -18,7 +18,7 @@ func main() {
 	if os.Getenv("INVOCATION_ID") != "" {
 		logger = log.New(os.Stdout, "", 0)
 	} else {
-		logger = log.New(os.Stdout, "rescoot-pm: ", log.LstdFlags|log.Lmsgprefix)
+		logger = log.New(os.Stdout, "librescoot-pm: ", log.LstdFlags|log.Lmsgprefix)
 	}
 
 	cfg := config.New()

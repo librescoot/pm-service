@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rescoot/pm-service/internal/config"
-	"github.com/rescoot/pm-service/internal/inhibitor"
-	"github.com/rescoot/pm-service/internal/power"
+	"github.com/librescoot/pm-service/internal/config"
+	"github.com/librescoot/pm-service/internal/inhibitor"
+	"github.com/librescoot/pm-service/internal/power"
 	redis_ipc "github.com/rescoot/redis-ipc"
 )
 

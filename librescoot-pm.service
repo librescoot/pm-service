@@ -1,11 +1,11 @@
 [Unit]
-Description=Rescoot Power Management Service
+Description=Librescoot Power Management Service
 After=redis.service
 Wants=redis.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/pm-service
+ExecStart=/usr/bin/librescoot-pm -dry-run
 Restart=on-failure
 RestartSec=5
 User=root
