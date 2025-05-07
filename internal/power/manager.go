@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/librescoot/pm-service/internal/systemd"
 )
@@ -31,6 +32,9 @@ type Manager struct {
 	onLowPowerStateExit  func()
 	lowPowerModeIssued   bool
 	wakeupSourcePath     string
+	inhibitor            *Inhibitor
+	pendingPowerState    PowerState
+	pendingTimer         *time.Timer
 }
 
 func NewManager(logger *log.Logger, dryRunMode bool, onLowPowerStateEnter func(PowerState), onLowPowerStateExit func()) (*Manager, error) {
@@ -39,7 +43,7 @@ func NewManager(logger *log.Logger, dryRunMode bool, onLowPowerStateEnter func(P
 		return nil, fmt.Errorf("failed to create systemd client: %v", err)
 	}
 
-	return &Manager{
+	manager := &Manager{
 		logger:               logger,
 		systemd:              systemdClient,
 		currentState:         StateRun,
@@ -49,7 +53,10 @@ func NewManager(logger *log.Logger, dryRunMode bool, onLowPowerStateEnter func(P
 		onLowPowerStateExit:  onLowPowerStateExit,
 		lowPowerModeIssued:   false,
 		wakeupSourcePath:     "/sys/power/pm_wakeup_irq",
-	}, nil
+		inhibitor:            NewInhibitor(logger),
+	}
+
+	return manager, nil
 }
 
 func (m *Manager) GetCurrentState() PowerState {
@@ -110,6 +117,53 @@ func (m *Manager) IssueTargetState(state PowerState) error {
 	if state == StateRun {
 		m.logger.Printf("Not issuing power state for run state")
 		return nil
+	}
+
+	// Check if power state changes are allowed
+	canChange, delay, deferred := m.inhibitor.CanChangePowerState()
+	if !canChange {
+		if deferred {
+			// Power state change is completely deferred
+			m.logger.Printf("Power state change to %s is deferred due to active inhibitors", state)
+
+			// Store the pending power state for later
+			m.mutex.Lock()
+			m.pendingPowerState = state
+			m.mutex.Unlock()
+
+			return nil
+		} else if delay > 0 {
+			// Power state change is delayed
+			m.logger.Printf("Power state change to %s is delayed for %v due to active inhibitors", state, delay)
+
+			// Store the pending power state and set a timer
+			m.mutex.Lock()
+			m.pendingPowerState = state
+
+			// Cancel any existing timer
+			if m.pendingTimer != nil {
+				m.pendingTimer.Stop()
+			}
+
+			// Set a new timer
+			m.pendingTimer = time.AfterFunc(delay, func() {
+				m.mutex.Lock()
+				pendingState := m.pendingPowerState
+				m.pendingPowerState = ""
+				m.pendingTimer = nil
+				m.mutex.Unlock()
+
+				// Issue the pending power state
+				if pendingState != "" {
+					m.logger.Printf("Executing delayed power state change to %s", pendingState)
+					m.IssueTargetState(pendingState)
+				}
+			})
+
+			m.mutex.Unlock()
+
+			return nil
+		}
 	}
 
 	if m.dryRunMode {
@@ -173,6 +227,39 @@ func (m *Manager) IsLowPowerStateIssued() bool {
 	return m.lowPowerModeIssued
 }
 
+// AddInhibit adds a power inhibit request
+func (m *Manager) AddInhibit(req InhibitRequest) error {
+	return m.inhibitor.AddInhibit(req)
+}
+
+// RemoveInhibit removes a power inhibit request
+func (m *Manager) RemoveInhibit(id string) error {
+	return m.inhibitor.RemoveInhibit(id)
+}
+
+// HasInhibit checks if a specific inhibit exists
+func (m *Manager) HasInhibit(id string) bool {
+	return m.inhibitor.HasInhibit(id)
+}
+
+// GetInhibits returns all current inhibits
+func (m *Manager) GetInhibits() map[string]InhibitRequest {
+	return m.inhibitor.GetInhibits()
+}
+
+// RegisterInhibitCallback registers a callback to be executed when an inhibit is removed
+func (m *Manager) RegisterInhibitCallback(id string, callback func()) {
+	m.inhibitor.RegisterCallback(id, callback)
+}
+
 func (m *Manager) Close() error {
+	// Cancel any pending timer
+	m.mutex.Lock()
+	if m.pendingTimer != nil {
+		m.pendingTimer.Stop()
+		m.pendingTimer = nil
+	}
+	m.mutex.Unlock()
+
 	return m.systemd.Close()
 }
