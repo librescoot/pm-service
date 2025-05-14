@@ -218,6 +218,12 @@ func (s *Service) onPowerCommand(data []byte) error {
 	command := string(data)
 	s.logger.Printf("Received power command: %s", command)
 
+	// Log current state information for debugging
+	s.mutex.RLock()
+	s.logger.Printf("Current state - Vehicle: %s, Battery: %s, Target power: %s",
+		s.vehicleState, s.batteryState, s.powerManager.GetTargetState())
+	s.mutex.RUnlock()
+
 	switch command {
 	case "run":
 		s.powerManager.SetTargetState(power.StateRun)
@@ -235,8 +241,18 @@ func (s *Service) onPowerCommand(data []byte) error {
 		return fmt.Errorf("unknown power command: %s", command)
 	}
 
-	if s.canEnterLowPowerState() && !s.powerManager.IsLowPowerStateIssued() && s.powerManager.GetTargetState() != power.StateRun {
+	canEnter := s.canEnterLowPowerState()
+	isIssued := s.powerManager.IsLowPowerStateIssued()
+	targetState := s.powerManager.GetTargetState()
+
+	s.logger.Printf("Power state check - Can enter low power: %v, Is issued: %v, Target state: %s",
+		canEnter, isIssued, targetState)
+
+	if canEnter && !isIssued && targetState != power.StateRun {
+		s.logger.Printf("Starting suspend imminent timer for target state: %s", targetState)
 		s.startSuspendImminentTimer()
+	} else {
+		s.logger.Printf("Not starting suspend imminent timer, conditions not met")
 	}
 
 	return nil
@@ -337,11 +353,26 @@ func (s *Service) canEnterLowPowerState() bool {
 	s.mutex.RLock()
 	defer s.mutex.RUnlock()
 
+	targetState := s.powerManager.GetTargetState()
+
+	// Special case for reboot - allow in both stand-by and shutting-down states
+	if targetState == power.StateReboot {
+		if s.vehicleState != "stand-by" && s.vehicleState != "shutting-down" {
+			s.logger.Printf("Cannot enter reboot state: vehicle state is %s (needs stand-by or shutting-down)",
+				s.vehicleState)
+			return false
+		}
+		return true
+	}
+
+	// Regular check for other power states
 	if s.vehicleState != "stand-by" {
+		s.logger.Printf("Cannot enter low power state: vehicle state is %s (needs stand-by)", s.vehicleState)
 		return false
 	}
 
-	if s.powerManager.GetTargetState() == power.StateSuspend && s.batteryState == "active" {
+	if targetState == power.StateSuspend && s.batteryState == "active" {
+		s.logger.Printf("Cannot enter suspend state: battery state is active")
 		return false
 	}
 
@@ -464,11 +495,13 @@ func (s *Service) stopHibernationTimer() {
 
 func (s *Service) issueLowPowerState() {
 	if s.powerManager.IsLowPowerStateIssued() {
+		s.logger.Printf("Low power state already issued, skipping")
 		return
 	}
 
 	state := s.powerManager.GetTargetState()
 	if state == power.StateRun {
+		s.logger.Printf("Target state is run, not issuing low power state")
 		return
 	}
 
@@ -476,6 +509,8 @@ func (s *Service) issueLowPowerState() {
 
 	if err := s.powerManager.IssueTargetState(state); err != nil {
 		s.logger.Printf("Failed to issue low power state: %v", err)
+	} else {
+		s.logger.Printf("Successfully issued low power state command: %s", state)
 	}
 }
 
