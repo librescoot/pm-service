@@ -8,18 +8,25 @@ import (
 	"time"
 
 	"github.com/librescoot/pm-service/internal/config"
+	"github.com/librescoot/pm-service/internal/hardware"
+	"github.com/librescoot/pm-service/internal/hibernation"
 	"github.com/librescoot/pm-service/internal/inhibitor"
 	"github.com/librescoot/pm-service/internal/power"
+	"github.com/redis/go-redis/v9"
 	redis_ipc "github.com/rescoot/redis-ipc"
 )
 
 type Service struct {
-	config           *config.Config
-	logger           *log.Logger
-	redis            *redis_ipc.Client
-	powerManager     *power.Manager
-	inhibitorManager *inhibitor.Manager
-	delayInhibitor   *inhibitor.Inhibitor
+	config              *config.Config
+	logger              *log.Logger
+	redis               *redis_ipc.Client
+	powerManager        *power.Manager
+	inhibitorManager    *inhibitor.Manager
+	hardwareManager     *hardware.Manager
+	hardwareListener    *hardware.RedisListener
+	hibernationSM       *hibernation.StateMachine
+	hibernationListener *hibernation.RedisListener
+	delayInhibitor      *inhibitor.Inhibitor
 
 	mutex        sync.RWMutex
 	vehicleState string
@@ -84,6 +91,43 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		inhibitor.TypeDelay,
 	)
 
+	// Create standard Redis client for hardware manager
+	ctx := context.Background()
+	standardRedisClient := redis.NewClient(&redis.Options{
+		Addr: fmt.Sprintf("%s:%d", cfg.RedisHost, cfg.RedisPort),
+		DB:   0,
+	})
+
+	// Create hardware manager
+	hardwareManager, err := hardware.NewManager(ctx, standardRedisClient, logger, cfg.DryRun)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create hardware manager: %w", err)
+	}
+	service.hardwareManager = hardwareManager
+
+	// Initialize hardware state in Redis
+	if err := hardwareManager.InitializeRedisState(); err != nil {
+		return nil, fmt.Errorf("failed to initialize hardware state: %w", err)
+	}
+
+	// Create hardware Redis listener
+	hardwareListener := hardware.NewRedisListener(ctx, standardRedisClient, hardwareManager, logger)
+	service.hardwareListener = hardwareListener
+
+	// Create hibernation state machine
+	hibernationSM := hibernation.NewStateMachine(ctx, standardRedisClient, logger, func() {
+		// Callback when hibernation sequence completes
+		service.powerManager.SetTargetState(power.StateHibernateManual)
+		if service.canEnterLowPowerState() {
+			service.startSuspendImminentTimer()
+		}
+	})
+	service.hibernationSM = hibernationSM
+
+	// Create hibernation Redis listener
+	hibernationListener := hibernation.NewRedisListener(ctx, standardRedisClient, hibernationSM, logger)
+	service.hibernationListener = hibernationListener
+
 	switch cfg.DefaultState {
 	case "run":
 		service.powerManager.SetTargetState(power.StateRun)
@@ -117,6 +161,16 @@ func (s *Service) Run(ctx context.Context) error {
 
 	_ = s.redis.HandleRequests("scooter:power", s.onPowerCommand)
 
+	// Start hardware Redis listener
+	if err := s.hardwareListener.Start(); err != nil {
+		return fmt.Errorf("failed to start hardware listener: %v", err)
+	}
+
+	// Start hibernation Redis listener
+	if err := s.hibernationListener.Start(); err != nil {
+		return fmt.Errorf("failed to start hibernation listener: %v", err)
+	}
+
 	vehicleState, err := s.redis.HGet("vehicle", "state")
 	if err == nil {
 		s.vehicleState = vehicleState
@@ -143,6 +197,10 @@ func (s *Service) Run(ctx context.Context) error {
 		s.hibernationTimer.Stop()
 	}
 
+	// Stop listeners
+	s.hardwareListener.Stop()
+	s.hibernationListener.Stop()
+
 	if err := s.powerManager.Close(); err != nil {
 		s.logger.Printf("Failed to close power manager: %v", err)
 	}
@@ -150,6 +208,12 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.inhibitorManager.Close(); err != nil {
 		s.logger.Printf("Failed to close inhibitor manager: %v", err)
 	}
+
+	if err := s.hardwareManager.Close(); err != nil {
+		s.logger.Printf("Failed to close hardware manager: %v", err)
+	}
+
+	s.hibernationSM.Close()
 
 	if err := s.redis.Close(); err != nil {
 		s.logger.Printf("Failed to close Redis client: %v", err)
