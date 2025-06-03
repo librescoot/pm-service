@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,11 +21,13 @@ type Service struct {
 	config              *config.Config
 	logger              *log.Logger
 	redis               *redis_ipc.Client
+	standardRedis       *redis.Client
 	powerManager        *power.Manager
 	inhibitorManager    *inhibitor.Manager
 	hardwareManager     *hardware.Manager
 	hardwareListener    *hardware.RedisListener
 	hibernationSM       *hibernation.StateMachine
+	hibernationTimer    *hibernation.Timer
 	hibernationListener *hibernation.RedisListener
 	delayInhibitor      *inhibitor.Inhibitor
 
@@ -34,7 +37,6 @@ type Service struct {
 
 	preSuspendTimer      *time.Timer
 	suspendImminentTimer *time.Timer
-	hibernationTimer     *time.Timer
 
 	lpmImminentTimerElapsed bool
 	modemDisabled           bool
@@ -53,10 +55,18 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		return nil, fmt.Errorf("failed to create Redis client: %v", err)
 	}
 
+	// Create standard Redis client for hardware manager and hibernation timer
+	ctx := context.Background()
+	standardRedisClient := redis.NewClient(&redis.Options{
+		Addr: fmt.Sprintf("%s:%d", cfg.RedisHost, cfg.RedisPort),
+		DB:   0,
+	})
+
 	service := &Service{
 		config:                  cfg,
 		logger:                  logger,
 		redis:                   redisClient,
+		standardRedis:           standardRedisClient,
 		vehicleState:            "",
 		batteryState:            "",
 		lpmImminentTimerElapsed: false,
@@ -91,15 +101,9 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		inhibitor.TypeDelay,
 	)
 
-	// Create standard Redis client for hardware manager
-	ctx := context.Background()
-	standardRedisClient := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", cfg.RedisHost, cfg.RedisPort),
-		DB:   0,
-	})
 
 	// Create hardware manager
-	hardwareManager, err := hardware.NewManager(ctx, standardRedisClient, logger, cfg.DryRun)
+	hardwareManager, err := hardware.NewManager(ctx, service.standardRedis, logger, cfg.DryRun)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create hardware manager: %w", err)
 	}
@@ -111,11 +115,11 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 	}
 
 	// Create hardware Redis listener
-	hardwareListener := hardware.NewRedisListener(ctx, standardRedisClient, hardwareManager, logger)
+	hardwareListener := hardware.NewRedisListener(ctx, service.standardRedis, hardwareManager, logger)
 	service.hardwareListener = hardwareListener
 
 	// Create hibernation state machine
-	hibernationSM := hibernation.NewStateMachine(ctx, standardRedisClient, logger, func() {
+	hibernationSM := hibernation.NewStateMachine(ctx, service.standardRedis, logger, func() {
 		// Callback when hibernation sequence completes
 		service.powerManager.SetTargetState(power.StateHibernateManual)
 		if service.canEnterLowPowerState() {
@@ -124,8 +128,21 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 	})
 	service.hibernationSM = hibernationSM
 
+	// Create hibernation timer
+	hibernationTimer := hibernation.NewTimer(
+		ctx,
+		service.standardRedis,
+		logger,
+		cfg.HibernationTimer, // Default hibernation timer duration
+		func() {
+			// Execute hibernation when timer expires
+			service.executeHibernationTimer()
+		},
+	)
+	service.hibernationTimer = hibernationTimer
+
 	// Create hibernation Redis listener
-	hibernationListener := hibernation.NewRedisListener(ctx, standardRedisClient, hibernationSM, logger)
+	hibernationListener := hibernation.NewRedisListener(ctx, service.standardRedis, hibernationSM, logger)
 	service.hibernationListener = hibernationListener
 
 	switch cfg.DefaultState {
@@ -171,6 +188,9 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start hibernation listener: %v", err)
 	}
 
+	// Start hibernation timer settings listener
+	go s.listenForHibernationSettings(ctx, s.standardRedis)
+
 	vehicleState, err := s.redis.HGet("vehicle", "state")
 	if err == nil {
 		s.vehicleState = vehicleState
@@ -193,9 +213,6 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.suspendImminentTimer != nil {
 		s.suspendImminentTimer.Stop()
 	}
-	if s.hibernationTimer != nil {
-		s.hibernationTimer.Stop()
-	}
 
 	// Stop listeners
 	s.hardwareListener.Stop()
@@ -214,6 +231,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	s.hibernationSM.Close()
+	s.hibernationTimer.Close()
 
 	if err := s.redis.Close(); err != nil {
 		s.logger.Printf("Failed to close Redis client: %v", err)
@@ -248,9 +266,9 @@ func (s *Service) onVehicleState(data []byte) error {
 	}
 
 	if vehicleState == "stand-by" {
-		s.startHibernationTimer()
+		s.hibernationTimer.ResetTimer(true)
 	} else {
-		s.stopHibernationTimer()
+		s.hibernationTimer.ResetTimer(false)
 	}
 
 	return nil
@@ -532,28 +550,47 @@ func (s *Service) stopSuspendImminentTimer() {
 	}
 }
 
-func (s *Service) startHibernationTimer() {
-	if s.hibernationTimer != nil {
-		s.hibernationTimer.Stop()
+// executeHibernationTimer handles hibernation timer expiration
+func (s *Service) executeHibernationTimer() {
+	s.logger.Printf("Hibernation timer expired, executing timer-based hibernation")
+	s.powerManager.SetTargetState(power.StateHibernateTimer)
+	if s.canEnterLowPowerState() {
+		s.startSuspendImminentTimer()
 	}
-
-	s.hibernationTimer = time.AfterFunc(s.config.HibernationTimer, func() {
-		s.mutex.Lock()
-		defer s.mutex.Unlock()
-
-		s.logger.Printf("Hibernation timer elapsed")
-		s.powerManager.SetTargetState(power.StateHibernateTimer)
-
-		if s.canEnterLowPowerState() {
-			s.startSuspendImminentTimer()
-		}
-	})
 }
 
-func (s *Service) stopHibernationTimer() {
-	if s.hibernationTimer != nil {
-		s.hibernationTimer.Stop()
-		s.hibernationTimer = nil
+// listenForHibernationSettings listens for hibernation timer setting changes
+func (s *Service) listenForHibernationSettings(ctx context.Context, redis *redis.Client) {
+	// Subscribe to settings changes
+	pubsub := redis.Subscribe(ctx, "settings")
+	defer pubsub.Close()
+
+	// Load initial hibernation timer setting
+	s.loadHibernationTimerSetting(redis)
+
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			if msg.Payload == "hibernation-timer" {
+				s.loadHibernationTimerSetting(redis)
+			}
+		}
+	}
+}
+
+// loadHibernationTimerSetting loads the hibernation timer setting from Redis
+func (s *Service) loadHibernationTimerSetting(redis *redis.Client) {
+	result := redis.HGet(context.Background(), "settings", "hibernation-timer")
+	if result.Err() == nil {
+		if timerValue, err := strconv.ParseInt(result.Val(), 10, 32); err == nil {
+			s.hibernationTimer.SetTimerValue(int32(timerValue))
+			s.logger.Printf("Updated hibernation timer setting: %d seconds", timerValue)
+		} else {
+			s.logger.Printf("Failed to parse hibernation timer setting: %v", err)
+		}
 	}
 }
 
