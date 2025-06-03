@@ -5,7 +5,7 @@ Wants=redis.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/pm-service
+ExecStart=/usr/bin/pm-service -default-state run
 Restart=on-failure
 RestartSec=5
 User=root
