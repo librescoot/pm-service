@@ -3,7 +3,6 @@ module github.com/librescoot/pm-service
 go 1.22.1
 
 require (
-	github.com/godbus/dbus/v5 v5.1.0
 	github.com/redis/go-redis/v9 v9.7.0
 	github.com/rescoot/redis-ipc v0.2.0
 )
