@@ -11,16 +11,16 @@ import (
 
 // Timer manages the hibernation timer that triggers hibernation after extended standby
 type Timer struct {
-	mutex             sync.RWMutex
-	logger            *log.Logger
-	redis             *redis.Client
-	ctx               context.Context
-	timer             *time.Timer
-	timerDuration     time.Duration
-	lastActivateTime  time.Time
-	active            bool // Vehicle is in standby
-	enabled           bool // Timer value > 0
-	onHibernateTimer  func() // Callback when hibernation timer triggers
+	mutex            sync.RWMutex
+	logger           *log.Logger
+	redis            *redis.Client
+	ctx              context.Context
+	timer            *time.Timer
+	timerDuration    time.Duration
+	lastActivateTime time.Time
+	active           bool   // Vehicle is in standby
+	enabled          bool   // Timer value > 0
+	onHibernateTimer func() // Callback when hibernation timer triggers
 }
 
 // NewTimer creates a new hibernation timer
@@ -47,7 +47,7 @@ func (t *Timer) SetTimerValue(timerValueSeconds int32) {
 	defer t.mutex.Unlock()
 
 	t.timerDuration = time.Duration(timerValueSeconds) * time.Second
-	
+
 	if timerValueSeconds == 0 {
 		t.enabled = false
 		t.stopTimer()
@@ -55,7 +55,7 @@ func (t *Timer) SetTimerValue(timerValueSeconds int32) {
 	} else {
 		wasEnabled := t.enabled
 		t.enabled = true
-		
+
 		if t.active {
 			if wasEnabled {
 				// Timer was already running, update it
@@ -63,7 +63,7 @@ func (t *Timer) SetTimerValue(timerValueSeconds int32) {
 				if t.timerDuration > timeSinceLastActivate {
 					updatedTimer := t.timerDuration - timeSinceLastActivate
 					t.startTimer(updatedTimer)
-					t.logger.Printf("Hibernation timer updated with %d seconds remaining", 
+					t.logger.Printf("Hibernation timer updated with %d seconds remaining",
 						int32(updatedTimer.Seconds()))
 				} else {
 					// Timer should have already triggered, trigger immediately
@@ -73,7 +73,7 @@ func (t *Timer) SetTimerValue(timerValueSeconds int32) {
 			} else {
 				// Timer was disabled, now enabled with active vehicle
 				t.startTimer(t.timerDuration)
-				t.logger.Printf("Hibernation timer started with %d seconds", 
+				t.logger.Printf("Hibernation timer started with %d seconds",
 					int32(t.timerDuration.Seconds()))
 			}
 		}
@@ -95,14 +95,14 @@ func (t *Timer) ResetTimer(activate bool) {
 		// Vehicle entering standby, start timer
 		t.lastActivateTime = time.Now()
 		t.startTimer(t.timerDuration)
-		t.logger.Printf("Hibernation timer started with %d seconds", 
+		t.logger.Printf("Hibernation timer started with %d seconds",
 			int32(t.timerDuration.Seconds()))
 	} else if !activate && t.active {
 		// Vehicle leaving standby, stop timer
 		t.stopTimer()
 		t.logger.Printf("Hibernation timer stopped")
 	}
-	
+
 	t.active = activate
 }
 
@@ -145,7 +145,7 @@ func (t *Timer) onTimer() {
 	}
 
 	t.logger.Printf("Hibernation timer expired, triggering hibernation")
-	
+
 	if t.onHibernateTimer != nil {
 		t.onHibernateTimer()
 	}

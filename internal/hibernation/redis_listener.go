@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -33,7 +32,6 @@ func NewRedisListener(ctx context.Context, redisClient *redis.Client, stateMachi
 // Start begins listening for hibernation-related input events
 func (rl *RedisListener) Start() error {
 	go rl.listenForInputEvents()
-	go rl.listenForHibernationCommands()
 	return nil
 }
 
@@ -59,44 +57,11 @@ func (rl *RedisListener) listenForInputEvents() {
 	}
 }
 
-// listenForHibernationCommands handles direct hibernation commands
-func (rl *RedisListener) listenForHibernationCommands() {
-	for {
-		select {
-		case <-rl.ctx.Done():
-			return
-		default:
-			// Block for up to 1 second waiting for commands
-			result, err := rl.redis.BRPop(rl.ctx, time.Second, "scooter:hibernation").Result()
-			if err != nil {
-				if err == redis.Nil {
-					continue // Timeout, continue listening
-				}
-				if strings.Contains(err.Error(), "context canceled") {
-					return
-				}
-				rl.logger.Printf("Error reading from scooter:hibernation: %v", err)
-				time.Sleep(time.Second)
-				continue
-			}
-
-			if len(result) != 2 {
-				continue
-			}
-
-			command := result[1]
-			rl.handleHibernationCommand(command)
-		}
-	}
-}
-
 // handleInputEvent processes input events for hibernation sequence
 func (rl *RedisListener) handleInputEvent(channel, payload string) {
 	switch channel {
 	case "buttons":
 		// Parse button events for hibernation trigger
-		// This would need to be customized based on the actual button mapping
-		// For example, holding both brake buttons + seatbox button for hibernation
 		if strings.Contains(payload, "hibernation") {
 			if strings.Contains(payload, "pressed") {
 				rl.stateMachine.ProcessInput("hibernation_input", "pressed")
@@ -126,27 +91,5 @@ func (rl *RedisListener) handleInputEvent(channel, payload string) {
 				}
 			}
 		}
-	}
-}
-
-// handleHibernationCommand processes direct hibernation commands
-func (rl *RedisListener) handleHibernationCommand(command string) {
-	rl.logger.Printf("Received hibernation command: %s", command)
-
-	switch command {
-	case "start":
-		rl.stateMachine.StartHibernationSequence()
-	case "cancel":
-		rl.stateMachine.CancelSequence()
-	case "input-pressed":
-		rl.stateMachine.ProcessInput("hibernation_input", "pressed")
-	case "input-released":
-		rl.stateMachine.ProcessInput("hibernation_input", "released")
-	case "seatbox-closed":
-		rl.stateMachine.ProcessInput("seatbox", "closed")
-	case "seatbox-opened":
-		rl.stateMachine.ProcessInput("seatbox", "opened")
-	default:
-		rl.logger.Printf("Unknown hibernation command: %s", command)
 	}
 }
