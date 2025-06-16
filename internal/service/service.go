@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"strconv"
 	"sync"
 	"time"
@@ -157,7 +158,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	_ = s.redis.HandleRequests("scooter:power", s.onPowerCommand)
-
+	_ = s.redis.HandleRequests("scooter:governor", s.onGovernorCommand)
 
 	// Start hibernation Redis listener
 	if err := s.hibernationListener.Start(); err != nil {
@@ -176,6 +177,10 @@ func (s *Service) Run(ctx context.Context) error {
 	if err == nil {
 		s.batteryState = batteryState
 	}
+
+	// Set initial power manager state in Redis based on current target state
+	currentTargetState := s.powerManager.GetTargetState()
+	s.publishState(string(currentTargetState))
 
 	if s.canEnterLowPowerState() {
 		s.startPreSuspendTimer()
@@ -200,7 +205,6 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.inhibitorManager.Close(); err != nil {
 		s.logger.Printf("Failed to close inhibitor manager: %v", err)
 	}
-
 
 	s.hibernationSM.Close()
 	s.hibernationTimer.Close()
@@ -587,16 +591,102 @@ func (s *Service) issueLowPowerState() {
 	}
 }
 
+// mapPowerStateToRedis converts power state to Redis state format
+func (s *Service) mapPowerStateToRedis(state string) string {
+	switch state {
+	case "run":
+		return "running"
+	case "suspend":
+		return "suspending"
+	case "hibernate":
+		return "hibernating"
+	case "hibernate-manual":
+		return "hibernating-manual"
+	case "hibernate-timer":
+		return "hibernating-timer"
+	case "reboot":
+		return "reboot"
+	case "suspend-imminent":
+		return "suspending-imminent"
+	case "hibernate-imminent":
+		return "hibernating-imminent"
+	case "hibernate-manual-imminent":
+		return "hibernating-manual-imminent"
+	case "hibernate-timer-imminent":
+		return "hibernating-timer-imminent"
+	case "reboot-imminent":
+		return "reboot-imminent"
+	default:
+		return state
+	}
+}
+
 func (s *Service) publishState(state string) {
-	s.logger.Printf("Publishing power state: %s", state)
+	redisState := s.mapPowerStateToRedis(state)
+	s.logger.Printf("Publishing power state: %s (Redis: %s)", state, redisState)
 
 	tx := s.redis.NewTxGroup("power-state")
 
-	tx.Add("HSET", "power-manager", "state", state)
+	tx.Add("HSET", "power-manager", "state", redisState)
 
 	tx.Add("PUBLISH", "power-manager", "state")
 
 	if _, err := tx.Exec(); err != nil {
 		s.logger.Printf("Failed to publish power state: %v", err)
 	}
+}
+
+// onGovernorCommand handles CPU governor change requests
+func (s *Service) onGovernorCommand(data []byte) error {
+	governor := string(data)
+	s.logger.Printf("Received governor command: %s", governor)
+
+	// Validate governor value
+	switch governor {
+	case "ondemand", "powersave", "performance":
+		// Valid governors
+	default:
+		s.logger.Printf("Invalid governor command: %s", governor)
+		return fmt.Errorf("invalid governor command: %s", governor)
+	}
+
+	return s.setGovernor(governor)
+}
+
+// setGovernor changes the CPU governor and publishes the change
+func (s *Service) setGovernor(governor string) error {
+	s.logger.Printf("Setting CPU governor to: %s", governor)
+
+	// Use the direct sysfs interface to change the CPU governor
+	governorPath := "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+
+	// Execute the change using shell command for reliability
+	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo %s > %s", governor, governorPath))
+	if err := cmd.Run(); err != nil {
+		s.logger.Printf("Failed to set CPU governor to %s: %v", governor, err)
+		return fmt.Errorf("failed to set CPU governor to %s: %w", governor, err)
+	}
+
+	s.logger.Printf("Successfully set CPU governor to %s", governor)
+
+	// Publish the governor change to Redis
+	if err := s.publishGovernorChange(governor); err != nil {
+		s.logger.Printf("Warning: Failed to publish governor change to Redis: %v", err)
+	}
+
+	return nil
+}
+
+// publishGovernorChange publishes governor changes to Redis
+func (s *Service) publishGovernorChange(governor string) error {
+	tx := s.redis.NewTxGroup("governor")
+
+	tx.Add("HSET", "system", "cpu:governor", governor)
+	tx.Add("PUBLISH", "system", "cpu:governor")
+
+	if _, err := tx.Exec(); err != nil {
+		return fmt.Errorf("failed to publish governor change: %w", err)
+	}
+
+	return nil
 }
