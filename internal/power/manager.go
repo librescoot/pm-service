@@ -121,6 +121,7 @@ func (m *Manager) IssueTargetState(state PowerState) error {
 
 	// Check if power state changes are allowed
 	canChange, delay, deferred := m.inhibitor.CanChangePowerState()
+
 	if !canChange {
 		if deferred {
 			// Power state change is completely deferred

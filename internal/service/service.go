@@ -157,8 +157,8 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to subscribe to battery state: %v", err)
 	}
 
-	_ = s.redis.HandleRequests("scooter:power", s.onPowerCommand)
-	_ = s.redis.HandleRequests("scooter:governor", s.onGovernorCommand)
+	s.redis.HandleRequests("scooter:power", s.onPowerCommand)
+	s.redis.HandleRequests("scooter:governor", s.onGovernorCommand)
 
 	// Start hibernation Redis listener
 	if err := s.hibernationListener.Start(); err != nil {
@@ -278,9 +278,13 @@ func (s *Service) onPowerCommand(data []byte) error {
 
 	// Log current state information for debugging
 	s.mutex.RLock()
-	s.logger.Printf("Current state - Vehicle: %s, Battery: %s, Target power: %s",
-		s.vehicleState, s.batteryState, s.powerManager.GetTargetState())
+	vehicleState := s.vehicleState
+	batteryState := s.batteryState
 	s.mutex.RUnlock()
+
+	currentTargetState := s.powerManager.GetTargetState()
+	s.logger.Printf("Current state - Vehicle: %s, Battery: %s, Target power: %s",
+		vehicleState, batteryState, currentTargetState)
 
 	switch command {
 	case "run":
