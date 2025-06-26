@@ -447,14 +447,7 @@ func (s *Service) startPreSuspendTimer() {
 	}
 
 	s.preSuspendTimer = time.AfterFunc(s.config.PreSuspendDelay, func() {
-		s.mutex.Lock()
-		defer s.mutex.Unlock()
-
-		s.logger.Printf("Pre-suspend timer elapsed")
-
-		if s.canEnterLowPowerState() {
-			s.startSuspendImminentTimer()
-		}
+		go s.handlePreSuspendElapsed()
 	})
 }
 
@@ -462,6 +455,17 @@ func (s *Service) stopPreSuspendTimer() {
 	if s.preSuspendTimer != nil {
 		s.preSuspendTimer.Stop()
 		s.preSuspendTimer = nil
+	}
+}
+
+func (s *Service) handlePreSuspendElapsed() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	s.logger.Printf("Pre-suspend timer elapsed")
+
+	if s.canEnterLowPowerState() {
+		s.startSuspendImminentTimer()
 	}
 }
 
@@ -473,20 +477,24 @@ func (s *Service) startSuspendImminentTimer() {
 	s.publishState(string(s.powerManager.GetTargetState()) + "-imminent")
 
 	s.suspendImminentTimer = time.AfterFunc(s.config.SuspendImminentDelay, func() {
-		s.mutex.Lock()
-		defer s.mutex.Unlock()
-
-		s.logger.Printf("Suspend imminent timer elapsed")
-		s.lpmImminentTimerElapsed = true
-
-		if s.hasOnlyModemBlockingInhibitors() {
-			s.disableModem()
-		}
-
-		if !s.inhibitorManager.HasBlockingInhibitors() && !s.powerManager.IsLowPowerStateIssued() {
-			s.issueLowPowerState()
-		}
+		go s.handleSuspendImminentElapsed()
 	})
+}
+
+func (s *Service) handleSuspendImminentElapsed() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	s.logger.Printf("Suspend imminent timer elapsed")
+	s.lpmImminentTimerElapsed = true
+
+	if s.hasOnlyModemBlockingInhibitors() {
+		s.disableModem()
+	}
+
+	if !s.inhibitorManager.HasBlockingInhibitors() && !s.powerManager.IsLowPowerStateIssued() {
+		s.issueLowPowerState()
+	}
 }
 
 func (s *Service) hasOnlyModemBlockingInhibitors() bool {
