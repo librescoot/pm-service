@@ -217,25 +217,30 @@ func (s *Service) Run(ctx context.Context) error {
 }
 
 func (s *Service) onVehicleState(data []byte) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	vehicleState, err := s.redis.HGet("vehicle", "state")
 	if err != nil {
 		return fmt.Errorf("failed to get vehicle state: %v", err)
 	}
 
-	if s.vehicleState == "stand-by" && vehicleState != "stand-by" {
+	s.mutex.Lock()
+	oldVehicleState := s.vehicleState
+	s.vehicleState = vehicleState
+	s.mutex.Unlock()
+
+	s.logger.Printf("Vehicle state: %s", vehicleState)
+
+	if oldVehicleState == "stand-by" && vehicleState != "stand-by" {
 		s.logger.Printf("Vehicle state changed from stand-by to %s, aborting low power mode", vehicleState)
 		s.powerManager.SetTargetState(power.StateRun)
 		s.stopSuspendImminentTimer()
 		s.stopPreSuspendTimer()
+		
+		s.mutex.Lock()
 		s.modemDisabled = false
+		s.mutex.Unlock()
+		
 		s.publishState(string(power.StateRun))
 	}
-
-	s.vehicleState = vehicleState
-	s.logger.Printf("Vehicle state: %s", vehicleState)
 
 	if s.canEnterLowPowerState() {
 		s.startPreSuspendTimer()
@@ -251,15 +256,15 @@ func (s *Service) onVehicleState(data []byte) error {
 }
 
 func (s *Service) onBatteryState(data []byte) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	batteryState, err := s.redis.HGet("battery:0", "state")
 	if err != nil {
 		return fmt.Errorf("failed to get battery state: %v", err)
 	}
 
+	s.mutex.Lock()
 	s.batteryState = batteryState
+	s.mutex.Unlock()
+
 	s.logger.Printf("Battery state: %s", batteryState)
 
 	if s.canEnterLowPowerState() {
@@ -321,9 +326,6 @@ func (s *Service) onPowerCommand(data []byte) error {
 }
 
 func (s *Service) onInhibitorsChanged() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	inhibitors := s.inhibitorManager.GetInhibitors()
 
 	tx := s.redis.NewTxGroup("inhibitors")
@@ -342,6 +344,8 @@ func (s *Service) onInhibitorsChanged() {
 		s.logger.Printf("Failed to publish inhibitors: %v", err)
 	}
 
+	s.mutex.Lock()
+	
 	// Check if there are other blocking inhibitors besides modem
 	hasOtherBlockingInhibitors := false
 	for _, inh := range inhibitors {
@@ -354,12 +358,18 @@ func (s *Service) onInhibitorsChanged() {
 	if hasOtherBlockingInhibitors {
 		s.modemDisabled = false
 	} else if s.lpmImminentTimerElapsed && s.hasOnlyModemBlockingInhibitors() && !s.modemDisabled {
+		s.mutex.Unlock()
 		s.disableModem()
+		s.mutex.Lock()
 	}
 
 	if s.lpmImminentTimerElapsed && !s.inhibitorManager.HasBlockingInhibitors() && !s.powerManager.IsLowPowerStateIssued() {
+		s.mutex.Unlock()
 		s.issueLowPowerState()
+		return
 	}
+	
+	s.mutex.Unlock()
 }
 
 func (s *Service) onLowPowerStateEnter(state power.PowerState) {
