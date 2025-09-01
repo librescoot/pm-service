@@ -11,7 +11,7 @@ import (
 	"github.com/librescoot/pm-service/internal/service"
 )
 
-var version = "0.1.0" // Default version, can be overridden during build
+var version = "unknown"
 
 func main() {
 	var logger *log.Logger
@@ -40,7 +40,7 @@ func main() {
 		cancel()
 	}()
 
-	logger.Printf("Starting power management service v%s", version)
+	logger.Printf("Starting power management service %s", version)
 	if err := svc.Run(ctx); err != nil {
 		log.Fatalf("Service failed: %v", err)
 	}
