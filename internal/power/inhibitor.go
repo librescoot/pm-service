@@ -66,7 +66,7 @@ func (i *Inhibitor) AddInhibit(req InhibitRequest) error {
 
 		// Create a new timer
 		i.timers[req.ID] = time.AfterFunc(req.Duration, func() {
-			i.RemoveInhibit(req.ID)
+			go i.RemoveInhibit(req.ID)
 		})
 	}
 

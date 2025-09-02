@@ -148,16 +148,19 @@ func (m *Manager) IssueTargetState(state PowerState) error {
 
 			// Set a new timer
 			m.pendingTimer = time.AfterFunc(delay, func() {
+				// Get pending state without holding the lock during recursive call
 				m.mutex.Lock()
 				pendingState := m.pendingPowerState
 				m.pendingPowerState = ""
 				m.pendingTimer = nil
 				m.mutex.Unlock()
 
-				// Issue the pending power state
+				// Issue the pending power state outside of any locked context
 				if pendingState != "" {
 					m.logger.Printf("Executing delayed power state change to %s", pendingState)
-					m.IssueTargetState(pendingState)
+					go func() {
+						m.IssueTargetState(pendingState)
+					}()
 				}
 			})
 
