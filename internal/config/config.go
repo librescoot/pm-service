@@ -14,9 +14,10 @@ type Config struct {
 	InhibitorDuration    time.Duration
 	HibernationTimer     time.Duration
 
-	SocketPath   string
-	DryRun       bool
-	DefaultState string
+	SocketPath     string
+	DryRun         bool
+	DefaultState   string
+	WakeupSources  []string
 }
 
 func New() *Config {
@@ -30,6 +31,7 @@ func New() *Config {
 		SocketPath:           "/tmp/suspend_inhibitor",
 		DryRun:               false,
 		DefaultState:         "suspend",
+		WakeupSources:        []string{"ttymxc0", "ttymxc1"},
 	}
 }
 
