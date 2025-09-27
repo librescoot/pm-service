@@ -83,10 +83,10 @@ func (rl *RedisListener) handleInputEvent(channel, payload string) {
 		if strings.Contains(payload, "state") {
 			// Get current vehicle state
 			vehicleState, err := rl.redis.HGet(rl.ctx, "vehicle", "state").Result()
-			if err == nil && vehicleState != "stand-by" {
-				// Vehicle left standby state, cancel hibernation sequence
+			if err == nil && vehicleState != "stand-by" && vehicleState != "parked" {
+				// Vehicle left valid hibernation state, cancel hibernation sequence
 				if rl.stateMachine.GetState() != HibernationStateIdle {
-					rl.logger.Printf("Vehicle left standby state (%s), canceling hibernation sequence", vehicleState)
+					rl.logger.Printf("Vehicle left valid hibernation state (%s), canceling hibernation sequence", vehicleState)
 					rl.stateMachine.CancelSequence()
 				}
 			}
