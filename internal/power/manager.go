@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,7 @@ type Manager struct {
 	dryRunMode           bool
 	onLowPowerStateEnter func(PowerState)
 	onLowPowerStateExit  func()
+	onWakeup             func(string) // Callback for wakeup with reason
 	lowPowerModeIssued   bool
 	wakeupSourcePath     string
 	inhibitor            *Inhibitor
@@ -37,7 +39,7 @@ type Manager struct {
 	pendingTimer         *time.Timer
 }
 
-func NewManager(logger *log.Logger, dryRunMode bool, onLowPowerStateEnter func(PowerState), onLowPowerStateExit func()) (*Manager, error) {
+func NewManager(logger *log.Logger, dryRunMode bool, onLowPowerStateEnter func(PowerState), onLowPowerStateExit func(), onWakeup func(string)) (*Manager, error) {
 	systemdClient, err := systemd.NewClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create systemd client: %v", err)
@@ -51,6 +53,7 @@ func NewManager(logger *log.Logger, dryRunMode bool, onLowPowerStateEnter func(P
 		dryRunMode:           dryRunMode,
 		onLowPowerStateEnter: onLowPowerStateEnter,
 		onLowPowerStateExit:  onLowPowerStateExit,
+		onWakeup:             onWakeup,
 		lowPowerModeIssued:   false,
 		wakeupSourcePath:     "/sys/power/pm_wakeup_irq",
 		inhibitor:            NewInhibitor(logger),
@@ -80,32 +83,28 @@ func (m *Manager) SetTargetState(state PowerState) {
 		return
 	}
 
-	// Priority rules:
-	// 1. run
-	// 2. hibernate-manual
-	// 3. hibernate
-	// 4. hibernate-timer
-	// 5. suspend/reboot
+	// Priority-based mode setting, lower priority requests will be ignored.
+	// Priority order: 1. run  2. hibernate-manual  3. hibernate  4. hibernate-timer  5. suspend/reboot
 
 	// Don't allow hibernation or hibernation timer request when targetPowerState is hibernate-manual
 	if m.targetState == StateHibernateManual && (state == StateHibernate || state == StateHibernateTimer) {
-		m.logger.Printf("Current target power state is %s; ignoring requested state %s",
-			m.targetState, state)
+		m.logger.Printf("Current target power state is %s; ignoring requested state %s", m.targetState, state)
+		m.logger.Printf("If you want to apply the mode, cancel the previous request by running 'redis-cli lpush scooter:power run' and run the command")
 		return
 	}
 
 	// Don't allow hibernation timer request when targetPowerState is hibernate-manual or hibernate
 	if (m.targetState == StateHibernateManual || m.targetState == StateHibernate) && state == StateHibernateTimer {
-		m.logger.Printf("Current target power state is %s; ignoring requested state %s",
-			m.targetState, state)
+		m.logger.Printf("Current target power state is %s; ignoring requested state %s", m.targetState, state)
+		m.logger.Printf("If you want to apply the mode, cancel the previous request by running 'redis-cli lpush scooter:power run' and run the command")
 		return
 	}
 
-	// Don't allow suspend or reboot requests when targetPowerState is hibernate, hibernate-manual, or hiberate-timer
+	// Don't allow suspend or reboot requests when targetPowerState is hibernate, hibernate-manual, or hibernate-timer
 	if (m.targetState == StateHibernate || m.targetState == StateHibernateManual || m.targetState == StateHibernateTimer) &&
 		(state == StateSuspend || state == StateReboot) {
-		m.logger.Printf("Current target power state is %s; ignoring requested state %s",
-			m.targetState, state)
+		m.logger.Printf("Current target power state is %s; ignoring requested state %s", m.targetState, state)
+		m.logger.Printf("If you want to apply the mode, cancel the previous request by running 'redis-cli lpush scooter:power run' and run the command")
 		return
 	}
 
@@ -207,10 +206,10 @@ func (m *Manager) IssueTargetState(state PowerState) error {
 	return nil
 }
 
-func (m *Manager) OnWakeup() {
+func (m *Manager) OnWakeup() string {
 	wakeupReason := "unknown"
 	if data, err := os.ReadFile(m.wakeupSourcePath); err == nil {
-		wakeupReason = string(data)
+		wakeupReason = strings.TrimSpace(string(data))
 	}
 
 	m.mutex.Lock()
@@ -220,9 +219,15 @@ func (m *Manager) OnWakeup() {
 
 	m.logger.Printf("IRQ wakeup reason: %s", wakeupReason)
 
+	if m.onWakeup != nil {
+		m.onWakeup(wakeupReason)
+	}
+
 	if m.onLowPowerStateExit != nil {
 		m.onLowPowerStateExit()
 	}
+
+	return wakeupReason
 }
 
 func (m *Manager) IsLowPowerStateIssued() bool {
