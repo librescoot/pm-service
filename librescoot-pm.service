@@ -1,7 +1,8 @@
 [Unit]
 Description=LibreScoot Power Management Service
 After=redis.service
-Wants=redis.service
+After=librescoot-vehicle.service
+Requires=redis.service
 
 [Service]
 Type=simple
