@@ -2,6 +2,8 @@
 Description=LibreScoot Power Management Service
 After=redis.service
 After=librescoot-vehicle.service
+After=librescoot-battery.service
+After=librescoot-settings.service
 Requires=redis.service
 
 [Service]
