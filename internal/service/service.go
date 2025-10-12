@@ -177,14 +177,9 @@ func (s *Service) Run(ctx context.Context) error {
 	// Start hibernation timer settings listener
 	go s.listenForHibernationSettings(ctx, s.standardRedis)
 
-	vehicleState, err := s.redis.HGet("vehicle", "state")
-	if err == nil {
-		s.vehicleState = vehicleState
-	}
-
-	batteryState, err := s.redis.HGet("battery:0", "state")
-	if err == nil {
-		s.batteryState = batteryState
+	// Read initial states with retries
+	if err := s.readInitialStates(); err != nil {
+		return fmt.Errorf("failed to read initial states from Redis: %v", err)
 	}
 
 	// Set initial power manager state in Redis based on current target state
@@ -222,6 +217,38 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.redis.Close(); err != nil {
 		s.logger.Printf("Failed to close Redis client: %v", err)
 	}
+
+	return nil
+}
+
+func (s *Service) readInitialStates() error {
+	const maxRetries = 10
+	const retryDelay = 500 * time.Millisecond
+
+	s.logger.Printf("Reading initial vehicle and battery states from Redis...")
+
+	for i := range maxRetries {
+		vehicleState, vehicleErr := s.redis.HGet("vehicle", "state")
+		batteryState, batteryErr := s.redis.HGet("battery:0", "state")
+
+		if vehicleErr == nil && batteryErr == nil {
+			s.vehicleState = vehicleState
+			s.batteryState = batteryState
+			s.logger.Printf("Successfully read initial states - Vehicle: %s, Battery: %s", vehicleState, batteryState)
+			return nil
+		}
+
+		if i < maxRetries-1 {
+			s.logger.Printf("Failed to read initial states (attempt %d/%d) - Vehicle error: %v, Battery error: %v. Retrying in %v...",
+				i+1, maxRetries, vehicleErr, batteryErr, retryDelay)
+			time.Sleep(retryDelay)
+		}
+	}
+
+	// After all retries failed, use safe default states that block power actions
+	s.vehicleState = "initializing"
+	s.batteryState = "initializing"
+	s.logger.Printf("WARNING: Failed to read initial states from Redis after %d attempts. Using safe default state 'initializing' which blocks all power actions until real state is received via subscription.", maxRetries)
 
 	return nil
 }
