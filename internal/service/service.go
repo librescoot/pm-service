@@ -593,6 +593,11 @@ func (s *Service) handleDelayInhibitorRemove() {
 func (s *Service) canEnterLowPowerState() bool {
 	targetState := s.powerManager.GetTargetState()
 
+	// Cannot enter low power state if target is to stay running
+	if targetState == power.StateRun {
+		return false
+	}
+
 	// Special case for reboot - allow in both stand-by and shutting-down states
 	if targetState == power.StateReboot {
 		if s.vehicleState != "stand-by" && s.vehicleState != "shutting-down" {
