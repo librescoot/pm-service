@@ -91,13 +91,13 @@ func (t *Timer) ResetTimer(activate bool) {
 		return
 	}
 
-	if activate && !t.active {
-		// Vehicle entering standby, start timer
+	if activate {
+		// Vehicle entering standby, (re)start timer
 		t.lastActivateTime = time.Now()
 		t.startTimer(t.timerDuration)
 		t.logger.Printf("Hibernation timer started with %d seconds",
 			int32(t.timerDuration.Seconds()))
-	} else if !activate && t.active {
+	} else if t.active {
 		// Vehicle leaving standby, stop timer
 		t.stopTimer()
 		t.logger.Printf("Hibernation timer stopped")
