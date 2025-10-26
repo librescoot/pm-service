@@ -736,6 +736,10 @@ func (s *Service) listenForHibernationSettings(ctx context.Context, redis *redis
 		case <-ctx.Done():
 			return
 		case msg := <-ch:
+			if msg == nil {
+				s.logger.Printf("Redis settings channel closed unexpectedly")
+				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
+			}
 			if msg.Payload == "hibernation-timer" {
 				s.loadHibernationTimerSetting(redis)
 			}

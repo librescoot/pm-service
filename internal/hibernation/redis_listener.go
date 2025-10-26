@@ -51,7 +51,15 @@ func (rl *RedisListener) listenForInputEvents() {
 		select {
 		case <-rl.ctx.Done():
 			return
-		case msg := <-ch:
+		case msg, ok := <-ch:
+			if !ok {
+				rl.logger.Printf("Redis channel closed unexpectedly")
+				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
+			}
+			if msg == nil {
+				rl.logger.Printf("Received nil Redis message")
+				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
+			}
 			rl.handleInputEvent(msg.Channel, msg.Payload)
 		}
 	}
