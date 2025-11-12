@@ -190,6 +190,15 @@ func (s *Service) Run(ctx context.Context) error {
 		s.startPreSuspendTimer()
 	}
 
+	// Initialize hibernation timer based on initial vehicle state
+	if s.vehicleState == "stand-by" || s.vehicleState == "parked" {
+		s.hibernationTimer.ResetTimer(true)
+		s.logger.Printf("Initialized hibernation timer based on initial vehicle state: %s", s.vehicleState)
+	} else {
+		s.hibernationTimer.ResetTimer(false)
+		s.logger.Printf("Hibernation timer not activated for initial vehicle state: %s", s.vehicleState)
+	}
+
 	// Run event loop
 	s.eventLoop(ctx)
 
