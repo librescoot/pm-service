@@ -49,6 +49,7 @@ const (
 
 	// Wakeup and lifecycle
 	EvWakeup         librefsm.EventID = "wakeup"
+	EvWakeupRTC      librefsm.EventID = "wakeup-rtc" // RTC wakeup skips pre-suspend
 	EvLowPowerIssued librefsm.EventID = "low-power-issued"
 
 	// Manual hibernation sequence events
@@ -144,6 +145,7 @@ type Actions interface {
 	IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool
 	IsTargetNotRun(c *librefsm.Context) bool
 	IsBatteryNotActive(c *librefsm.Context) bool
+	IsBatteryBlockingSuspend(c *librefsm.Context) bool // battery active AND target is suspend
 
 	// Transition actions
 	OnPreSuspendTimeout(c *librefsm.Context) error

@@ -123,6 +123,11 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
 		).
 
+		// Cancel: battery became active while target is suspend
+		Transition(StatePreSuspend, EvBatteryStateChanged, StateRunning,
+			librefsm.WithGuard(actions.IsBatteryBlockingSuspend),
+		).
+
 		// === Transitions from SuspendImminent ===
 
 		Transition(StateSuspendImminent, EvSuspendImminentTimeout, StateWaitingInhibitors,
@@ -136,6 +141,11 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		Transition(StateSuspendImminent, EvVehicleStateChanged, StateRunning,
 			librefsm.WithGuard(actions.IsVehicleNotInStandbyOrParked),
 			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
+		).
+
+		// Cancel: battery became active while target is suspend
+		Transition(StateSuspendImminent, EvBatteryStateChanged, StateRunning,
+			librefsm.WithGuard(actions.IsBatteryBlockingSuspend),
 		).
 
 		// === Transitions from WaitingInhibitors ===
@@ -171,14 +181,25 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		// === Transitions from Suspended ===
 
-		// Wakeup: go back to pre-suspend if target is still low power
+		// Wakeup: go back to pre-suspend if target is still low power AND conditions allow
 		Transition(StateSuspended, EvWakeup, StatePreSuspend,
-			librefsm.WithGuard(actions.IsTargetNotRun),
+			librefsm.WithGuard(actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnWakeup),
 		).
 
-		// Wakeup: go to running if target is run
+		// Wakeup: go to running if conditions don't allow low power
 		Transition(StateSuspended, EvWakeup, StateRunning,
+			librefsm.WithAction(actions.OnWakeup),
+		).
+
+		// RTC wakeup: skip pre-suspend and go straight to suspend-imminent if conditions allow
+		Transition(StateSuspended, EvWakeupRTC, StateSuspendImminent,
+			librefsm.WithGuard(actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnWakeup),
+		).
+
+		// RTC wakeup: go to running if conditions don't allow
+		Transition(StateSuspended, EvWakeupRTC, StateRunning,
 			librefsm.WithAction(actions.OnWakeup),
 		).
 

@@ -534,8 +534,15 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 		)
 	}
 
+	// Use EvWakeupRTC for RTC wakeup (IRQ 45) to skip pre-suspend delay
+	eventID := fsm.EvWakeup
+	if wakeupReason == "45" {
+		eventID = fsm.EvWakeupRTC
+		s.logger.Printf("RTC wakeup detected, using fast path")
+	}
+
 	c.Send(librefsm.Event{
-		ID:      fsm.EvWakeup,
+		ID:      eventID,
 		Payload: fsm.WakeupPayload{Reason: wakeupReason},
 	})
 }
@@ -626,6 +633,10 @@ func (s *Service) IsTargetNotRun(c *librefsm.Context) bool {
 
 func (s *Service) IsBatteryNotActive(c *librefsm.Context) bool {
 	return s.fsmData.BatteryState != "active"
+}
+
+func (s *Service) IsBatteryBlockingSuspend(c *librefsm.Context) bool {
+	return s.fsmData.TargetPowerState == fsm.TargetSuspend && s.fsmData.BatteryState == "active"
 }
 
 // Transition actions
