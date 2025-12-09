@@ -178,6 +178,15 @@ func (s *Service) Run(ctx context.Context) error {
 		s.logger.Printf("Initialized hibernation timer based on initial vehicle state: %s", s.fsmData.VehicleState)
 	}
 
+	// Trigger low-power sequence evaluation if default state is not "run"
+	// The FSM transition guards will determine if conditions allow
+	if s.fsmData.TargetPowerState != fsm.TargetRun {
+		s.machine.Send(librefsm.Event{
+			ID:      fsm.EvVehicleStateChanged,
+			Payload: fsm.VehicleStatePayload{State: s.fsmData.VehicleState},
+		})
+	}
+
 	// Wait for context cancellation
 	<-ctx.Done()
 

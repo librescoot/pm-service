@@ -100,6 +100,14 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithGuard(actions.IsVehicleInStandbyOrParked),
 		).
 
+		// State changes may enable low-power transition (e.g., vehicle entered standby)
+		Transition(StateRunning, EvVehicleStateChanged, StatePreSuspend,
+			librefsm.WithGuard(actions.CanEnterLowPowerState),
+		).
+		Transition(StateRunning, EvBatteryStateChanged, StatePreSuspend,
+			librefsm.WithGuard(actions.CanEnterLowPowerState),
+		).
+
 		// === Transitions from PreSuspend ===
 
 		Transition(StatePreSuspend, EvPreSuspendTimeout, StateSuspendImminent,
