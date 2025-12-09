@@ -4,41 +4,36 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/librescoot/librefsm"
 	"github.com/librescoot/pm-service/internal/config"
+	"github.com/librescoot/pm-service/internal/fsm"
 	"github.com/librescoot/pm-service/internal/hibernation"
 	"github.com/librescoot/pm-service/internal/inhibitor"
-	"github.com/librescoot/pm-service/internal/power"
+	"github.com/librescoot/pm-service/internal/systemd"
 	"github.com/redis/go-redis/v9"
 	redis_ipc "github.com/rescoot/redis-ipc"
 )
 
 type Service struct {
-	config              *config.Config
-	logger              *log.Logger
-	redis               *redis_ipc.Client
-	standardRedis       *redis.Client
-	powerManager        *power.Manager
-	inhibitorManager    *inhibitor.Manager
-	hibernationSM       *hibernation.StateMachine
-	hibernationTimer    *hibernation.Timer
-	hibernationListener *hibernation.RedisListener
-	delayInhibitor      *inhibitor.Inhibitor
+	config           *config.Config
+	logger           *log.Logger
+	redis            *redis_ipc.Client
+	standardRedis    *redis.Client
+	inhibitorManager *inhibitor.Manager
+	hibernationTimer *hibernation.Timer
+	systemdClient    *systemd.Client
+	delayInhibitor   *inhibitor.Inhibitor
 
-	events chan Event
-
-	vehicleState string
-	batteryState string
-
-	preSuspendTimer      *time.Timer
-	suspendImminentTimer *time.Timer
-
-	lpmImminentTimerElapsed bool
-	modemDisabled           bool
+	// librefsm
+	machine *librefsm.Machine
+	fsmData *fsm.FSMData
 }
 
 func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
@@ -54,36 +49,29 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		return nil, fmt.Errorf("failed to create Redis client: %v", err)
 	}
 
-	// Create standard Redis client for hardware manager and hibernation timer
 	ctx := context.Background()
 	standardRedisClient := redis.NewClient(&redis.Options{
 		Addr: fmt.Sprintf("%s:%d", cfg.RedisHost, cfg.RedisPort),
 		DB:   0,
 	})
 
-	service := &Service{
-		config:                  cfg,
-		logger:                  logger,
-		redis:                   redisClient,
-		standardRedis:           standardRedisClient,
-		events:                  make(chan Event, 100),
-		vehicleState:            "",
-		batteryState:            "",
-		lpmImminentTimerElapsed: false,
-		modemDisabled:           false,
+	systemdClient, err := systemd.NewClient()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create systemd client: %v", err)
 	}
 
-	powerManager, err := power.NewManager(
-		logger,
-		cfg.DryRun,
-		service.onLowPowerStateEnter,
-		service.onLowPowerStateExit,
-		service.onWakeup,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create power manager: %v", err)
+	service := &Service{
+		config:        cfg,
+		logger:        logger,
+		redis:         redisClient,
+		standardRedis: standardRedisClient,
+		systemdClient: systemdClient,
+		fsmData: &fsm.FSMData{
+			TargetPowerState: cfg.DefaultState,
+			VehicleState:     "",
+			BatteryState:     "",
+		},
 	}
-	service.powerManager = powerManager
 
 	inhibitorManager, err := inhibitor.NewManager(
 		logger,
@@ -102,52 +90,21 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		inhibitor.TypeDelay,
 	)
 
-	// Create hibernation state machine
-	hibernationSM := hibernation.NewStateMachine(ctx, service.standardRedis, logger, func() {
-		// Callback when hibernation sequence completes
-		service.events <- Event{
-			Type: EventHibernationComplete,
-			Data: nil,
-		}
-	})
-	service.hibernationSM = hibernationSM
-
 	// Create hibernation timer
 	hibernationTimer := hibernation.NewTimer(
 		ctx,
 		service.standardRedis,
 		logger,
-		cfg.HibernationTimer, // Default hibernation timer duration
+		cfg.HibernationTimer,
 		func() {
-			// Execute hibernation when timer expires
-			service.events <- Event{
-				Type: EventHibernationTimerExpired,
-				Data: nil,
+			// Send FSM event when timer expires
+			if service.machine != nil {
+				service.fsmData.TargetPowerState = fsm.TargetHibernateTimer
+				service.machine.Send(librefsm.Event{ID: fsm.EvHibernationTimerExpired})
 			}
 		},
 	)
 	service.hibernationTimer = hibernationTimer
-
-	// Create hibernation Redis listener
-	hibernationListener := hibernation.NewRedisListener(ctx, service.standardRedis, hibernationSM, logger)
-	service.hibernationListener = hibernationListener
-
-	switch cfg.DefaultState {
-	case "run":
-		service.powerManager.SetTargetState(power.StateRun)
-	case "suspend":
-		service.powerManager.SetTargetState(power.StateSuspend)
-	case "hibernate":
-		service.powerManager.SetTargetState(power.StateHibernate)
-	case "hibernate-manual":
-		service.powerManager.SetTargetState(power.StateHibernateManual)
-	case "hibernate-timer":
-		service.powerManager.SetTargetState(power.StateHibernateTimer)
-	case "reboot":
-		service.powerManager.SetTargetState(power.StateReboot)
-	default:
-		service.powerManager.SetTargetState(power.StateSuspend)
-	}
 
 	return service, nil
 }
@@ -156,6 +113,30 @@ func (s *Service) Run(ctx context.Context) error {
 	// Enable wakeup on configured serial ports
 	s.enableWakeupSources()
 
+	// Build FSM
+	def := fsm.NewDefinition(s, s.config.PreSuspendDelay, s.config.SuspendImminentDelay)
+	machine, err := def.Build(
+		librefsm.WithData(s.fsmData),
+		librefsm.WithLogger(slog.Default()),
+		librefsm.WithEventQueueSize(100),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to build FSM: %v", err)
+	}
+	s.machine = machine
+
+	// Set up state change callback for Redis publishing
+	s.machine.OnStateChange(func(from, to librefsm.StateID) {
+		s.logger.Printf("FSM state transition: %s -> %s", from, to)
+		s.publishFSMState(to)
+	})
+
+	// Start FSM
+	if err := s.machine.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start FSM: %v", err)
+	}
+
+	// Set up Redis subscriptions
 	vehicleSubscriber := s.redis.Subscribe("vehicle")
 	if err := vehicleSubscriber.Handle("state", s.onVehicleState); err != nil {
 		return fmt.Errorf("failed to subscribe to vehicle state: %v", err)
@@ -169,9 +150,15 @@ func (s *Service) Run(ctx context.Context) error {
 	s.redis.HandleRequests("scooter:power", s.onPowerCommand)
 	s.redis.HandleRequests("scooter:governor", s.onGovernorCommand)
 
-	// Start hibernation Redis listener
-	if err := s.hibernationListener.Start(); err != nil {
-		return fmt.Errorf("failed to start hibernation listener: %v", err)
+	// Subscribe to hibernation inputs (for manual hibernation sequence)
+	buttonsSubscriber := s.redis.Subscribe("buttons")
+	if err := buttonsSubscriber.Handle("hibernation_input", s.onHibernationInput); err != nil {
+		s.logger.Printf("Warning: failed to subscribe to hibernation input: %v", err)
+	}
+
+	seatboxSubscriber := s.redis.Subscribe("seatbox")
+	if err := seatboxSubscriber.Handle("state", s.onSeatboxState); err != nil {
+		s.logger.Printf("Warning: failed to subscribe to seatbox state: %v", err)
 	}
 
 	// Start hibernation timer settings listener
@@ -182,46 +169,29 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to read initial states from Redis: %v", err)
 	}
 
-	// Set initial power manager state in Redis based on current target state
-	currentTargetState := s.powerManager.GetTargetState()
-	s.publishState(string(currentTargetState))
-
-	if s.canEnterLowPowerState() {
-		s.startPreSuspendTimer()
-	}
+	// Publish initial power state
+	s.publishFSMState(s.machine.CurrentState())
 
 	// Initialize hibernation timer based on initial vehicle state
-	if s.vehicleState == "stand-by" || s.vehicleState == "parked" {
+	if s.fsmData.VehicleState == "stand-by" || s.fsmData.VehicleState == "parked" {
 		s.hibernationTimer.ResetTimer(true)
-		s.logger.Printf("Initialized hibernation timer based on initial vehicle state: %s", s.vehicleState)
-	} else {
-		s.hibernationTimer.ResetTimer(false)
-		s.logger.Printf("Hibernation timer not activated for initial vehicle state: %s", s.vehicleState)
+		s.logger.Printf("Initialized hibernation timer based on initial vehicle state: %s", s.fsmData.VehicleState)
 	}
 
-	// Run event loop
-	s.eventLoop(ctx)
+	// Wait for context cancellation
+	<-ctx.Done()
 
-	if s.preSuspendTimer != nil {
-		s.preSuspendTimer.Stop()
-	}
-	if s.suspendImminentTimer != nil {
-		s.suspendImminentTimer.Stop()
-	}
-
-	// Stop listeners
-	s.hibernationListener.Stop()
-
-	if err := s.powerManager.Close(); err != nil {
-		s.logger.Printf("Failed to close power manager: %v", err)
-	}
+	// Cleanup
+	s.machine.Stop()
+	s.hibernationTimer.Close()
 
 	if err := s.inhibitorManager.Close(); err != nil {
 		s.logger.Printf("Failed to close inhibitor manager: %v", err)
 	}
 
-	s.hibernationSM.Close()
-	s.hibernationTimer.Close()
+	if err := s.systemdClient.Close(); err != nil {
+		s.logger.Printf("Failed to close systemd client: %v", err)
+	}
 
 	if err := s.redis.Close(); err != nil {
 		s.logger.Printf("Failed to close Redis client: %v", err)
@@ -241,8 +211,8 @@ func (s *Service) readInitialStates() error {
 		batteryState, batteryErr := s.redis.HGet("battery:0", "state")
 
 		if vehicleErr == nil && batteryErr == nil {
-			s.vehicleState = vehicleState
-			s.batteryState = batteryState
+			s.fsmData.VehicleState = vehicleState
+			s.fsmData.BatteryState = batteryState
 			s.logger.Printf("Successfully read initial states - Vehicle: %s, Battery: %s", vehicleState, batteryState)
 			return nil
 		}
@@ -254,13 +224,14 @@ func (s *Service) readInitialStates() error {
 		}
 	}
 
-	// After all retries failed, use safe default states that block power actions
-	s.vehicleState = "initializing"
-	s.batteryState = "initializing"
-	s.logger.Printf("WARNING: Failed to read initial states from Redis after %d attempts. Using safe default state 'initializing' which blocks all power actions until real state is received via subscription.", maxRetries)
+	s.fsmData.VehicleState = "initializing"
+	s.fsmData.BatteryState = "initializing"
+	s.logger.Printf("WARNING: Failed to read initial states from Redis after %d attempts. Using safe default state 'initializing'.", maxRetries)
 
 	return nil
 }
+
+// Redis handlers - send FSM events
 
 func (s *Service) onVehicleState(data []byte) error {
 	vehicleState, err := s.redis.HGet("vehicle", "state")
@@ -268,9 +239,29 @@ func (s *Service) onVehicleState(data []byte) error {
 		return fmt.Errorf("failed to get vehicle state: %v", err)
 	}
 
-	s.events <- Event{
-		Type: EventVehicleState,
-		Data: VehicleStateData{State: vehicleState},
+	oldState := s.fsmData.VehicleState
+	s.fsmData.VehicleState = vehicleState
+	s.logger.Printf("Vehicle state: %s", vehicleState)
+
+	// Update hibernation timer based on vehicle state
+	if vehicleState == "stand-by" || vehicleState == "parked" {
+		s.hibernationTimer.ResetTimer(true)
+	} else {
+		s.hibernationTimer.ResetTimer(false)
+	}
+
+	// Send FSM event
+	if s.machine != nil {
+		s.machine.Send(librefsm.Event{
+			ID:      fsm.EvVehicleStateChanged,
+			Payload: fsm.VehicleStatePayload{State: vehicleState},
+		})
+	}
+
+	// If vehicle left standby/parked, cancel any pending low power state
+	if (oldState == "stand-by" || oldState == "parked") && vehicleState != "stand-by" && vehicleState != "parked" {
+		s.fsmData.TargetPowerState = fsm.TargetRun
+		s.fsmData.ModemDisabled = false
 	}
 
 	return nil
@@ -282,9 +273,14 @@ func (s *Service) onBatteryState(data []byte) error {
 		return fmt.Errorf("failed to get battery state: %v", err)
 	}
 
-	s.events <- Event{
-		Type: EventBatteryState,
-		Data: BatteryStateData{State: batteryState},
+	s.fsmData.BatteryState = batteryState
+	s.logger.Printf("Battery state: %s", batteryState)
+
+	if s.machine != nil {
+		s.machine.Send(librefsm.Event{
+			ID:      fsm.EvBatteryStateChanged,
+			Payload: fsm.BatteryStatePayload{State: batteryState},
+		})
 	}
 
 	return nil
@@ -292,263 +288,234 @@ func (s *Service) onBatteryState(data []byte) error {
 
 func (s *Service) onPowerCommand(data []byte) error {
 	command := string(data)
+	s.logger.Printf("Received power command: %s", command)
 
-	s.events <- Event{
-		Type: EventPowerCommand,
-		Data: PowerCommandData{Command: command},
+	// Check priority and update target state
+	if !s.canSetTargetState(command) {
+		s.logger.Printf("Power command %s ignored due to priority (current target: %s)", command, s.fsmData.TargetPowerState)
+		return nil
+	}
+
+	s.fsmData.TargetPowerState = command
+
+	var eventID librefsm.EventID
+	switch command {
+	case "run":
+		eventID = fsm.EvPowerRun
+	case "suspend":
+		eventID = fsm.EvPowerSuspend
+	case "hibernate":
+		eventID = fsm.EvPowerHibernate
+	case "hibernate-manual":
+		eventID = fsm.EvPowerHibernateManual
+	case "hibernate-timer":
+		eventID = fsm.EvPowerHibernateTimer
+	case "reboot":
+		eventID = fsm.EvPowerReboot
+	default:
+		s.logger.Printf("Unknown power command: %s", command)
+		return nil
+	}
+
+	if s.machine != nil {
+		s.machine.Send(librefsm.Event{ID: eventID})
+	}
+
+	return nil
+}
+
+func (s *Service) onHibernationInput(data []byte) error {
+	value := string(data)
+
+	if s.machine != nil {
+		switch value {
+		case "pressed":
+			// Check if we should start hibernation sequence
+			if s.machine.CurrentState() == fsm.StateRunning {
+				s.machine.Send(librefsm.Event{ID: fsm.EvHibernationStart})
+			} else if s.machine.IsInState(fsm.StateHibernationConfirm) {
+				s.machine.Send(librefsm.Event{ID: fsm.EvHibernationInputPressed})
+			}
+		case "released":
+			s.machine.Send(librefsm.Event{ID: fsm.EvHibernationInputReleased})
+		}
+	}
+
+	return nil
+}
+
+func (s *Service) onSeatboxState(data []byte) error {
+	state, err := s.redis.HGet("seatbox", "state")
+	if err != nil {
+		return err
+	}
+
+	if state == "closed" && s.machine != nil {
+		s.machine.Send(librefsm.Event{ID: fsm.EvSeatboxClosed})
 	}
 
 	return nil
 }
 
 func (s *Service) onInhibitorsChanged() {
-	s.events <- Event{
-		Type: EventInhibitorsChanged,
-		Data: nil,
+	// Publish inhibitors to Redis
+	s.publishInhibitors()
+
+	// Send FSM event
+	if s.machine != nil {
+		s.machine.Send(librefsm.Event{ID: fsm.EvInhibitorsChanged})
 	}
 }
 
-func (s *Service) onLowPowerStateEnter(state power.PowerState) {
-	s.events <- Event{
-		Type: EventLowPowerStateEnter,
-		Data: LowPowerStateEnterData{State: string(state)},
-	}
-}
-
-func (s *Service) onWakeup(wakeupReason string) {
-	s.events <- Event{
-		Type: EventWakeup,
-		Data: WakeupData{Reason: wakeupReason},
-	}
-}
-
-func (s *Service) onLowPowerStateExit() {
-	s.events <- Event{
-		Type: EventLowPowerStateExit,
-		Data: nil,
-	}
-}
-
-// eventLoop processes all events sequentially, owning all Service state
-func (s *Service) eventLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case evt := <-s.events:
-			s.handleEvent(evt)
-		}
-	}
-}
-
-// handleEvent dispatches events to appropriate handlers
-func (s *Service) handleEvent(evt Event) {
-	switch evt.Type {
-	case EventPowerCommand:
-		data := evt.Data.(PowerCommandData)
-		s.handlePowerCommand(data.Command)
-	case EventGovernorCommand:
-		data := evt.Data.(GovernorCommandData)
-		s.handleGovernorCommand(data.Governor)
-	case EventVehicleState:
-		data := evt.Data.(VehicleStateData)
-		s.handleVehicleStateChange(data.State)
-	case EventBatteryState:
-		data := evt.Data.(BatteryStateData)
-		s.handleBatteryStateChange(data.State)
-	case EventInhibitorsChanged:
-		s.handleInhibitorsChanged()
-	case EventPreSuspendElapsed:
-		s.handlePreSuspendElapsed()
-	case EventSuspendImminentElapsed:
-		s.handleSuspendImminentElapsed()
-	case EventLowPowerStateEnter:
-		data := evt.Data.(LowPowerStateEnterData)
-		s.handleLowPowerStateEnter(data.State)
-	case EventLowPowerStateExit:
-		s.handleLowPowerStateExit()
-	case EventWakeup:
-		data := evt.Data.(WakeupData)
-		s.handleWakeup(data.Reason)
-	case EventHibernationTimerExpired:
-		s.handleHibernationTimerExpired()
-	case EventHibernationComplete:
-		s.handleHibernationComplete()
-	case EventHibernationSettingsChanged:
-		data := evt.Data.(HibernationSettingsData)
-		s.handleHibernationSettingsChanged(data.TimerValue)
-	case EventDelayInhibitorRemove:
-		s.handleDelayInhibitorRemove()
-	}
-}
-
-// handlePowerCommand processes power command events
-func (s *Service) handlePowerCommand(command string) {
-	s.logger.Printf("Received power command: %s", command)
-
-	s.logger.Printf("Current state - Vehicle: %s, Battery: %s, Target power: %s",
-		s.vehicleState, s.batteryState, s.powerManager.GetTargetState())
-
-	switch command {
-	case "run":
-		s.powerManager.SetTargetState(power.StateRun)
-	case "suspend":
-		s.powerManager.SetTargetState(power.StateSuspend)
-	case "hibernate":
-		s.powerManager.SetTargetState(power.StateHibernate)
-	case "hibernate-manual":
-		s.powerManager.SetTargetState(power.StateHibernateManual)
-	case "hibernate-timer":
-		s.powerManager.SetTargetState(power.StateHibernateTimer)
-	case "reboot":
-		s.powerManager.SetTargetState(power.StateReboot)
-	default:
-		s.logger.Printf("Unknown power command: %s", command)
-		return
-	}
-
-	canEnter := s.canEnterLowPowerState()
-	isIssued := s.powerManager.IsLowPowerStateIssued()
-	targetState := s.powerManager.GetTargetState()
-
-	s.logger.Printf("Power state check - Can enter low power: %v, Is issued: %v, Target state: %s",
-		canEnter, isIssued, targetState)
-
-	if canEnter && !isIssued && targetState != power.StateRun {
-		s.logger.Printf("Starting suspend imminent timer for target state: %s", targetState)
-		s.startSuspendImminentTimer()
-	} else {
-		s.logger.Printf("Not starting suspend imminent timer, conditions not met")
-	}
-}
-
-// handleGovernorCommand processes CPU governor command events
-func (s *Service) handleGovernorCommand(governor string) {
+func (s *Service) onGovernorCommand(data []byte) error {
+	governor := string(data)
 	s.logger.Printf("Received governor command: %s", governor)
 
-	// Validate governor value
 	switch governor {
 	case "ondemand", "powersave", "performance":
-		// Valid governors
+		s.setGovernor(governor)
 	default:
 		s.logger.Printf("Invalid governor command: %s", governor)
-		return
 	}
 
-	s.setGovernor(governor)
+	return nil
 }
 
-// handleVehicleStateChange processes vehicle state change events
-func (s *Service) handleVehicleStateChange(newState string) {
-	oldVehicleState := s.vehicleState
-	s.vehicleState = newState
+// Priority-based power state setting
+func (s *Service) canSetTargetState(newState string) bool {
+	current := s.fsmData.TargetPowerState
 
-	s.logger.Printf("Vehicle state: %s", newState)
-
-	if (oldVehicleState == "stand-by" || oldVehicleState == "parked") && newState != "stand-by" && newState != "parked" {
-		s.logger.Printf("Vehicle state changed from %s to %s, aborting low power mode", oldVehicleState, newState)
-		s.powerManager.SetTargetState(power.StateRun)
-		s.stopSuspendImminentTimer()
-		s.stopPreSuspendTimer()
-
-		s.modemDisabled = false
-
-		s.publishState(string(power.StateRun))
+	// Run can always be set
+	if newState == "run" {
+		return true
 	}
 
-	if s.canEnterLowPowerState() {
-		s.startPreSuspendTimer()
-	}
-
-	if newState == "stand-by" || newState == "parked" {
-		s.hibernationTimer.ResetTimer(true)
-	} else {
-		s.hibernationTimer.ResetTimer(false)
-	}
-}
-
-// handleBatteryStateChange processes battery state change events
-func (s *Service) handleBatteryStateChange(newState string) {
-	s.batteryState = newState
-
-	s.logger.Printf("Battery state: %s", newState)
-
-	if s.canEnterLowPowerState() {
-		s.startPreSuspendTimer()
-	} else {
-		s.stopPreSuspendTimer()
-		s.stopSuspendImminentTimer()
-	}
-}
-
-// handleInhibitorsChanged processes inhibitor change events
-func (s *Service) handleInhibitorsChanged() {
-	inhibitors := s.inhibitorManager.GetInhibitors()
-
-	tx := s.redis.NewTxGroup("inhibitors")
-
-	tx.Add("DEL", "power-manager:busy-services")
-
-	for _, inhibitor := range inhibitors {
-		tx.Add("HSET", "power-manager:busy-services",
-			fmt.Sprintf("%s %s %s", inhibitor.Who, inhibitor.Why, inhibitor.What),
-			string(inhibitor.Type))
-	}
-
-	tx.Add("PUBLISH", "power-manager:busy-services", "updated")
-
-	if _, err := tx.Exec(); err != nil {
-		s.logger.Printf("Failed to publish inhibitors: %v", err)
-	}
-
-	// Check if there are other blocking inhibitors besides modem
-	hasOtherBlockingInhibitors := false
-	for _, inh := range inhibitors {
-		if inh.Type == inhibitor.TypeBlock && inh.Who != "unu-modem" && inh.Who != "modem-service" {
-			hasOtherBlockingInhibitors = true
-			break
+	// Priority order: run > hibernate-manual > hibernate > hibernate-timer > suspend/reboot
+	switch current {
+	case "hibernate-manual":
+		if newState == "hibernate" || newState == "hibernate-timer" || newState == "suspend" || newState == "reboot" {
+			return false
+		}
+	case "hibernate":
+		if newState == "hibernate-timer" || newState == "suspend" || newState == "reboot" {
+			return false
+		}
+	case "hibernate-timer":
+		if newState == "suspend" || newState == "reboot" {
+			return false
 		}
 	}
 
-	if hasOtherBlockingInhibitors {
-		s.modemDisabled = false
-	} else if s.lpmImminentTimerElapsed && s.hasOnlyModemBlockingInhibitors() && !s.modemDisabled {
+	return true
+}
+
+// Actions interface implementation
+
+func (s *Service) EnterRunning(c *librefsm.Context) error {
+	s.logger.Printf("Entering running state")
+	s.fsmData.LowPowerStateIssued = false
+	return nil
+}
+
+func (s *Service) EnterPreSuspend(c *librefsm.Context) error {
+	s.logger.Printf("Entering pre-suspend state, waiting %v", s.config.PreSuspendDelay)
+	return nil
+}
+
+func (s *Service) EnterSuspendImminent(c *librefsm.Context) error {
+	s.logger.Printf("Entering suspend-imminent state")
+	// Publish imminent state
+	s.publishState(s.fsmData.TargetPowerState + "-imminent")
+	return nil
+}
+
+func (s *Service) EnterWaitingInhibitors(c *librefsm.Context) error {
+	s.logger.Printf("Entering waiting-for-inhibitors state")
+
+	// Check if we can proceed immediately
+	if !s.inhibitorManager.HasBlockingInhibitors() {
+		// No blocking inhibitors, proceed to issuing
+		c.Send(librefsm.Event{ID: fsm.EvInhibitorsChanged})
+	} else if s.hasOnlyModemBlockingInhibitors() {
+		// Only modem inhibitors, try to disable modem
 		s.disableModem()
 	}
 
-	if s.lpmImminentTimerElapsed && !s.inhibitorManager.HasBlockingInhibitors() && !s.powerManager.IsLowPowerStateIssued() {
-		s.issueLowPowerState()
-	}
+	return nil
 }
 
-// handleLowPowerStateEnter processes low power state enter events
-func (s *Service) handleLowPowerStateEnter(state string) {
-	s.logger.Printf("Entering low power state: %s", state)
-	s.publishState(state)
+func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
+	s.logger.Printf("Entering issuing-low-power state")
 
-	// Schedule removal of inhibitor
+	if s.config.DryRun {
+		s.logger.Printf("[DRY RUN] Would issue power state %s", s.fsmData.TargetPowerState)
+		// In dry-run mode, simulate immediate wakeup for suspend
+		if s.fsmData.TargetPowerState == "suspend" {
+			c.Send(librefsm.Event{
+				ID:      fsm.EvWakeup,
+				Payload: fsm.WakeupPayload{Reason: "dry-run"},
+			})
+		}
+		return nil
+	}
+
+	var target string
+	switch s.fsmData.TargetPowerState {
+	case "suspend":
+		target = "suspend"
+	case "hibernate", "hibernate-manual", "hibernate-timer":
+		target = "poweroff"
+	case "reboot":
+		target = "reboot"
+	default:
+		return fmt.Errorf("unsupported power state: %s", s.fsmData.TargetPowerState)
+	}
+
+	s.fsmData.LowPowerStateIssued = true
+	s.publishState(s.fsmData.TargetPowerState)
+
+	s.logger.Printf("Issuing %s command", target)
+	// Note: For suspend, this call blocks until the system wakes up
+	if err := s.systemdClient.IssueCommand(target); err != nil {
+		s.fsmData.LowPowerStateIssued = false
+		return fmt.Errorf("failed to issue %s command: %v", target, err)
+	}
+
+	// For suspend, we just woke up - handle wakeup
+	if target == "suspend" {
+		s.handleWakeupAfterSuspend(c)
+	}
+	// For poweroff/reboot, the system will have stopped - we won't reach here
+
+	return nil
+}
+
+func (s *Service) ExitIssuingLowPower(c *librefsm.Context) error {
+	// Schedule removal of delay inhibitor
 	go func() {
 		time.Sleep(s.config.InhibitorDuration)
-		s.events <- Event{
-			Type: EventDelayInhibitorRemove,
-			Data: nil,
+		if s.delayInhibitor != nil {
+			s.inhibitorManager.RemoveInhibitor(s.delayInhibitor)
+			s.delayInhibitor = nil
 		}
 	}()
+	return nil
 }
 
-// handleLowPowerStateExit processes low power state exit events
-func (s *Service) handleLowPowerStateExit() {
-	s.logger.Printf("Exiting low power state")
-	s.publishState(string(power.StateRun))
-}
+func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
+	// Read wakeup reason
+	wakeupReason := "unknown"
+	if data, err := os.ReadFile("/sys/power/pm_wakeup_irq"); err == nil {
+		wakeupReason = strings.TrimSpace(string(data))
+	}
 
-// handleWakeup processes wakeup events
-func (s *Service) handleWakeup(wakeupReason string) {
+	s.fsmData.WakeupReason = wakeupReason
+	s.fsmData.LowPowerStateIssued = false
+	s.fsmData.ModemDisabled = false
+
 	s.logger.Printf("Wakeup detected with reason: %s", wakeupReason)
-	s.publishWakeupSource(wakeupReason)
 
-	s.modemDisabled = false
-
+	// Re-add delay inhibitor
 	if s.delayInhibitor == nil {
 		s.delayInhibitor = s.inhibitorManager.AddInhibitor(
 			"pm-service",
@@ -558,241 +525,239 @@ func (s *Service) handleWakeup(wakeupReason string) {
 		)
 	}
 
-	if s.powerManager.GetTargetState() != power.StateRun && s.canEnterLowPowerState() {
-		// Use shorter delay for RTC wakeup (IRQ 45)
-		if wakeupReason == "45" {
-			s.startSuspendImminentTimer()
-		} else {
-			s.startPreSuspendTimer()
-		}
-	}
+	c.Send(librefsm.Event{
+		ID:      fsm.EvWakeup,
+		Payload: fsm.WakeupPayload{Reason: wakeupReason},
+	})
 }
 
-// handleHibernationTimerExpired processes hibernation timer expiration events
-func (s *Service) handleHibernationTimerExpired() {
-	s.logger.Printf("Hibernation timer expired, executing timer-based hibernation")
-	s.powerManager.SetTargetState(power.StateHibernateTimer)
-	if s.canEnterLowPowerState() {
-		s.startSuspendImminentTimer()
-	}
+func (s *Service) EnterHibernation(c *librefsm.Context) error {
+	s.logger.Printf("Entering hibernation sequence")
+	return nil
 }
 
-// handleHibernationComplete processes hibernation sequence completion events
-func (s *Service) handleHibernationComplete() {
-	s.powerManager.SetTargetState(power.StateHibernateManual)
-	if s.canEnterLowPowerState() {
-		s.startSuspendImminentTimer()
-	}
+func (s *Service) ExitHibernation(c *librefsm.Context) error {
+	s.logger.Printf("Exiting hibernation sequence")
+	s.publishHibernationState("idle")
+	return nil
 }
 
-// handleHibernationSettingsChanged processes hibernation settings change events
-func (s *Service) handleHibernationSettingsChanged(timerValue int32) {
-	s.hibernationTimer.SetTimerValue(timerValue)
-	s.logger.Printf("Updated hibernation timer setting: %d seconds", timerValue)
+func (s *Service) EnterHibernationWaiting(c *librefsm.Context) error {
+	s.logger.Printf("Hibernation: waiting for initial hold (15s)")
+	s.publishHibernationState("waiting-hibernation")
+	return nil
 }
 
-// handleDelayInhibitorRemove processes delay inhibitor removal events
-func (s *Service) handleDelayInhibitorRemove() {
-	if s.delayInhibitor != nil {
-		s.inhibitorManager.RemoveInhibitor(s.delayInhibitor)
-		s.delayInhibitor = nil
-	}
+func (s *Service) EnterHibernationAdvanced(c *librefsm.Context) error {
+	s.logger.Printf("Hibernation: advanced state (10s)")
+	s.publishHibernationState("waiting-hibernation-advanced")
+	return nil
 }
 
-func (s *Service) canEnterLowPowerState() bool {
-	targetState := s.powerManager.GetTargetState()
+func (s *Service) EnterHibernationSeatbox(c *librefsm.Context) error {
+	s.logger.Printf("Hibernation: waiting for seatbox closure (60s)")
+	s.publishHibernationState("waiting-hibernation-seatbox")
+	return nil
+}
 
-	// Cannot enter low power state if target is to stay running
-	if targetState == power.StateRun {
+func (s *Service) EnterHibernationConfirm(c *librefsm.Context) error {
+	s.logger.Printf("Hibernation: waiting for confirmation (3s)")
+	s.publishHibernationState("waiting-hibernation-confirm")
+	return nil
+}
+
+// Guards
+
+func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
+	if s.fsmData.TargetPowerState == fsm.TargetRun {
 		return false
 	}
 
 	// Special case for reboot - allow in both stand-by and shutting-down states
-	if targetState == power.StateReboot {
-		if s.vehicleState != "stand-by" && s.vehicleState != "shutting-down" {
-			s.logger.Printf("Cannot enter reboot state: vehicle state is %s (needs stand-by or shutting-down)",
-				s.vehicleState)
+	if s.fsmData.TargetPowerState == fsm.TargetReboot {
+		if s.fsmData.VehicleState != "stand-by" && s.fsmData.VehicleState != "shutting-down" {
+			s.logger.Printf("Cannot enter reboot state: vehicle state is %s", s.fsmData.VehicleState)
 			return false
 		}
 		return true
 	}
 
-	// Regular check for other power states
-	if s.vehicleState != "stand-by" && s.vehicleState != "parked" {
-		s.logger.Printf("Cannot enter low power state: vehicle state is %s (needs stand-by or parked)", s.vehicleState)
+	if s.fsmData.VehicleState != "stand-by" && s.fsmData.VehicleState != "parked" {
+		s.logger.Printf("Cannot enter low power state: vehicle state is %s", s.fsmData.VehicleState)
 		return false
 	}
 
-	if targetState == power.StateSuspend && s.batteryState == "active" {
-		s.logger.Printf("Cannot enter suspend state: battery state is active")
+	if s.fsmData.TargetPowerState == fsm.TargetSuspend && s.fsmData.BatteryState == "active" {
+		s.logger.Printf("Cannot enter suspend state: battery is active")
 		return false
 	}
 
 	return true
 }
 
-func (s *Service) startPreSuspendTimer() {
-	if s.preSuspendTimer != nil {
-		s.preSuspendTimer.Stop()
-	}
-
-	s.preSuspendTimer = time.AfterFunc(s.config.PreSuspendDelay, func() {
-		s.events <- Event{
-			Type: EventPreSuspendElapsed,
-			Data: nil,
-		}
-	})
+func (s *Service) HasNoBlockingInhibitors(c *librefsm.Context) bool {
+	return !s.inhibitorManager.HasBlockingInhibitors()
 }
 
-func (s *Service) stopPreSuspendTimer() {
-	if s.preSuspendTimer != nil {
-		s.preSuspendTimer.Stop()
-		s.preSuspendTimer = nil
+func (s *Service) HasOnlyModemInhibitors(c *librefsm.Context) bool {
+	return s.hasOnlyModemBlockingInhibitors() && !s.fsmData.ModemDisabled
+}
+
+func (s *Service) IsVehicleInStandbyOrParked(c *librefsm.Context) bool {
+	return s.fsmData.VehicleState == "stand-by" || s.fsmData.VehicleState == "parked"
+}
+
+func (s *Service) IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool {
+	return s.fsmData.VehicleState != "stand-by" && s.fsmData.VehicleState != "parked"
+}
+
+func (s *Service) IsTargetNotRun(c *librefsm.Context) bool {
+	return s.fsmData.TargetPowerState != fsm.TargetRun
+}
+
+func (s *Service) IsBatteryNotActive(c *librefsm.Context) bool {
+	return s.fsmData.BatteryState != "active"
+}
+
+// Transition actions
+
+func (s *Service) OnPreSuspendTimeout(c *librefsm.Context) error {
+	s.logger.Printf("Pre-suspend timeout elapsed")
+	return nil
+}
+
+func (s *Service) OnSuspendImminentTimeout(c *librefsm.Context) error {
+	s.logger.Printf("Suspend imminent timeout elapsed")
+	return nil
+}
+
+func (s *Service) OnInhibitorsChanged(c *librefsm.Context) error {
+	return nil
+}
+
+func (s *Service) OnWakeup(c *librefsm.Context) error {
+	if payload, ok := c.Event.Payload.(fsm.WakeupPayload); ok {
+		s.publishWakeupSource(payload.Reason)
+	}
+	s.publishState("running")
+	return nil
+}
+
+func (s *Service) OnHibernationComplete(c *librefsm.Context) error {
+	s.logger.Printf("Hibernation sequence complete, setting target to hibernate-manual")
+	s.fsmData.TargetPowerState = fsm.TargetHibernateManual
+	return nil
+}
+
+func (s *Service) OnDisableModem(c *librefsm.Context) error {
+	s.disableModem()
+	return nil
+}
+
+func (s *Service) OnVehicleLeftLowPowerState(c *librefsm.Context) error {
+	s.logger.Printf("Vehicle left low power state, aborting")
+	s.fsmData.TargetPowerState = fsm.TargetRun
+	s.fsmData.ModemDisabled = false
+	s.publishState("running")
+	return nil
+}
+
+// Publishing methods
+
+func (s *Service) PublishState(state string) error {
+	return s.publishState(state)
+}
+
+func (s *Service) PublishWakeupSource(reason string) error {
+	s.publishWakeupSource(reason)
+	return nil
+}
+
+func (s *Service) publishState(state string) error {
+	redisState := s.mapPowerStateToRedis(state)
+	s.logger.Printf("Publishing power state: %s (Redis: %s)", state, redisState)
+
+	tx := s.redis.NewTxGroup("power-state")
+	tx.Add("HSET", "power-manager", "state", redisState)
+	tx.Add("PUBLISH", "power-manager", "state")
+
+	if _, err := tx.Exec(); err != nil {
+		s.logger.Printf("Failed to publish power state: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (s *Service) publishFSMState(state librefsm.StateID) {
+	var redisState string
+
+	switch state {
+	case fsm.StateRunning:
+		redisState = "running"
+	case fsm.StatePreSuspend:
+		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState) + "-pending"
+	case fsm.StateSuspendImminent:
+		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState + "-imminent")
+	case fsm.StateWaitingInhibitors:
+		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState + "-imminent")
+	case fsm.StateIssuingLowPower:
+		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState)
+	case fsm.StateSuspended:
+		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState)
+	default:
+		// For hibernation states, don't change power-manager state
+		return
+	}
+
+	tx := s.redis.NewTxGroup("power-state")
+	tx.Add("HSET", "power-manager", "state", redisState)
+	tx.Add("PUBLISH", "power-manager", "state")
+
+	if _, err := tx.Exec(); err != nil {
+		s.logger.Printf("Failed to publish FSM state: %v", err)
 	}
 }
 
-// handlePreSuspendElapsed processes pre-suspend timer expiration
-func (s *Service) handlePreSuspendElapsed() {
-	s.logger.Printf("Pre-suspend timer elapsed")
-
-	if s.canEnterLowPowerState() {
-		s.startSuspendImminentTimer()
+func (s *Service) publishHibernationState(state string) {
+	pipe := s.standardRedis.Pipeline()
+	pipe.HSet(context.Background(), "hibernation", "state", state)
+	pipe.Publish(context.Background(), "hibernation", "state")
+	if _, err := pipe.Exec(context.Background()); err != nil {
+		s.logger.Printf("Warning: Failed to publish hibernation state: %v", err)
 	}
 }
 
-func (s *Service) startSuspendImminentTimer() {
-	if s.suspendImminentTimer != nil {
-		s.suspendImminentTimer.Stop()
-	}
+func (s *Service) publishWakeupSource(reason string) {
+	s.logger.Printf("Publishing wakeup source: %s", reason)
 
-	s.publishState(string(s.powerManager.GetTargetState()) + "-imminent")
+	tx := s.redis.NewTxGroup("wakeup-source")
+	tx.Add("HSET", "power-manager", "wakeup-source", reason)
+	tx.Add("PUBLISH", "power-manager", "wakeup-source")
 
-	s.suspendImminentTimer = time.AfterFunc(s.config.SuspendImminentDelay, func() {
-		s.events <- Event{
-			Type: EventSuspendImminentElapsed,
-			Data: nil,
-		}
-	})
-}
-
-// handleSuspendImminentElapsed processes suspend imminent timer expiration
-func (s *Service) handleSuspendImminentElapsed() {
-	s.logger.Printf("Suspend imminent timer elapsed")
-	s.lpmImminentTimerElapsed = true
-
-	if s.hasOnlyModemBlockingInhibitors() {
-		s.disableModem()
-	}
-
-	if !s.inhibitorManager.HasBlockingInhibitors() && !s.powerManager.IsLowPowerStateIssued() {
-		s.issueLowPowerState()
+	if _, err := tx.Exec(); err != nil {
+		s.logger.Printf("Failed to publish wakeup source: %v", err)
 	}
 }
 
-func (s *Service) hasOnlyModemBlockingInhibitors() bool {
+func (s *Service) publishInhibitors() {
 	inhibitors := s.inhibitorManager.GetInhibitors()
 
-	hasModemInhibitor := false
-	hasOtherInhibitors := false
+	tx := s.redis.NewTxGroup("inhibitors")
+	tx.Add("DEL", "power-manager:busy-services")
 
 	for _, inh := range inhibitors {
-		if inh.Type == inhibitor.TypeBlock {
-			if inh.Who == "unu-modem" || inh.Who == "modem-service" {
-				hasModemInhibitor = true
-			} else {
-				hasOtherInhibitors = true
-			}
-		}
+		tx.Add("HSET", "power-manager:busy-services",
+			fmt.Sprintf("%s %s %s", inh.Who, inh.Why, inh.What),
+			string(inh.Type))
 	}
 
-	return hasModemInhibitor && !hasOtherInhibitors
-}
+	tx.Add("PUBLISH", "power-manager:busy-services", "updated")
 
-func (s *Service) disableModem() {
-	if s.modemDisabled {
-		return
-	}
-
-	s.logger.Printf("Issuing modem to turn off")
-	if _, err := s.redis.LPush("scooter:modem", "disable"); err != nil {
-		s.logger.Printf("Failed to disable modem: %v", err)
-		return
-	}
-
-	s.modemDisabled = true
-}
-
-func (s *Service) stopSuspendImminentTimer() {
-	if s.suspendImminentTimer != nil {
-		s.suspendImminentTimer.Stop()
-		s.suspendImminentTimer = nil
-		s.lpmImminentTimerElapsed = false
+	if _, err := tx.Exec(); err != nil {
+		s.logger.Printf("Failed to publish inhibitors: %v", err)
 	}
 }
 
-// listenForHibernationSettings listens for hibernation timer setting changes
-func (s *Service) listenForHibernationSettings(ctx context.Context, redis *redis.Client) {
-	// Subscribe to settings changes
-	pubsub := redis.Subscribe(ctx, "settings")
-	defer pubsub.Close()
-
-	// Load initial hibernation timer setting
-	s.loadHibernationTimerSetting(redis)
-
-	ch := pubsub.Channel()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-ch:
-			if msg == nil {
-				s.logger.Printf("Redis settings channel closed unexpectedly")
-				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
-			}
-			if msg.Payload == "hibernation-timer" {
-				s.loadHibernationTimerSetting(redis)
-			}
-		}
-	}
-}
-
-// loadHibernationTimerSetting loads the hibernation timer setting from Redis
-func (s *Service) loadHibernationTimerSetting(redis *redis.Client) {
-	result := redis.HGet(context.Background(), "settings", "hibernation-timer")
-	if result.Err() == nil {
-		if timerValue, err := strconv.ParseInt(result.Val(), 10, 32); err == nil {
-			s.events <- Event{
-				Type: EventHibernationSettingsChanged,
-				Data: HibernationSettingsData{TimerValue: int32(timerValue)},
-			}
-		} else {
-			s.logger.Printf("Failed to parse hibernation timer setting: %v", err)
-		}
-	}
-}
-
-func (s *Service) issueLowPowerState() {
-	if s.powerManager.IsLowPowerStateIssued() {
-		s.logger.Printf("Low power state already issued, skipping")
-		return
-	}
-
-	state := s.powerManager.GetTargetState()
-	if state == power.StateRun {
-		s.logger.Printf("Target state is run, not issuing low power state")
-		return
-	}
-
-	s.logger.Printf("Issuing low power state: %s", state)
-
-	if err := s.powerManager.IssueTargetState(state); err != nil {
-		s.logger.Printf("Failed to issue low power state: %v", err)
-	} else {
-		s.logger.Printf("Successfully issued low power state command: %s", state)
-	}
-}
-
-// mapPowerStateToRedis converts power state to Redis state format
 func (s *Service) mapPowerStateToRedis(state string) string {
 	switch state {
 	case "run":
@@ -822,41 +787,45 @@ func (s *Service) mapPowerStateToRedis(state string) string {
 	}
 }
 
-func (s *Service) publishState(state string) {
-	redisState := s.mapPowerStateToRedis(state)
-	s.logger.Printf("Publishing power state: %s (Redis: %s)", state, redisState)
+// Helper methods
 
-	tx := s.redis.NewTxGroup("power-state")
+func (s *Service) hasOnlyModemBlockingInhibitors() bool {
+	inhibitors := s.inhibitorManager.GetInhibitors()
 
-	tx.Add("HSET", "power-manager", "state", redisState)
+	hasModemInhibitor := false
+	hasOtherInhibitors := false
 
-	tx.Add("PUBLISH", "power-manager", "state")
-
-	if _, err := tx.Exec(); err != nil {
-		s.logger.Printf("Failed to publish power state: %v", err)
-	}
-}
-
-// onGovernorCommand handles CPU governor change requests
-func (s *Service) onGovernorCommand(data []byte) error {
-	governor := string(data)
-
-	s.events <- Event{
-		Type: EventGovernorCommand,
-		Data: GovernorCommandData{Governor: governor},
+	for _, inh := range inhibitors {
+		if inh.Type == inhibitor.TypeBlock {
+			if inh.Who == "unu-modem" || inh.Who == "modem-service" {
+				hasModemInhibitor = true
+			} else {
+				hasOtherInhibitors = true
+			}
+		}
 	}
 
-	return nil
+	return hasModemInhibitor && !hasOtherInhibitors
 }
 
-// setGovernor changes the CPU governor and publishes the change
+func (s *Service) disableModem() {
+	if s.fsmData.ModemDisabled {
+		return
+	}
+
+	s.logger.Printf("Issuing modem to turn off")
+	if _, err := s.redis.LPush("scooter:modem", "disable"); err != nil {
+		s.logger.Printf("Failed to disable modem: %v", err)
+		return
+	}
+
+	s.fsmData.ModemDisabled = true
+}
+
 func (s *Service) setGovernor(governor string) error {
 	s.logger.Printf("Setting CPU governor to: %s", governor)
 
-	// Use the direct sysfs interface to change the CPU governor
 	governorPath := "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-
-	// Execute the change using shell command for reliability
 	cmd := exec.Command("sh", "-c", fmt.Sprintf("echo %s > %s", governor, governorPath))
 	if err := cmd.Run(); err != nil {
 		s.logger.Printf("Failed to set CPU governor to %s: %v", governor, err)
@@ -865,29 +834,17 @@ func (s *Service) setGovernor(governor string) error {
 
 	s.logger.Printf("Successfully set CPU governor to %s", governor)
 
-	// Publish the governor change to Redis
-	if err := s.publishGovernorChange(governor); err != nil {
-		s.logger.Printf("Warning: Failed to publish governor change to Redis: %v", err)
-	}
-
-	return nil
-}
-
-// publishGovernorChange publishes governor changes to Redis
-func (s *Service) publishGovernorChange(governor string) error {
 	tx := s.redis.NewTxGroup("governor")
-
 	tx.Add("HSET", "system", "cpu:governor", governor)
 	tx.Add("PUBLISH", "system", "cpu:governor")
 
 	if _, err := tx.Exec(); err != nil {
-		return fmt.Errorf("failed to publish governor change: %w", err)
+		s.logger.Printf("Warning: Failed to publish governor change: %v", err)
 	}
 
 	return nil
 }
 
-// enableWakeupSources enables wakeup on configured serial ports
 func (s *Service) enableWakeupSources() {
 	for _, port := range s.config.WakeupSources {
 		wakeupPath := fmt.Sprintf("/sys/class/tty/%s/power/wakeup", port)
@@ -899,16 +856,37 @@ func (s *Service) enableWakeupSources() {
 	}
 }
 
-// publishWakeupSource publishes the wakeup source to Redis
-func (s *Service) publishWakeupSource(wakeupReason string) {
-	s.logger.Printf("Publishing wakeup source: %s", wakeupReason)
+func (s *Service) listenForHibernationSettings(ctx context.Context, redis *redis.Client) {
+	pubsub := redis.Subscribe(ctx, "settings")
+	defer pubsub.Close()
 
-	tx := s.redis.NewTxGroup("wakeup-source")
+	s.loadHibernationTimerSetting(redis)
 
-	tx.Add("HSET", "power-manager", "wakeup-source", wakeupReason)
-	tx.Add("PUBLISH", "power-manager", "wakeup-source")
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			if msg == nil {
+				s.logger.Printf("Redis settings channel closed unexpectedly")
+				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
+			}
+			if msg.Payload == "hibernation-timer" {
+				s.loadHibernationTimerSetting(redis)
+			}
+		}
+	}
+}
 
-	if _, err := tx.Exec(); err != nil {
-		s.logger.Printf("Failed to publish wakeup source: %v", err)
+func (s *Service) loadHibernationTimerSetting(redis *redis.Client) {
+	result := redis.HGet(context.Background(), "settings", "hibernation-timer")
+	if result.Err() == nil {
+		if timerValue, err := strconv.ParseInt(result.Val(), 10, 32); err == nil {
+			s.hibernationTimer.SetTimerValue(int32(timerValue))
+			s.logger.Printf("Updated hibernation timer setting: %d seconds", timerValue)
+		} else {
+			s.logger.Printf("Failed to parse hibernation timer setting: %v", err)
+		}
 	}
 }
