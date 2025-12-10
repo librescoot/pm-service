@@ -12,6 +12,8 @@ const (
 	StateRunning           librefsm.StateID = "running"
 	StatePreSuspend        librefsm.StateID = "pre-suspend"
 	StateSuspendImminent   librefsm.StateID = "suspend-imminent"
+	StatePreHibernate      librefsm.StateID = "pre-hibernate"
+	StateHibernateImminent librefsm.StateID = "hibernate-imminent"
 	StateWaitingInhibitors librefsm.StateID = "waiting-inhibitors"
 	StateIssuingLowPower   librefsm.StateID = "issuing-low-power"
 	StateSuspended         librefsm.StateID = "suspended"
@@ -35,8 +37,9 @@ const (
 	EvPowerReboot         librefsm.EventID = "power-reboot"
 
 	// State change events
-	EvVehicleStateChanged librefsm.EventID = "vehicle-state-changed"
-	EvBatteryStateChanged librefsm.EventID = "battery-state-changed"
+	EvVehicleStateChanged  librefsm.EventID = "vehicle-state-changed"
+	EvBatteryBecameActive  librefsm.EventID = "battery-became-active"
+	EvBatteryBecameInactive librefsm.EventID = "battery-became-inactive"
 
 	// Inhibitor events
 	EvInhibitorsChanged librefsm.EventID = "inhibitors-changed"
@@ -125,6 +128,8 @@ type Actions interface {
 	EnterRunning(c *librefsm.Context) error
 	EnterPreSuspend(c *librefsm.Context) error
 	EnterSuspendImminent(c *librefsm.Context) error
+	EnterPreHibernate(c *librefsm.Context) error
+	EnterHibernateImminent(c *librefsm.Context) error
 	EnterWaitingInhibitors(c *librefsm.Context) error
 	EnterIssuingLowPower(c *librefsm.Context) error
 	ExitIssuingLowPower(c *librefsm.Context) error
@@ -145,7 +150,8 @@ type Actions interface {
 	IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool
 	IsTargetNotRun(c *librefsm.Context) bool
 	IsBatteryNotActive(c *librefsm.Context) bool
-	IsBatteryBlockingSuspend(c *librefsm.Context) bool // battery active AND target is suspend
+	IsTargetSuspend(c *librefsm.Context) bool
+	IsTargetHibernate(c *librefsm.Context) bool
 
 	// Transition actions
 	OnPreSuspendTimeout(c *librefsm.Context) error

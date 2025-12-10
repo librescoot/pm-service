@@ -277,19 +277,22 @@ func (s *Service) onVehicleState(data []byte) error {
 }
 
 func (s *Service) onBatteryState(data []byte) error {
-	batteryState, err := s.redis.HGet("battery:0", "state")
+	newState, err := s.redis.HGet("battery:0", "state")
 	if err != nil {
 		return fmt.Errorf("failed to get battery state: %v", err)
 	}
 
-	s.fsmData.BatteryState = batteryState
-	s.logger.Printf("Battery state: %s", batteryState)
+	oldState := s.fsmData.BatteryState
+	s.fsmData.BatteryState = newState
+	s.logger.Printf("Battery state: %s", newState)
 
 	if s.machine != nil {
-		s.machine.Send(librefsm.Event{
-			ID:      fsm.EvBatteryStateChanged,
-			Payload: fsm.BatteryStatePayload{State: batteryState},
-		})
+		// Send semantic battery events
+		if oldState != "active" && newState == "active" {
+			s.machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameActive})
+		} else if oldState == "active" && newState != "active" {
+			s.machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameInactive})
+		}
 	}
 
 	return nil
@@ -433,6 +436,18 @@ func (s *Service) EnterPreSuspend(c *librefsm.Context) error {
 
 func (s *Service) EnterSuspendImminent(c *librefsm.Context) error {
 	s.logger.Printf("Entering suspend-imminent state")
+	// Publish imminent state
+	s.publishState(s.fsmData.TargetPowerState + "-imminent")
+	return nil
+}
+
+func (s *Service) EnterPreHibernate(c *librefsm.Context) error {
+	s.logger.Printf("Entering pre-hibernate state, waiting %v", s.config.PreSuspendDelay)
+	return nil
+}
+
+func (s *Service) EnterHibernateImminent(c *librefsm.Context) error {
+	s.logger.Printf("Entering hibernate-imminent state")
 	// Publish imminent state
 	s.publishState(s.fsmData.TargetPowerState + "-imminent")
 	return nil
@@ -635,8 +650,17 @@ func (s *Service) IsBatteryNotActive(c *librefsm.Context) bool {
 	return s.fsmData.BatteryState != "active"
 }
 
-func (s *Service) IsBatteryBlockingSuspend(c *librefsm.Context) bool {
-	return s.fsmData.TargetPowerState == fsm.TargetSuspend && s.fsmData.BatteryState == "active"
+func (s *Service) IsTargetSuspend(c *librefsm.Context) bool {
+	return s.fsmData.TargetPowerState == fsm.TargetSuspend
+}
+
+func (s *Service) IsTargetHibernate(c *librefsm.Context) bool {
+	// Hibernate includes all non-suspend low-power states except run
+	switch s.fsmData.TargetPowerState {
+	case fsm.TargetHibernate, fsm.TargetHibernateManual, fsm.TargetHibernateTimer, fsm.TargetReboot:
+		return true
+	}
+	return false
 }
 
 // Transition actions
@@ -714,9 +738,9 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 	switch state {
 	case fsm.StateRunning:
 		redisState = "running"
-	case fsm.StatePreSuspend:
+	case fsm.StatePreSuspend, fsm.StatePreHibernate:
 		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState) + "-pending"
-	case fsm.StateSuspendImminent:
+	case fsm.StateSuspendImminent, fsm.StateHibernateImminent:
 		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState + "-imminent")
 	case fsm.StateWaitingInhibitors:
 		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState + "-imminent")
