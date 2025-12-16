@@ -113,6 +113,47 @@ func (s *Service) Run(ctx context.Context) error {
 	// Enable wakeup on configured serial ports
 	s.enableWakeupSources()
 
+	// Set up Redis subscriptions FIRST (before FSM starts)
+	vehicleSubscriber := s.redis.Subscribe("vehicle")
+	if err := vehicleSubscriber.Handle("vehicle", s.onVehicleState); err != nil {
+		return fmt.Errorf("failed to subscribe to vehicle state: %v", err)
+	}
+
+	batterySubscriber := s.redis.Subscribe("battery:0")
+	if err := batterySubscriber.Handle("battery:0", s.onBatteryState); err != nil {
+		return fmt.Errorf("failed to subscribe to battery state: %v", err)
+	}
+
+	s.redis.HandleRequests("scooter:power", s.onPowerCommand)
+	s.redis.HandleRequests("scooter:governor", s.onGovernorCommand)
+
+	// Subscribe to hibernation inputs (for manual hibernation sequence)
+	buttonsSubscriber := s.redis.Subscribe("buttons")
+	if err := buttonsSubscriber.Handle("buttons", s.onHibernationInput); err != nil {
+		s.logger.Printf("Warning: failed to subscribe to hibernation input: %v", err)
+	}
+
+	seatboxSubscriber := s.redis.Subscribe("seatbox")
+	if err := seatboxSubscriber.Handle("seatbox", s.onSeatboxState); err != nil {
+		s.logger.Printf("Warning: failed to subscribe to seatbox state: %v", err)
+	}
+
+	// Start hibernation timer settings listener
+	go s.listenForHibernationSettings(ctx, s.standardRedis)
+
+	// Read initial states with retries
+	if err := s.readInitialStates(); err != nil {
+		return fmt.Errorf("failed to read initial states from Redis: %v", err)
+	}
+
+	// Manually trigger handlers once to bootstrap subscriptions
+	if err := s.onVehicleState(nil); err != nil {
+		s.logger.Printf("Warning: failed to trigger initial vehicle state: %v", err)
+	}
+	if err := s.onBatteryState(nil); err != nil {
+		s.logger.Printf("Warning: failed to trigger initial battery state: %v", err)
+	}
+
 	// Build FSM
 	def := fsm.NewDefinition(s, s.config.PreSuspendDelay, s.config.SuspendImminentDelay)
 	machine, err := def.Build(
@@ -134,39 +175,6 @@ func (s *Service) Run(ctx context.Context) error {
 	// Start FSM
 	if err := s.machine.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start FSM: %v", err)
-	}
-
-	// Set up Redis subscriptions
-	vehicleSubscriber := s.redis.Subscribe("vehicle")
-	if err := vehicleSubscriber.Handle("state", s.onVehicleState); err != nil {
-		return fmt.Errorf("failed to subscribe to vehicle state: %v", err)
-	}
-
-	batterySubscriber := s.redis.Subscribe("battery:0")
-	if err := batterySubscriber.Handle("state", s.onBatteryState); err != nil {
-		return fmt.Errorf("failed to subscribe to battery state: %v", err)
-	}
-
-	s.redis.HandleRequests("scooter:power", s.onPowerCommand)
-	s.redis.HandleRequests("scooter:governor", s.onGovernorCommand)
-
-	// Subscribe to hibernation inputs (for manual hibernation sequence)
-	buttonsSubscriber := s.redis.Subscribe("buttons")
-	if err := buttonsSubscriber.Handle("hibernation_input", s.onHibernationInput); err != nil {
-		s.logger.Printf("Warning: failed to subscribe to hibernation input: %v", err)
-	}
-
-	seatboxSubscriber := s.redis.Subscribe("seatbox")
-	if err := seatboxSubscriber.Handle("state", s.onSeatboxState); err != nil {
-		s.logger.Printf("Warning: failed to subscribe to seatbox state: %v", err)
-	}
-
-	// Start hibernation timer settings listener
-	go s.listenForHibernationSettings(ctx, s.standardRedis)
-
-	// Read initial states with retries
-	if err := s.readInitialStates(); err != nil {
-		return fmt.Errorf("failed to read initial states from Redis: %v", err)
 	}
 
 	// Publish initial power state
