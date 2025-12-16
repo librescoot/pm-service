@@ -22,7 +22,6 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithOnEnter(actions.EnterPreSuspend),
 			librefsm.WithTimeout(preSuspendDelay, EvPreSuspendTimeout),
 		).
-
 		State(StateSuspendImminent,
 			librefsm.WithOnEnter(actions.EnterSuspendImminent),
 			librefsm.WithTimeout(suspendImminentDelay, EvSuspendImminentTimeout),
@@ -33,7 +32,6 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithOnEnter(actions.EnterPreHibernate),
 			librefsm.WithTimeout(preSuspendDelay, EvPreSuspendTimeout),
 		).
-
 		State(StateHibernateImminent,
 			librefsm.WithOnEnter(actions.EnterHibernateImminent),
 			librefsm.WithTimeout(suspendImminentDelay, EvSuspendImminentTimeout),
@@ -43,46 +41,11 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		State(StateWaitingInhibitors,
 			librefsm.WithOnEnter(actions.EnterWaitingInhibitors),
 		).
-
 		State(StateIssuingLowPower,
 			librefsm.WithOnEnter(actions.EnterIssuingLowPower),
 			librefsm.WithOnExit(actions.ExitIssuingLowPower),
 		).
-
 		State(StateSuspended).
-
-		// === Hibernation Parent State ===
-
-		State(StateHibernation,
-			librefsm.WithOnEnter(actions.EnterHibernation),
-			librefsm.WithOnExit(actions.ExitHibernation),
-		).
-
-		// === Hibernation Substates ===
-
-		State(StateHibernationWaiting,
-			librefsm.WithParent(StateHibernation),
-			librefsm.WithOnEnter(actions.EnterHibernationWaiting),
-			librefsm.WithTimeout(HibernationStartTime, EvHibernationStartTimeout),
-		).
-
-		State(StateHibernationAdvanced,
-			librefsm.WithParent(StateHibernation),
-			librefsm.WithOnEnter(actions.EnterHibernationAdvanced),
-			librefsm.WithTimeout(HibernationAdvanceTime, EvHibernationAdvanceTimeout),
-		).
-
-		State(StateHibernationSeatbox,
-			librefsm.WithParent(StateHibernation),
-			librefsm.WithOnEnter(actions.EnterHibernationSeatbox),
-			librefsm.WithTimeout(HibernationExitTime, EvHibernationExitTimeout),
-		).
-
-		State(StateHibernationConfirm,
-			librefsm.WithParent(StateHibernation),
-			librefsm.WithOnEnter(actions.EnterHibernationConfirm),
-			librefsm.WithTimeout(HibernationConfirmTime, EvHibernationConfirmTimeout),
-		).
 
 		// === Transitions from Running ===
 
@@ -108,11 +71,6 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// Auto-hibernation timer expired
 		Transition(StateRunning, EvHibernationTimerExpired, StatePreHibernate,
 			librefsm.WithGuard(actions.CanEnterLowPowerState),
-		).
-
-		// Manual hibernation sequence start
-		Transition(StateRunning, EvHibernationStart, StateHibernationWaiting,
-			librefsm.WithGuard(actions.IsVehicleInStandbyOrParked),
 		).
 
 		// Vehicle state changes may enable low-power transition
@@ -260,49 +218,6 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		Transition(StateSuspended, EvWakeupRTC, StateRunning,
 			librefsm.WithAction(actions.OnWakeup),
 		).
-
-		// === Manual Hibernation Sequence Transitions ===
-
-		// Waiting → Advanced on timeout
-		Transition(StateHibernationWaiting, EvHibernationStartTimeout, StateHibernationAdvanced).
-
-		// Waiting → Running on input release or cancel
-		Transition(StateHibernationWaiting, EvHibernationInputReleased, StateRunning).
-		Transition(StateHibernationWaiting, EvHibernationCancel, StateRunning).
-
-		// Advanced → Seatbox on timeout
-		Transition(StateHibernationAdvanced, EvHibernationAdvanceTimeout, StateHibernationSeatbox).
-
-		// Advanced → Running on input release or cancel
-		Transition(StateHibernationAdvanced, EvHibernationInputReleased, StateRunning).
-		Transition(StateHibernationAdvanced, EvHibernationCancel, StateRunning).
-
-		// Seatbox → Confirm on seatbox closed
-		Transition(StateHibernationSeatbox, EvSeatboxClosed, StateHibernationConfirm).
-
-		// Seatbox → Running on timeout, input release, or cancel
-		Transition(StateHibernationSeatbox, EvHibernationExitTimeout, StateRunning).
-		Transition(StateHibernationSeatbox, EvHibernationInputReleased, StateRunning).
-		Transition(StateHibernationSeatbox, EvHibernationCancel, StateRunning).
-
-		// Confirm → PreHibernate on final button press (completes sequence)
-		Transition(StateHibernationConfirm, EvHibernationInputPressed, StatePreHibernate,
-			librefsm.WithAction(actions.OnHibernationComplete),
-		).
-
-		// Confirm → Running on timeout or cancel
-		Transition(StateHibernationConfirm, EvHibernationConfirmTimeout, StateRunning).
-		Transition(StateHibernationConfirm, EvHibernationCancel, StateRunning).
-
-		// === Global Hibernation Transitions (via parent) ===
-
-		// Cancel hibernation sequence if vehicle state changes
-		Transition(StateHibernation, EvVehicleStateChanged, StateRunning,
-			librefsm.WithGuard(actions.IsVehicleNotInStandbyOrParked),
-		).
-
-		// Cancel on power-run command
-		Transition(StateHibernation, EvPowerRun, StateRunning).
 
 		// Initial state
 		Initial(StateRunning)

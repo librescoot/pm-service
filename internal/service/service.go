@@ -127,17 +127,6 @@ func (s *Service) Run(ctx context.Context) error {
 	s.redis.HandleRequests("scooter:power", s.onPowerCommand)
 	s.redis.HandleRequests("scooter:governor", s.onGovernorCommand)
 
-	// Subscribe to hibernation inputs (for manual hibernation sequence)
-	buttonsSubscriber := s.redis.Subscribe("buttons")
-	if err := buttonsSubscriber.Handle("buttons", s.onHibernationInput); err != nil {
-		s.logger.Printf("Warning: failed to subscribe to hibernation input: %v", err)
-	}
-
-	seatboxSubscriber := s.redis.Subscribe("seatbox")
-	if err := seatboxSubscriber.Handle("seatbox", s.onSeatboxState); err != nil {
-		s.logger.Printf("Warning: failed to subscribe to seatbox state: %v", err)
-	}
-
 	// Start hibernation timer settings listener
 	go s.listenForHibernationSettings(ctx, s.standardRedis)
 
@@ -344,39 +333,6 @@ func (s *Service) onPowerCommand(data []byte) error {
 	return nil
 }
 
-func (s *Service) onHibernationInput(data []byte) error {
-	value := string(data)
-
-	if s.machine != nil {
-		switch value {
-		case "pressed":
-			// Check if we should start hibernation sequence
-			if s.machine.CurrentState() == fsm.StateRunning {
-				s.machine.Send(librefsm.Event{ID: fsm.EvHibernationStart})
-			} else if s.machine.IsInState(fsm.StateHibernationConfirm) {
-				s.machine.Send(librefsm.Event{ID: fsm.EvHibernationInputPressed})
-			}
-		case "released":
-			s.machine.Send(librefsm.Event{ID: fsm.EvHibernationInputReleased})
-		}
-	}
-
-	return nil
-}
-
-func (s *Service) onSeatboxState(data []byte) error {
-	state, err := s.redis.HGet("seatbox", "state")
-	if err != nil {
-		return err
-	}
-
-	if state == "closed" && s.machine != nil {
-		s.machine.Send(librefsm.Event{ID: fsm.EvSeatboxClosed})
-	}
-
-	return nil
-}
-
 func (s *Service) onInhibitorsChanged() {
 	// Publish inhibitors to Redis
 	s.publishInhibitors()
@@ -570,41 +526,6 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 	})
 }
 
-func (s *Service) EnterHibernation(c *librefsm.Context) error {
-	s.logger.Printf("Entering hibernation sequence")
-	return nil
-}
-
-func (s *Service) ExitHibernation(c *librefsm.Context) error {
-	s.logger.Printf("Exiting hibernation sequence")
-	s.publishHibernationState("idle")
-	return nil
-}
-
-func (s *Service) EnterHibernationWaiting(c *librefsm.Context) error {
-	s.logger.Printf("Hibernation: waiting for initial hold (15s)")
-	s.publishHibernationState("waiting-hibernation")
-	return nil
-}
-
-func (s *Service) EnterHibernationAdvanced(c *librefsm.Context) error {
-	s.logger.Printf("Hibernation: advanced state (10s)")
-	s.publishHibernationState("waiting-hibernation-advanced")
-	return nil
-}
-
-func (s *Service) EnterHibernationSeatbox(c *librefsm.Context) error {
-	s.logger.Printf("Hibernation: waiting for seatbox closure (60s)")
-	s.publishHibernationState("waiting-hibernation-seatbox")
-	return nil
-}
-
-func (s *Service) EnterHibernationConfirm(c *librefsm.Context) error {
-	s.logger.Printf("Hibernation: waiting for confirmation (3s)")
-	s.publishHibernationState("waiting-hibernation-confirm")
-	return nil
-}
-
 // Guards
 
 func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
@@ -695,12 +616,6 @@ func (s *Service) OnWakeup(c *librefsm.Context) error {
 	return nil
 }
 
-func (s *Service) OnHibernationComplete(c *librefsm.Context) error {
-	s.logger.Printf("Hibernation sequence complete, setting target to hibernate-manual")
-	s.fsmData.TargetPowerState = fsm.TargetHibernateManual
-	return nil
-}
-
 func (s *Service) OnDisableModem(c *librefsm.Context) error {
 	s.disableModem()
 	return nil
@@ -767,15 +682,6 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 
 	if _, err := tx.Exec(); err != nil {
 		s.logger.Printf("Failed to publish FSM state: %v", err)
-	}
-}
-
-func (s *Service) publishHibernationState(state string) {
-	pipe := s.standardRedis.Pipeline()
-	pipe.HSet(context.Background(), "hibernation", "state", state)
-	pipe.Publish(context.Background(), "hibernation", "state")
-	if _, err := pipe.Exec(context.Background()); err != nil {
-		s.logger.Printf("Warning: Failed to publish hibernation state: %v", err)
 	}
 }
 

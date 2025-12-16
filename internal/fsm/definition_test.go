@@ -21,38 +21,46 @@ type mockActions struct {
 	targetNotRun             bool
 }
 
-func (m *mockActions) EnterRunning(c *librefsm.Context) error                { return nil }
-func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error             { return nil }
-func (m *mockActions) EnterSuspendImminent(c *librefsm.Context) error        { return nil }
-func (m *mockActions) EnterPreHibernate(c *librefsm.Context) error           { return nil }
-func (m *mockActions) EnterHibernateImminent(c *librefsm.Context) error      { return nil }
-func (m *mockActions) EnterWaitingInhibitors(c *librefsm.Context) error      { return nil }
-func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error        { return nil }
-func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error         { return nil }
-func (m *mockActions) EnterHibernation(c *librefsm.Context) error            { return nil }
-func (m *mockActions) ExitHibernation(c *librefsm.Context) error             { return nil }
-func (m *mockActions) EnterHibernationWaiting(c *librefsm.Context) error     { return nil }
-func (m *mockActions) EnterHibernationAdvanced(c *librefsm.Context) error    { return nil }
-func (m *mockActions) EnterHibernationSeatbox(c *librefsm.Context) error     { return nil }
-func (m *mockActions) EnterHibernationConfirm(c *librefsm.Context) error     { return nil }
-func (m *mockActions) CanEnterLowPowerState(c *librefsm.Context) bool        { return m.canEnterLowPower }
-func (m *mockActions) HasNoBlockingInhibitors(c *librefsm.Context) bool      { return !m.hasBlockingInhibitors }
-func (m *mockActions) HasOnlyModemInhibitors(c *librefsm.Context) bool       { return m.hasOnlyModemInhibitors }
-func (m *mockActions) IsVehicleInStandbyOrParked(c *librefsm.Context) bool   { return m.vehicleInStandbyOrParked }
-func (m *mockActions) IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool { return m.vehicleNotInStandby }
-func (m *mockActions) IsTargetNotRun(c *librefsm.Context) bool               { return m.targetNotRun }
-func (m *mockActions) IsBatteryNotActive(c *librefsm.Context) bool           { return true }
-func (m *mockActions) IsTargetSuspend(c *librefsm.Context) bool              { return m.targetSuspend }
-func (m *mockActions) IsTargetHibernate(c *librefsm.Context) bool            { return m.targetHibernate }
-func (m *mockActions) OnPreSuspendTimeout(c *librefsm.Context) error         { return nil }
-func (m *mockActions) OnSuspendImminentTimeout(c *librefsm.Context) error    { return nil }
-func (m *mockActions) OnInhibitorsChanged(c *librefsm.Context) error         { return nil }
-func (m *mockActions) OnWakeup(c *librefsm.Context) error                    { return nil }
-func (m *mockActions) OnHibernationComplete(c *librefsm.Context) error       { return nil }
-func (m *mockActions) OnDisableModem(c *librefsm.Context) error              { return nil }
-func (m *mockActions) OnVehicleLeftLowPowerState(c *librefsm.Context) error  { return nil }
-func (m *mockActions) PublishState(state string) error                       { return nil }
-func (m *mockActions) PublishWakeupSource(reason string) error               { return nil }
+func (m *mockActions) EnterRunning(c *librefsm.Context) error             { return nil }
+func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error          { return nil }
+func (m *mockActions) EnterSuspendImminent(c *librefsm.Context) error     { return nil }
+func (m *mockActions) EnterPreHibernate(c *librefsm.Context) error        { return nil }
+func (m *mockActions) EnterHibernateImminent(c *librefsm.Context) error   { return nil }
+func (m *mockActions) EnterWaitingInhibitors(c *librefsm.Context) error   { return nil }
+func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error     { return nil }
+func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error      { return nil }
+func (m *mockActions) EnterHibernation(c *librefsm.Context) error         { return nil }
+func (m *mockActions) ExitHibernation(c *librefsm.Context) error          { return nil }
+func (m *mockActions) EnterHibernationWaiting(c *librefsm.Context) error  { return nil }
+func (m *mockActions) EnterHibernationAdvanced(c *librefsm.Context) error { return nil }
+func (m *mockActions) EnterHibernationSeatbox(c *librefsm.Context) error  { return nil }
+func (m *mockActions) EnterHibernationConfirm(c *librefsm.Context) error  { return nil }
+func (m *mockActions) CanEnterLowPowerState(c *librefsm.Context) bool     { return m.canEnterLowPower }
+func (m *mockActions) HasNoBlockingInhibitors(c *librefsm.Context) bool {
+	return !m.hasBlockingInhibitors
+}
+func (m *mockActions) HasOnlyModemInhibitors(c *librefsm.Context) bool {
+	return m.hasOnlyModemInhibitors
+}
+func (m *mockActions) IsVehicleInStandbyOrParked(c *librefsm.Context) bool {
+	return m.vehicleInStandbyOrParked
+}
+func (m *mockActions) IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool {
+	return m.vehicleNotInStandby
+}
+func (m *mockActions) IsTargetNotRun(c *librefsm.Context) bool              { return m.targetNotRun }
+func (m *mockActions) IsBatteryNotActive(c *librefsm.Context) bool          { return true }
+func (m *mockActions) IsTargetSuspend(c *librefsm.Context) bool             { return m.targetSuspend }
+func (m *mockActions) IsTargetHibernate(c *librefsm.Context) bool           { return m.targetHibernate }
+func (m *mockActions) OnPreSuspendTimeout(c *librefsm.Context) error        { return nil }
+func (m *mockActions) OnSuspendImminentTimeout(c *librefsm.Context) error   { return nil }
+func (m *mockActions) OnInhibitorsChanged(c *librefsm.Context) error        { return nil }
+func (m *mockActions) OnWakeup(c *librefsm.Context) error                   { return nil }
+func (m *mockActions) OnHibernationComplete(c *librefsm.Context) error      { return nil }
+func (m *mockActions) OnDisableModem(c *librefsm.Context) error             { return nil }
+func (m *mockActions) OnVehicleLeftLowPowerState(c *librefsm.Context) error { return nil }
+func (m *mockActions) PublishState(state string) error                      { return nil }
+func (m *mockActions) PublishWakeupSource(reason string) error              { return nil }
 
 func TestSuspendPathWithBattery(t *testing.T) {
 	actions := &mockActions{
@@ -259,10 +267,10 @@ func TestSuspendImminentCancelOnBattery(t *testing.T) {
 
 func TestWakeupRoutingBasedOnTarget(t *testing.T) {
 	tests := []struct {
-		name          string
-		targetSuspend bool
+		name            string
+		targetSuspend   bool
 		targetHibernate bool
-		expectedState librefsm.StateID
+		expectedState   librefsm.StateID
 	}{
 		{"suspend target routes to PreSuspend", true, false, fsm.StatePreSuspend},
 		{"hibernate target routes to PreHibernate", false, true, fsm.StatePreHibernate},
