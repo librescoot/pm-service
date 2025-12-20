@@ -14,10 +14,10 @@ type Config struct {
 	InhibitorDuration    time.Duration
 	HibernationTimer     time.Duration
 
-	SocketPath     string
-	DryRun         bool
-	DefaultState   string
-	WakeupSources  []string
+	SocketPath    string
+	DryRun        bool
+	DefaultState  string
+	WakeupSources []string
 }
 
 func New() *Config {
