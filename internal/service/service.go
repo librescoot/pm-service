@@ -668,28 +668,27 @@ func (s *Service) publishWakeupSource(reason string) {
 
 func (s *Service) publishInhibitors() {
 	inhibitors := s.inhibitorManager.GetInhibitors()
-
 	ctx := context.Background()
+	pub := s.client.NewHashPublisher("power-manager:busy-services")
 
-	// Delete the hash to start fresh
-	if _, err := s.client.Del(ctx, "power-manager:busy-services"); err != nil {
-		s.logger.Printf("Failed to delete busy-services: %v", err)
+	if len(inhibitors) == 0 {
+		// Clear the hash and notify
+		if err := pub.Clear(ctx); err != nil {
+			s.logger.Printf("Failed to clear busy-services: %v", err)
+		}
 		return
 	}
 
 	// Build map of all inhibitor fields
-	if len(inhibitors) > 0 {
-		fields := make(map[string]any)
-		for _, inh := range inhibitors {
-			field := fmt.Sprintf("%s %s %s", inh.Who, inh.Why, inh.What)
-			fields[field] = string(inh.Type)
-		}
+	fields := make(map[string]any)
+	for _, inh := range inhibitors {
+		field := fmt.Sprintf("%s %s %s", inh.Who, inh.Why, inh.What)
+		fields[field] = string(inh.Type)
+	}
 
-		// Set all fields and publish once
-		pub := s.client.NewHashPublisher("power-manager:busy-services")
-		if _, err := pub.SetManyIfChanged(ctx, fields); err != nil {
-			s.logger.Printf("Failed to publish inhibitors: %v", err)
-		}
+	// Atomically replace all fields (DEL + HMSET + PUBLISH)
+	if err := pub.ReplaceAll(ctx, fields); err != nil {
+		s.logger.Printf("Failed to publish inhibitors: %v", err)
 	}
 }
 
