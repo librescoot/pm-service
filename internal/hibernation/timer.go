@@ -5,15 +5,12 @@ import (
 	"log"
 	"sync"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // Timer manages the hibernation timer that triggers hibernation after extended standby
 type Timer struct {
 	mutex            sync.RWMutex
 	logger           *log.Logger
-	redis            *redis.Client
 	ctx              context.Context
 	timer            *time.Timer
 	timerDuration    time.Duration
@@ -24,10 +21,9 @@ type Timer struct {
 }
 
 // NewTimer creates a new hibernation timer
-func NewTimer(ctx context.Context, redis *redis.Client, logger *log.Logger, defaultDuration time.Duration, onHibernateTimer func()) *Timer {
+func NewTimer(ctx context.Context, logger *log.Logger, defaultDuration time.Duration, onHibernateTimer func()) *Timer {
 	return &Timer{
 		logger:           logger,
-		redis:            redis,
 		ctx:              ctx,
 		timerDuration:    defaultDuration,
 		active:           false,

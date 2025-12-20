@@ -1,10 +1,13 @@
-.PHONY: build clean build-arm build-amd64 dist lint test
+.PHONY: build build-host clean build-arm build-amd64 dist lint test fmt deps
 
 BINARY_NAME=pm-service
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "0.1.0")
 LDFLAGS=-ldflags "-w -s -X main.version=$(VERSION) -extldflags '-static'"
 
 build:
+	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BINARY_NAME) ./cmd/pm-service
+
+build-host:
 	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BINARY_NAME) ./cmd/pm-service
 
 clean:
@@ -24,3 +27,9 @@ lint:
 
 test:
 	go test -v ./...
+
+fmt:
+	go fmt ./...
+
+deps:
+	go mod download && go mod tidy
