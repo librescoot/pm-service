@@ -8,5 +8,7 @@ github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f h1:lO4WD4F/r
 github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f/go.mod h1:cuUVRXasLTGF7a8hSLbxyZXjz+1KgoB3wDUb6vlszIc=
 github.com/librescoot/redis-ipc v0.3.0 h1:hugSIhZRpJke7r7sr5YgMYMr+bmsmsecTlS3CUoKRE8=
 github.com/librescoot/redis-ipc v0.3.0/go.mod h1:S6CD2Na6Adn4Fs3bsMoPWc3dYi80jGx/lnaTDLjmC+g=
+github.com/librescoot/redis-ipc v0.4.0 h1:QDj7b3305/Cu973+S4yQdkx/0dAXoCi83ViCsmy63WI=
+github.com/librescoot/redis-ipc v0.4.0/go.mod h1:S6CD2Na6Adn4Fs3bsMoPWc3dYi80jGx/lnaTDLjmC+g=
 github.com/redis/go-redis/v9 v9.12.1 h1:k5iquqv27aBtnTm2tIkROUDp8JBXhXZIVu1InSgvovg=
 github.com/redis/go-redis/v9 v9.12.1/go.mod h1:huWgSWd8mW6+m0VPhJjSSQ+d6Nh1VICQ6Q5lHuCH/Iw=
