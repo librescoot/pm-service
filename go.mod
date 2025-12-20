@@ -4,8 +4,8 @@ go 1.22.1
 
 require (
 	github.com/librescoot/librefsm v0.3.0
+	github.com/librescoot/redis-ipc v0.3.0
 	github.com/redis/go-redis/v9 v9.12.1
-	github.com/rescoot/redis-ipc v0.2.0
 )
 
 require (
