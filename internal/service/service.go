@@ -29,6 +29,10 @@ type Service struct {
 	systemdClient    *systemd.Client
 	delayInhibitor   *inhibitor.Inhibitor
 
+	// Redis publishers (reusable)
+	powerManagerPub *ipc.HashPublisher
+	systemPub       *ipc.HashPublisher
+
 	// librefsm
 	machine *librefsm.Machine
 	fsmData *fsm.FSMData
@@ -57,10 +61,12 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 	}
 
 	service := &Service{
-		config:        cfg,
-		logger:        logger,
-		client:        client,
-		systemdClient: systemdClient,
+		config:          cfg,
+		logger:          logger,
+		client:          client,
+		systemdClient:   systemdClient,
+		powerManagerPub: client.NewHashPublisher("power-manager"),
+		systemPub:       client.NewHashPublisher("system"),
 		fsmData: &fsm.FSMData{
 			TargetPowerState: cfg.DefaultState,
 			VehicleState:     "",
@@ -619,8 +625,7 @@ func (s *Service) publishState(state string) error {
 	redisState := s.mapPowerStateToRedis(state)
 	s.logger.Printf("Publishing power state: %s (Redis: %s)", state, redisState)
 
-	pub := s.client.NewHashPublisher("power-manager")
-	if err := pub.Set(context.Background(), "state", redisState); err != nil {
+	if err := s.powerManagerPub.Set(context.Background(), "state", redisState); err != nil {
 		s.logger.Printf("Failed to publish power state: %v", err)
 		return err
 	}
@@ -648,8 +653,7 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 		return
 	}
 
-	pub := s.client.NewHashPublisher("power-manager")
-	if err := pub.Set(context.Background(), "state", redisState); err != nil {
+	if err := s.powerManagerPub.Set(context.Background(), "state", redisState); err != nil {
 		s.logger.Printf("Failed to publish FSM state: %v", err)
 	}
 }
@@ -657,8 +661,7 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 func (s *Service) publishWakeupSource(reason string) {
 	s.logger.Printf("Publishing wakeup source: %s", reason)
 
-	pub := s.client.NewHashPublisher("power-manager")
-	if err := pub.Set(context.Background(), "wakeup-source", reason); err != nil {
+	if err := s.powerManagerPub.Set(context.Background(), "wakeup-source", reason); err != nil {
 		s.logger.Printf("Failed to publish wakeup source: %v", err)
 	}
 }
@@ -668,18 +671,24 @@ func (s *Service) publishInhibitors() {
 
 	ctx := context.Background()
 
-	// Delete the hash
+	// Delete the hash to start fresh
 	if _, err := s.client.Del(ctx, "power-manager:busy-services"); err != nil {
 		s.logger.Printf("Failed to delete busy-services: %v", err)
 		return
 	}
 
-	// Set each inhibitor field
-	pub := s.client.NewHashPublisher("power-manager:busy-services")
-	for _, inh := range inhibitors {
-		field := fmt.Sprintf("%s %s %s", inh.Who, inh.Why, inh.What)
-		if err := pub.Set(ctx, field, string(inh.Type)); err != nil {
-			s.logger.Printf("Failed to publish inhibitor %s: %v", field, err)
+	// Build map of all inhibitor fields
+	if len(inhibitors) > 0 {
+		fields := make(map[string]any)
+		for _, inh := range inhibitors {
+			field := fmt.Sprintf("%s %s %s", inh.Who, inh.Why, inh.What)
+			fields[field] = string(inh.Type)
+		}
+
+		// Set all fields and publish once
+		pub := s.client.NewHashPublisher("power-manager:busy-services")
+		if _, err := pub.SetManyIfChanged(ctx, fields); err != nil {
+			s.logger.Printf("Failed to publish inhibitors: %v", err)
 		}
 	}
 }
@@ -760,8 +769,7 @@ func (s *Service) setGovernor(governor string) error {
 
 	s.logger.Printf("Successfully set CPU governor to %s", governor)
 
-	pub := s.client.NewHashPublisher("system")
-	if err := pub.Set(context.Background(), "cpu:governor", governor); err != nil {
+	if err := s.systemPub.Set(context.Background(), "cpu:governor", governor); err != nil {
 		s.logger.Printf("Warning: Failed to publish governor change: %v", err)
 	}
 
