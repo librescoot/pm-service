@@ -43,6 +43,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		ipc.WithAddress(cfg.RedisHost),
 		ipc.WithPort(cfg.RedisPort),
 		ipc.WithRetryInterval(5*time.Second),
+		ipc.WithCodec(ipc.StringCodec{}), // Use plain string codec for API compatibility
 		ipc.WithOnDisconnect(func(err error) {
 			if err != nil {
 				logger.Printf("Redis disconnected: %v", err)
@@ -276,8 +277,7 @@ func (s *Service) onBatteryState(newState string) error {
 	return nil
 }
 
-func (s *Service) onPowerCommand(data []byte) error {
-	command := string(data)
+func (s *Service) onPowerCommand(command string) error {
 	s.logger.Printf("Received power command: %s", command)
 
 	// Check priority and update target state
@@ -324,8 +324,7 @@ func (s *Service) onInhibitorsChanged() {
 	}
 }
 
-func (s *Service) onGovernorCommand(data []byte) error {
-	governor := string(data)
+func (s *Service) onGovernorCommand(governor string) error {
 	s.logger.Printf("Received governor command: %s", governor)
 
 	switch governor {
