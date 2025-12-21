@@ -169,10 +169,10 @@ func (s *Service) Run(ctx context.Context) error {
 	// Publish initial power state
 	s.publishFSMState(s.machine.CurrentState())
 
-	// Initialize hibernation timer based on initial vehicle state
-	if s.fsmData.VehicleState == "stand-by" || s.fsmData.VehicleState == "parked" {
+	// Initialize hibernation timer if vehicle is not actively being used
+	if s.fsmData.VehicleState != "ready-to-drive" {
 		s.hibernationTimer.ResetTimer(true)
-		s.logger.Printf("Initialized hibernation timer based on initial vehicle state: %s", s.fsmData.VehicleState)
+		s.logger.Printf("Initialized hibernation timer - vehicle in idle state: %s", s.fsmData.VehicleState)
 	}
 
 	// Trigger low-power sequence evaluation if default state is not "run"
@@ -250,11 +250,22 @@ func (s *Service) onVehicleState(data []byte) error {
 	s.logger.Printf("Vehicle state: %s", vehicleState)
 
 	// Update hibernation timer based on vehicle state
-	if vehicleState == "stand-by" || vehicleState == "parked" {
+	// Timer runs in all unattended/idle states (everything except ready-to-drive)
+	// Timer resets when leaving ready-to-drive (user finished using scooter)
+	isActive := vehicleState == "ready-to-drive"
+	wasActive := oldState == "ready-to-drive"
+
+	if wasActive && !isActive {
+		// Just left ready-to-drive - reset timer for fresh countdown
 		s.hibernationTimer.ResetTimer(true)
-	} else {
+	} else if isActive && !wasActive {
+		// Entering ready-to-drive - stop timer
 		s.hibernationTimer.ResetTimer(false)
+	} else if !isActive && oldState == "" {
+		// Bootstrap: starting in idle state - start timer
+		s.hibernationTimer.ResetTimer(true)
 	}
+	// Else: transitions between idle states (timer continues) or staying in ready-to-drive
 
 	// Send FSM event
 	if s.machine != nil {
