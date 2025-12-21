@@ -109,24 +109,20 @@ func (s *Service) Run(ctx context.Context) error {
 	s.enableWakeupSources()
 
 	// Set up Redis hash watchers FIRST (before FSM starts)
-	vehicleWatcher := s.client.NewHashWatcher("vehicle")
-	vehicleWatcher.OnField("state", func(state string) error {
-		return s.onVehicleState(state)
-	})
-	vehicleWatcher.StartWithSync()
+	s.client.NewHashWatcher("vehicle").
+		OnField("state", s.onVehicleState).
+		StartWithSync()
 
-	batteryWatcher := s.client.NewHashWatcher("battery:0")
-	batteryWatcher.OnField("state", func(state string) error {
-		return s.onBatteryState(state)
-	})
-	batteryWatcher.StartWithSync()
+	s.client.NewHashWatcher("battery:0").
+		OnField("state", s.onBatteryState).
+		StartWithSync()
 
 	// Set up queue handlers
 	ipc.HandleRequests(s.client, "scooter:power", s.onPowerCommand)
 	ipc.HandleRequests(s.client, "scooter:governor", s.onGovernorCommand)
 
 	// Start hibernation timer settings listener
-	go s.listenForHibernationSettings(ctx)
+	go s.listenForHibernationSettings()
 
 	// Build FSM
 	def := fsm.NewDefinition(s, s.config.PreSuspendDelay, s.config.SuspendImminentDelay)
@@ -756,16 +752,16 @@ func (s *Service) enableWakeupSources() {
 	}
 }
 
-func (s *Service) listenForHibernationSettings(ctx context.Context) {
-	watcher := s.client.NewHashWatcher("settings")
-	watcher.OnField("hibernation-timer", func(value string) error {
-		if timerValue, err := strconv.ParseInt(value, 10, 32); err == nil {
-			s.hibernationTimer.SetTimerValue(int32(timerValue))
-			s.logger.Printf("Updated hibernation timer setting: %d seconds", timerValue)
-		} else {
-			s.logger.Printf("Failed to parse hibernation timer setting: %v", err)
-		}
-		return nil
-	})
-	watcher.StartWithSync()
+func (s *Service) listenForHibernationSettings() {
+	s.client.NewHashWatcher("settings").
+		OnField("hibernation-timer", func(value string) error {
+			if timerValue, err := strconv.ParseInt(value, 10, 32); err == nil {
+				s.hibernationTimer.SetTimerValue(int32(timerValue))
+				s.logger.Printf("Updated hibernation timer setting: %d seconds", timerValue)
+			} else {
+				s.logger.Printf("Failed to parse hibernation timer setting: %v", err)
+			}
+			return nil
+		}).
+		StartWithSync()
 }
