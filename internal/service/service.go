@@ -29,10 +29,6 @@ type Service struct {
 	systemdClient    *systemd.Client
 	delayInhibitor   *inhibitor.Inhibitor
 
-	// Redis publishers (reusable)
-	powerManagerPub *ipc.HashPublisher
-	systemPub       *ipc.HashPublisher
-
 	// librefsm
 	machine *librefsm.Machine
 	fsmData *fsm.FSMData
@@ -62,12 +58,10 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 	}
 
 	service := &Service{
-		config:          cfg,
-		logger:          logger,
-		client:          client,
-		systemdClient:   systemdClient,
-		powerManagerPub: client.NewHashPublisher("power-manager"),
-		systemPub:       client.NewHashPublisher("system"),
+		config:        cfg,
+		logger:        logger,
+		client:        client,
+		systemdClient: systemdClient,
 		fsmData: &fsm.FSMData{
 			TargetPowerState: cfg.DefaultState,
 			VehicleState:     "",
@@ -119,13 +113,13 @@ func (s *Service) Run(ctx context.Context) error {
 	vehicleWatcher.OnField("state", func(state string) error {
 		return s.onVehicleState(state)
 	})
-	vehicleWatcher.StartWithSync(ctx)
+	vehicleWatcher.StartWithSync()
 
 	batteryWatcher := s.client.NewHashWatcher("battery:0")
 	batteryWatcher.OnField("state", func(state string) error {
 		return s.onBatteryState(state)
 	})
-	batteryWatcher.StartWithSync(ctx)
+	batteryWatcher.StartWithSync()
 
 	// Set up queue handlers
 	ipc.HandleRequests(s.client, "scooter:power", s.onPowerCommand)
@@ -203,10 +197,9 @@ func (s *Service) readInitialStates() error {
 
 	s.logger.Printf("Reading initial vehicle and battery states from Redis...")
 
-	ctx := context.Background()
 	for i := range maxRetries {
-		vehicleState, vehicleErr := s.client.HGet(ctx, "vehicle", "state")
-		batteryState, batteryErr := s.client.HGet(ctx, "battery:0", "state")
+		vehicleState, vehicleErr := s.client.HGet("vehicle", "state")
+		batteryState, batteryErr := s.client.HGet("battery:0", "state")
 
 		if vehicleErr == nil && batteryErr == nil {
 			s.fsmData.VehicleState = vehicleState
@@ -635,7 +628,7 @@ func (s *Service) publishState(state string) error {
 	redisState := s.mapPowerStateToRedis(state)
 	s.logger.Printf("Publishing power state: %s (Redis: %s)", state, redisState)
 
-	if err := s.powerManagerPub.Set(context.Background(), "state", redisState); err != nil {
+	if err := s.client.Hash("power-manager").Set("state", redisState); err != nil {
 		s.logger.Printf("Failed to publish power state: %v", err)
 		return err
 	}
@@ -663,7 +656,7 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 		return
 	}
 
-	if err := s.powerManagerPub.Set(context.Background(), "state", redisState); err != nil {
+	if err := s.client.Hash("power-manager").Set("state", redisState); err != nil {
 		s.logger.Printf("Failed to publish FSM state: %v", err)
 	}
 }
@@ -671,19 +664,17 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 func (s *Service) publishWakeupSource(reason string) {
 	s.logger.Printf("Publishing wakeup source: %s", reason)
 
-	if err := s.powerManagerPub.Set(context.Background(), "wakeup-source", reason); err != nil {
+	if err := s.client.Hash("power-manager").Set("wakeup-source", reason); err != nil {
 		s.logger.Printf("Failed to publish wakeup source: %v", err)
 	}
 }
 
 func (s *Service) publishInhibitors() {
 	inhibitors := s.inhibitorManager.GetInhibitors()
-	ctx := context.Background()
-	pub := s.client.NewHashPublisher("power-manager:busy-services")
 
 	if len(inhibitors) == 0 {
 		// Clear the hash and notify
-		if err := pub.Clear(ctx); err != nil {
+		if err := s.client.Hash("power-manager:busy-services").Clear(); err != nil {
 			s.logger.Printf("Failed to clear busy-services: %v", err)
 		}
 		return
@@ -697,7 +688,7 @@ func (s *Service) publishInhibitors() {
 	}
 
 	// Atomically replace all fields (DEL + HMSET + PUBLISH)
-	if err := pub.ReplaceAll(ctx, fields); err != nil {
+	if err := s.client.Hash("power-manager:busy-services").ReplaceAll(fields); err != nil {
 		s.logger.Printf("Failed to publish inhibitors: %v", err)
 	}
 }
@@ -758,7 +749,7 @@ func (s *Service) disableModem() {
 	}
 
 	s.logger.Printf("Issuing modem to turn off")
-	if err := ipc.SendRequest(s.client, context.Background(), "scooter:modem", "disable"); err != nil {
+	if err := ipc.SendRequest(s.client, "scooter:modem", "disable"); err != nil {
 		s.logger.Printf("Failed to disable modem: %v", err)
 		return
 	}
@@ -778,7 +769,7 @@ func (s *Service) setGovernor(governor string) error {
 
 	s.logger.Printf("Successfully set CPU governor to %s", governor)
 
-	if err := s.systemPub.Set(context.Background(), "cpu:governor", governor); err != nil {
+	if err := s.client.Hash("system").Set("cpu:governor", governor); err != nil {
 		s.logger.Printf("Warning: Failed to publish governor change: %v", err)
 	}
 
@@ -807,5 +798,5 @@ func (s *Service) listenForHibernationSettings(ctx context.Context) {
 		}
 		return nil
 	})
-	watcher.StartWithSync(ctx)
+	watcher.StartWithSync()
 }
