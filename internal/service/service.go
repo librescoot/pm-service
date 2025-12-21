@@ -191,37 +191,6 @@ func (s *Service) Run(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) readInitialStates() error {
-	const maxRetries = 10
-	const retryDelay = 500 * time.Millisecond
-
-	s.logger.Printf("Reading initial vehicle and battery states from Redis...")
-
-	for i := range maxRetries {
-		vehicleState, vehicleErr := s.client.HGet("vehicle", "state")
-		batteryState, batteryErr := s.client.HGet("battery:0", "state")
-
-		if vehicleErr == nil && batteryErr == nil {
-			s.fsmData.VehicleState = vehicleState
-			s.fsmData.BatteryState = batteryState
-			s.logger.Printf("Successfully read initial states - Vehicle: %s, Battery: %s", vehicleState, batteryState)
-			return nil
-		}
-
-		if i < maxRetries-1 {
-			s.logger.Printf("Failed to read initial states (attempt %d/%d) - Vehicle error: %v, Battery error: %v. Retrying in %v...",
-				i+1, maxRetries, vehicleErr, batteryErr, retryDelay)
-			time.Sleep(retryDelay)
-		}
-	}
-
-	s.fsmData.VehicleState = "initializing"
-	s.fsmData.BatteryState = "initializing"
-	s.logger.Printf("WARNING: Failed to read initial states from Redis after %d attempts. Using safe default state 'initializing'.", maxRetries)
-
-	return nil
-}
-
 // Redis handlers - send FSM events
 
 func (s *Service) onVehicleState(vehicleState string) error {
