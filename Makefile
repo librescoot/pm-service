@@ -1,7 +1,7 @@
 .PHONY: build clean build-arm build-amd64 dist lint test
 
 BINARY_NAME=pm-service
-VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "0.1.0")
+VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS=-ldflags "-w -s -X main.version=$(VERSION) -extldflags '-static'"
 
 build:

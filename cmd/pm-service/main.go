@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -11,9 +13,17 @@ import (
 	"github.com/librescoot/pm-service/internal/service"
 )
 
-var version = "unknown"
+var version = "dev"
 
 func main() {
+	showVersion := flag.Bool("version", false, "Print version and exit")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("pm-service %s\n", version)
+		return
+	}
+
 	var logger *log.Logger
 	if os.Getenv("INVOCATION_ID") != "" {
 		logger = log.New(os.Stdout, "", 0)
