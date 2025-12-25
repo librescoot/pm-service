@@ -1,4 +1,4 @@
-# Librescoot Power Management Service
+# LibreScoot Power Management Service
 
 The power management service is responsible for managing power states (run, suspend, hibernate, poweroff, reboot) on the scooter. It monitors vehicle and battery state via Redis, handles power state transitions, and manages inhibitors to prevent unwanted power state changes.
 
