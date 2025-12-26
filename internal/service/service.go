@@ -18,7 +18,7 @@ import (
 	"github.com/librescoot/pm-service/internal/inhibitor"
 	"github.com/librescoot/pm-service/internal/systemd"
 	"github.com/redis/go-redis/v9"
-	redis_ipc "github.com/rescoot/redis-ipc"
+	redis_ipc "github.com/librescoot/redis-ipc"
 )
 
 type Service struct {
@@ -30,6 +30,8 @@ type Service struct {
 	hibernationTimer *hibernation.Timer
 	systemdClient    *systemd.Client
 	delayInhibitor   *inhibitor.Inhibitor
+	powerManagerPub  *redis_ipc.HashPublisher
+	systemPub        *redis_ipc.HashPublisher
 
 	// librefsm
 	machine *librefsm.Machine
@@ -37,14 +39,13 @@ type Service struct {
 }
 
 func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
-	redisConfig := redis_ipc.Config{
-		Address:       cfg.RedisHost,
-		Port:          cfg.RedisPort,
-		RetryInterval: 5 * time.Second,
-		MaxRetries:    3,
-	}
-
-	redisClient, err := redis_ipc.New(redisConfig)
+	redisClient, err := redis_ipc.New(
+		redis_ipc.WithAddress(cfg.RedisHost),
+		redis_ipc.WithPort(cfg.RedisPort),
+		redis_ipc.WithRetryInterval(5*time.Second),
+		redis_ipc.WithMaxRetries(3),
+		redis_ipc.WithCodec(redis_ipc.StringCodec{}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Redis client: %v", err)
 	}
@@ -61,11 +62,13 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 	}
 
 	service := &Service{
-		config:        cfg,
-		logger:        logger,
-		redis:         redisClient,
-		standardRedis: standardRedisClient,
-		systemdClient: systemdClient,
+		config:          cfg,
+		logger:          logger,
+		redis:           redisClient,
+		standardRedis:   standardRedisClient,
+		systemdClient:   systemdClient,
+		powerManagerPub: redisClient.NewHashPublisher("power-manager"),
+		systemPub:       redisClient.NewHashPublisher("system"),
 		fsmData: &fsm.FSMData{
 			TargetPowerState: cfg.DefaultState,
 			VehicleState:     "",
@@ -113,35 +116,25 @@ func (s *Service) Run(ctx context.Context) error {
 	// Enable wakeup on configured serial ports
 	s.enableWakeupSources()
 
-	// Set up Redis subscriptions FIRST (before FSM starts)
-	vehicleSubscriber := s.redis.Subscribe("vehicle")
-	if err := vehicleSubscriber.Handle("vehicle", s.onVehicleState); err != nil {
-		return fmt.Errorf("failed to subscribe to vehicle state: %v", err)
+	// Set up Redis hash watchers with initial sync
+	// StartWithSync fetches current state and calls handlers before processing new messages
+	if err := s.redis.NewHashWatcher("vehicle").
+		OnField("state", s.onVehicleStateChanged).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start vehicle state watcher: %v", err)
 	}
 
-	batterySubscriber := s.redis.Subscribe("battery:0")
-	if err := batterySubscriber.Handle("battery:0", s.onBatteryState); err != nil {
-		return fmt.Errorf("failed to subscribe to battery state: %v", err)
+	if err := s.redis.NewHashWatcher("battery:0").
+		OnField("state", s.onBatteryStateChanged).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start battery state watcher: %v", err)
 	}
 
-	s.redis.HandleRequests("scooter:power", s.onPowerCommand)
-	s.redis.HandleRequests("scooter:governor", s.onGovernorCommand)
+	redis_ipc.HandleRequests(s.redis, "scooter:power", s.onPowerCommand)
+	redis_ipc.HandleRequests(s.redis, "scooter:governor", s.onGovernorCommand)
 
 	// Start hibernation timer settings listener
 	go s.listenForHibernationSettings(ctx, s.standardRedis)
-
-	// Read initial states with retries
-	if err := s.readInitialStates(); err != nil {
-		return fmt.Errorf("failed to read initial states from Redis: %v", err)
-	}
-
-	// Manually trigger handlers once to bootstrap subscriptions
-	if err := s.onVehicleState(nil); err != nil {
-		s.logger.Printf("Warning: failed to trigger initial vehicle state: %v", err)
-	}
-	if err := s.onBatteryState(nil); err != nil {
-		s.logger.Printf("Warning: failed to trigger initial battery state: %v", err)
-	}
 
 	// Build FSM
 	def := fsm.NewDefinition(s, s.config.PreSuspendDelay, s.config.SuspendImminentDelay)
@@ -239,15 +232,14 @@ func (s *Service) readInitialStates() error {
 
 // Redis handlers - send FSM events
 
-func (s *Service) onVehicleState(data []byte) error {
-	vehicleState, err := s.redis.HGet("vehicle", "state")
-	if err != nil {
-		return fmt.Errorf("failed to get vehicle state: %v", err)
-	}
-
+func (s *Service) onVehicleStateChanged(vehicleState string) error {
 	oldState := s.fsmData.VehicleState
 	s.fsmData.VehicleState = vehicleState
-	s.logger.Printf("Vehicle state: %s", vehicleState)
+
+	// Only log when state actually changes
+	if oldState != vehicleState {
+		s.logger.Printf("Vehicle state: %s -> %s", oldState, vehicleState)
+	}
 
 	// Update hibernation timer based on vehicle state
 	// Timer runs in all unattended/idle states (everything except ready-to-drive)
@@ -284,15 +276,14 @@ func (s *Service) onVehicleState(data []byte) error {
 	return nil
 }
 
-func (s *Service) onBatteryState(data []byte) error {
-	newState, err := s.redis.HGet("battery:0", "state")
-	if err != nil {
-		return fmt.Errorf("failed to get battery state: %v", err)
-	}
-
+func (s *Service) onBatteryStateChanged(newState string) error {
 	oldState := s.fsmData.BatteryState
 	s.fsmData.BatteryState = newState
-	s.logger.Printf("Battery state: %s", newState)
+
+	// Only log when state actually changes
+	if oldState != newState {
+		s.logger.Printf("Battery state: %s -> %s", oldState, newState)
+	}
 
 	if s.machine != nil {
 		// Send semantic battery events
@@ -306,8 +297,7 @@ func (s *Service) onBatteryState(data []byte) error {
 	return nil
 }
 
-func (s *Service) onPowerCommand(data []byte) error {
-	command := string(data)
+func (s *Service) onPowerCommand(command string) error {
 	s.logger.Printf("Received power command: %s", command)
 
 	// Check priority and update target state
@@ -354,8 +344,7 @@ func (s *Service) onInhibitorsChanged() {
 	}
 }
 
-func (s *Service) onGovernorCommand(data []byte) error {
-	governor := string(data)
+func (s *Service) onGovernorCommand(governor string) error {
 	s.logger.Printf("Received governor command: %s", governor)
 
 	switch governor {
@@ -553,7 +542,7 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 		return true
 	}
 
-	if s.fsmData.VehicleState != "stand-by" && s.fsmData.VehicleState != "parked" {
+	if s.fsmData.VehicleState != "stand-by" && s.fsmData.VehicleState != "parked" && s.fsmData.VehicleState != "shutting-down" {
 		s.logger.Printf("Cannot enter low power state: vehicle state is %s", s.fsmData.VehicleState)
 		return false
 	}
@@ -655,11 +644,7 @@ func (s *Service) publishState(state string) error {
 	redisState := s.mapPowerStateToRedis(state)
 	s.logger.Printf("Publishing power state: %s (Redis: %s)", state, redisState)
 
-	tx := s.redis.NewTxGroup("power-state")
-	tx.Add("HSET", "power-manager", "state", redisState)
-	tx.Add("PUBLISH", "power-manager", "state")
-
-	if _, err := tx.Exec(); err != nil {
+	if err := s.powerManagerPub.Set("state", redisState); err != nil {
 		s.logger.Printf("Failed to publish power state: %v", err)
 		return err
 	}
@@ -687,11 +672,7 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 		return
 	}
 
-	tx := s.redis.NewTxGroup("power-state")
-	tx.Add("HSET", "power-manager", "state", redisState)
-	tx.Add("PUBLISH", "power-manager", "state")
-
-	if _, err := tx.Exec(); err != nil {
+	if err := s.powerManagerPub.Set("state", redisState); err != nil {
 		s.logger.Printf("Failed to publish FSM state: %v", err)
 	}
 }
@@ -699,11 +680,7 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 func (s *Service) publishWakeupSource(reason string) {
 	s.logger.Printf("Publishing wakeup source: %s", reason)
 
-	tx := s.redis.NewTxGroup("wakeup-source")
-	tx.Add("HSET", "power-manager", "wakeup-source", reason)
-	tx.Add("PUBLISH", "power-manager", "wakeup-source")
-
-	if _, err := tx.Exec(); err != nil {
+	if err := s.powerManagerPub.Set("wakeup-source", reason); err != nil {
 		s.logger.Printf("Failed to publish wakeup source: %v", err)
 	}
 }
@@ -711,18 +688,16 @@ func (s *Service) publishWakeupSource(reason string) {
 func (s *Service) publishInhibitors() {
 	inhibitors := s.inhibitorManager.GetInhibitors()
 
-	tx := s.redis.NewTxGroup("inhibitors")
-	tx.Add("DEL", "power-manager:busy-services")
-
+	// Build fields map for HashPublisher.ReplaceAll
+	fields := make(map[string]any)
 	for _, inh := range inhibitors {
-		tx.Add("HSET", "power-manager:busy-services",
-			fmt.Sprintf("%s %s %s", inh.Who, inh.Why, inh.What),
-			string(inh.Type))
+		key := fmt.Sprintf("%s %s %s", inh.Who, inh.Why, inh.What)
+		fields[key] = string(inh.Type)
 	}
 
-	tx.Add("PUBLISH", "power-manager:busy-services", "updated")
-
-	if _, err := tx.Exec(); err != nil {
+	// ReplaceAll does: DEL + HMSET + PUBLISH atomically
+	busyServicesPub := s.redis.NewHashPublisher("power-manager:busy-services")
+	if err := busyServicesPub.ReplaceAll(fields); err != nil {
 		s.logger.Printf("Failed to publish inhibitors: %v", err)
 	}
 }
@@ -803,11 +778,7 @@ func (s *Service) setGovernor(governor string) error {
 
 	s.logger.Printf("Successfully set CPU governor to %s", governor)
 
-	tx := s.redis.NewTxGroup("governor")
-	tx.Add("HSET", "system", "cpu:governor", governor)
-	tx.Add("PUBLISH", "system", "cpu:governor")
-
-	if _, err := tx.Exec(); err != nil {
+	if err := s.systemPub.Set("cpu:governor", governor); err != nil {
 		s.logger.Printf("Warning: Failed to publish governor change: %v", err)
 	}
 
