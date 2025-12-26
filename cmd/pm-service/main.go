@@ -16,7 +16,9 @@ import (
 var version = "dev"
 
 func main() {
+	cfg := config.New()
 	showVersion := flag.Bool("version", false, "Print version and exit")
+	cfg.RegisterFlags()
 	flag.Parse()
 
 	if *showVersion {
@@ -30,9 +32,6 @@ func main() {
 	} else {
 		logger = log.New(os.Stdout, "librescoot-pm: ", log.LstdFlags|log.Lmsgprefix)
 	}
-
-	cfg := config.New()
-	cfg.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

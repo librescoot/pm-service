@@ -35,7 +35,7 @@ func New() *Config {
 	}
 }
 
-func (c *Config) Parse() {
+func (c *Config) RegisterFlags() {
 	flag.StringVar(&c.RedisHost, "redis-host", c.RedisHost, "Redis host")
 	flag.IntVar(&c.RedisPort, "redis-port", c.RedisPort, "Redis port")
 
@@ -56,6 +56,4 @@ func (c *Config) Parse() {
 
 	flag.StringVar(&c.DefaultState, "default-state", c.DefaultState,
 		"Default power state (run, suspend, hibernate, hibernate-manual, hibernate-timer, reboot)")
-
-	flag.Parse()
 }
