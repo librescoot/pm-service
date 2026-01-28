@@ -137,17 +137,17 @@ func (t *Timer) stopTimer() {
 // onTimer is called when the hibernation timer expires
 func (t *Timer) onTimer() {
 	t.mutex.RLock()
-	defer t.mutex.RUnlock()
-
-	// Double-check that we should still trigger hibernation
 	if !t.active {
+		t.mutex.RUnlock()
 		return
 	}
+	cb := t.onHibernateTimer
+	t.mutex.RUnlock()
 
 	t.logger.Printf("Hibernation timer expired, triggering hibernation")
 
-	if t.onHibernateTimer != nil {
-		t.onHibernateTimer()
+	if cb != nil {
+		cb()
 	}
 }
 
