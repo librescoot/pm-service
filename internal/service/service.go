@@ -30,8 +30,9 @@ type Service struct {
 	inhibitorManager *inhibitor.Manager
 	hibernationTimer *hibernation.Timer
 	systemdClient    *systemd.Client
-	delayInhibitor   *inhibitor.Inhibitor
-	delayInhibitorMu sync.Mutex
+	delayInhibitor       *inhibitor.Inhibitor
+	delayInhibitorMu     sync.Mutex
+	cancelDelayRemoval   context.CancelFunc
 	powerManagerPub  *redis_ipc.HashPublisher
 	systemPub        *redis_ipc.HashPublisher
 	ctx              context.Context
@@ -484,6 +485,15 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 }
 
 func (s *Service) ExitIssuingLowPower(c *librefsm.Context) error {
+	s.delayInhibitorMu.Lock()
+	// Cancel any previous pending removal
+	if s.cancelDelayRemoval != nil {
+		s.cancelDelayRemoval()
+	}
+	removalCtx, cancel := context.WithCancel(s.ctx)
+	s.cancelDelayRemoval = cancel
+	s.delayInhibitorMu.Unlock()
+
 	go func() {
 		select {
 		case <-time.After(s.config.InhibitorDuration):
@@ -493,7 +503,8 @@ func (s *Service) ExitIssuingLowPower(c *librefsm.Context) error {
 				s.inhibitorManager.RemoveInhibitor(s.delayInhibitor)
 				s.delayInhibitor = nil
 			}
-		case <-s.ctx.Done():
+			s.cancelDelayRemoval = nil
+		case <-removalCtx.Done():
 			return
 		}
 	}()
@@ -513,8 +524,12 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 
 	s.logger.Printf("Wakeup detected with reason: %s", wakeupReason)
 
-	// Re-add delay inhibitor
+	// Cancel any pending delay inhibitor removal and re-add if needed
 	s.delayInhibitorMu.Lock()
+	if s.cancelDelayRemoval != nil {
+		s.cancelDelayRemoval()
+		s.cancelDelayRemoval = nil
+	}
 	if s.delayInhibitor == nil {
 		s.delayInhibitor = s.inhibitorManager.AddInhibitor(
 			"pm-service",
