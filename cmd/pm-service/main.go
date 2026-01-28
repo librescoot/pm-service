@@ -27,7 +27,7 @@ func main() {
 	}
 
 	var logger *log.Logger
-	if os.Getenv("INVOCATION_ID") != "" {
+	if os.Getenv("JOURNAL_STREAM") != "" {
 		logger = log.New(os.Stdout, "", 0)
 	} else {
 		logger = log.New(os.Stdout, "librescoot-pm: ", log.LstdFlags|log.Lmsgprefix)
