@@ -25,12 +25,13 @@ type Inhibitor struct {
 }
 
 type Manager struct {
-	logger     *log.Logger
-	socketPath string
-	listener   net.Listener
-	mutex      sync.RWMutex
-	inhibitors map[net.Conn]*Inhibitor
-	onChange   func()
+	logger           *log.Logger
+	socketPath       string
+	listener         net.Listener
+	mutex            sync.RWMutex
+	inhibitors       map[net.Conn]*Inhibitor
+	manualInhibitors []*Inhibitor
+	onChange         func()
 }
 
 func NewManager(logger *log.Logger, socketPath string, onChange func()) (*Manager, error) {
@@ -132,6 +133,10 @@ func (m *Manager) AddInhibitor(who, what, why string, inhibitType InhibitorType)
 		Type: inhibitType,
 	}
 
+	m.mutex.Lock()
+	m.manualInhibitors = append(m.manualInhibitors, inhibitor)
+	m.mutex.Unlock()
+
 	m.logger.Printf("Added inhibitor: %s (%s) by %s for %s", what, string(inhibitType), who, why)
 	if m.onChange != nil {
 		m.onChange()
@@ -141,11 +146,18 @@ func (m *Manager) AddInhibitor(who, what, why string, inhibitType InhibitorType)
 }
 
 func (m *Manager) RemoveInhibitor(inhibitor *Inhibitor) {
+	m.mutex.Lock()
 	if inhibitor.Conn != nil {
-		m.mutex.Lock()
 		delete(m.inhibitors, inhibitor.Conn)
-		m.mutex.Unlock()
+	} else {
+		for i, inh := range m.manualInhibitors {
+			if inh == inhibitor {
+				m.manualInhibitors = append(m.manualInhibitors[:i], m.manualInhibitors[i+1:]...)
+				break
+			}
+		}
 	}
+	m.mutex.Unlock()
 
 	m.logger.Printf("Removed inhibitor: %s (%s) by %s", inhibitor.What, string(inhibitor.Type), inhibitor.Who)
 	if m.onChange != nil {
@@ -157,10 +169,11 @@ func (m *Manager) GetInhibitors() []*Inhibitor {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	inhibitors := make([]*Inhibitor, 0, len(m.inhibitors))
+	inhibitors := make([]*Inhibitor, 0, len(m.inhibitors)+len(m.manualInhibitors))
 	for _, inhibitor := range m.inhibitors {
 		inhibitors = append(inhibitors, inhibitor)
 	}
+	inhibitors = append(inhibitors, m.manualInhibitors...)
 
 	return inhibitors
 }
@@ -170,6 +183,11 @@ func (m *Manager) HasBlockingInhibitors() bool {
 	defer m.mutex.RUnlock()
 
 	for _, inhibitor := range m.inhibitors {
+		if inhibitor.Type == TypeBlock {
+			return true
+		}
+	}
+	for _, inhibitor := range m.manualInhibitors {
 		if inhibitor.Type == TypeBlock {
 			return true
 		}
