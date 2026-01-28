@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/librescoot/librefsm"
@@ -30,8 +31,10 @@ type Service struct {
 	hibernationTimer *hibernation.Timer
 	systemdClient    *systemd.Client
 	delayInhibitor   *inhibitor.Inhibitor
+	delayInhibitorMu sync.Mutex
 	powerManagerPub  *redis_ipc.HashPublisher
 	systemPub        *redis_ipc.HashPublisher
+	ctx              context.Context
 
 	// librefsm
 	machine *librefsm.Machine
@@ -113,6 +116,8 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	s.ctx = ctx
+
 	// Enable wakeup on configured serial ports
 	s.enableWakeupSources()
 
@@ -479,12 +484,17 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 }
 
 func (s *Service) ExitIssuingLowPower(c *librefsm.Context) error {
-	// Schedule removal of delay inhibitor
 	go func() {
-		time.Sleep(s.config.InhibitorDuration)
-		if s.delayInhibitor != nil {
-			s.inhibitorManager.RemoveInhibitor(s.delayInhibitor)
-			s.delayInhibitor = nil
+		select {
+		case <-time.After(s.config.InhibitorDuration):
+			s.delayInhibitorMu.Lock()
+			defer s.delayInhibitorMu.Unlock()
+			if s.delayInhibitor != nil {
+				s.inhibitorManager.RemoveInhibitor(s.delayInhibitor)
+				s.delayInhibitor = nil
+			}
+		case <-s.ctx.Done():
+			return
 		}
 	}()
 	return nil
@@ -504,6 +514,7 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 	s.logger.Printf("Wakeup detected with reason: %s", wakeupReason)
 
 	// Re-add delay inhibitor
+	s.delayInhibitorMu.Lock()
 	if s.delayInhibitor == nil {
 		s.delayInhibitor = s.inhibitorManager.AddInhibitor(
 			"pm-service",
@@ -512,6 +523,7 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 			inhibitor.TypeDelay,
 		)
 	}
+	s.delayInhibitorMu.Unlock()
 
 	// Use EvWakeupRTC for RTC wakeup (IRQ 45) to skip pre-suspend delay
 	eventID := fsm.EvWakeup
