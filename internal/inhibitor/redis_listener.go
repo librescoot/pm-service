@@ -97,13 +97,10 @@ func (r *RedisListener) channelListener(pubsub *redis.PubSub) {
 	for {
 		select {
 		case msg, ok := <-channel:
-			if !ok {
-				r.logger.Printf("Redis channel closed unexpectedly")
-				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
-			}
-			if msg == nil {
-				r.logger.Printf("Received nil Redis message")
-				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
+			if !ok || msg == nil {
+				r.logger.Printf("Redis channel closed, stopping listener")
+				r.cancel()
+				return
 			}
 
 			r.logger.Printf("Received Redis message: channel=%s payload=%s", msg.Channel, msg.Payload)

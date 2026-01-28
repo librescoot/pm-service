@@ -36,6 +36,7 @@ type Service struct {
 	powerManagerPub  *redis_ipc.HashPublisher
 	systemPub        *redis_ipc.HashPublisher
 	ctx              context.Context
+	ctxCancel        context.CancelFunc
 
 	// librefsm
 	machine *librefsm.Machine
@@ -100,7 +101,10 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	s.ctx = ctx
+	s.ctxCancel = cancel
 
 	// Create hibernation timer with the run context
 	s.hibernationTimer = hibernation.NewTimer(
@@ -833,8 +837,9 @@ func (s *Service) listenForHibernationSettings(ctx context.Context, redis *redis
 			return
 		case msg := <-ch:
 			if msg == nil {
-				s.logger.Printf("Redis settings channel closed unexpectedly")
-				log.Fatalf("Redis connection lost, exiting to allow systemd restart")
+				s.logger.Printf("Redis connection lost, initiating shutdown")
+				s.ctxCancel()
+				return
 			}
 			if msg.Payload == "hibernation-timer" {
 				s.loadHibernationTimerSetting(redis)
