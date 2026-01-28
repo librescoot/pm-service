@@ -54,7 +54,6 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		return nil, fmt.Errorf("failed to create Redis client: %v", err)
 	}
 
-	ctx := context.Background()
 	standardRedisClient := redis.NewClient(&redis.Options{
 		Addr: fmt.Sprintf("%s:%d", cfg.RedisHost, cfg.RedisPort),
 		DB:   0,
@@ -97,27 +96,25 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		inhibitor.TypeDelay,
 	)
 
-	// Create hibernation timer
-	hibernationTimer := hibernation.NewTimer(
-		ctx,
-		service.standardRedis,
-		logger,
-		cfg.HibernationTimer,
-		func() {
-			// Send FSM event when timer expires
-			if service.machine != nil {
-				service.fsmData.TargetPowerState = fsm.TargetHibernateTimer
-				service.machine.Send(librefsm.Event{ID: fsm.EvHibernationTimerExpired})
-			}
-		},
-	)
-	service.hibernationTimer = hibernationTimer
-
 	return service, nil
 }
 
 func (s *Service) Run(ctx context.Context) error {
 	s.ctx = ctx
+
+	// Create hibernation timer with the run context
+	s.hibernationTimer = hibernation.NewTimer(
+		ctx,
+		s.standardRedis,
+		s.logger,
+		s.config.HibernationTimer,
+		func() {
+			if s.machine != nil {
+				s.fsmData.TargetPowerState = fsm.TargetHibernateTimer
+				s.machine.Send(librefsm.Event{ID: fsm.EvHibernationTimerExpired})
+			}
+		},
+	)
 
 	// Enable wakeup on configured serial ports
 	s.enableWakeupSources()
