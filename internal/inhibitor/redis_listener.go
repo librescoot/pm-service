@@ -238,6 +238,11 @@ func (r *RedisListener) handleAddInhibit(id string) {
 
 // handleRemoveInhibit handles removing a power inhibit
 func (r *RedisListener) handleRemoveInhibit(id string) {
+	// Don't process removals after context cancellation (e.g. from stale AfterFunc timers)
+	if r.ctx.Err() != nil {
+		return
+	}
+
 	// Check if we have this inhibitor
 	r.mutex.RLock()
 	inhibitor, exists := r.inhibitors[id]
