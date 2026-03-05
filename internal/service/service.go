@@ -140,6 +140,9 @@ func (s *Service) Run(ctx context.Context) error {
 	redis_ipc.HandleRequests(s.redis, "scooter:power", s.onPowerCommand)
 	redis_ipc.HandleRequests(s.redis, "scooter:governor", s.onGovernorCommand)
 
+	// Start Redis inhibitor listener (syncs power:inhibits hash into inhibitor manager)
+	go s.inhibitorManager.StartRedisListener(ctx, s.standardRedis, s.logger)
+
 	// Start hibernation timer settings listener
 	go s.listenForHibernationSettings(ctx, s.standardRedis)
 

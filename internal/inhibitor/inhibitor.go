@@ -17,11 +17,12 @@ const (
 )
 
 type Inhibitor struct {
-	Who  string
-	What string
-	Why  string
-	Type InhibitorType
-	Conn net.Conn
+	Who     string
+	What    string
+	Why     string
+	Type    InhibitorType
+	Conn    net.Conn
+	redisID string // non-empty for inhibitors synced from Redis
 }
 
 type Manager struct {
