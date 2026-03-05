@@ -3,9 +3,11 @@ module github.com/librescoot/pm-service
 go 1.22.1
 
 require (
-	github.com/librescoot/librefsm v0.3.2
-	github.com/redis/go-redis/v9 v9.12.1
+	github.com/librescoot/librefsm v0.4.0
+	github.com/redis/go-redis/v9 v9.18.0
 )
+
+require go.uber.org/atomic v1.11.0 // indirect
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
