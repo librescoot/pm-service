@@ -33,6 +33,7 @@ type Service struct {
 	cancelDelayRemoval   context.CancelFunc
 	powerManagerPub  *redis_ipc.HashPublisher
 	systemPub        *redis_ipc.HashPublisher
+	busyServicesPub  *redis_ipc.HashPublisher
 	ctx              context.Context
 	ctxCancel        context.CancelFunc
 
@@ -65,6 +66,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		systemdClient:   systemdClient,
 		powerManagerPub: redisClient.NewHashPublisher("power-manager"),
 		systemPub:       redisClient.NewHashPublisher("system"),
+		busyServicesPub: redisClient.NewHashPublisher("power-manager:busy-services"),
 		fsmData: &fsm.FSMData{
 			TargetPowerState: cfg.DefaultState,
 			VehicleState:     "",
@@ -200,37 +202,6 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.redis.Close(); err != nil {
 		s.logger.Printf("Failed to close Redis client: %v", err)
 	}
-
-	return nil
-}
-
-func (s *Service) readInitialStates() error {
-	const maxRetries = 10
-	const retryDelay = 500 * time.Millisecond
-
-	s.logger.Printf("Reading initial vehicle and battery states from Redis...")
-
-	for i := range maxRetries {
-		vehicleState, vehicleErr := s.redis.HGet("vehicle", "state")
-		batteryState, batteryErr := s.redis.HGet("battery:0", "state")
-
-		if vehicleErr == nil && batteryErr == nil {
-			s.fsmData.VehicleState = vehicleState
-			s.fsmData.BatteryState = batteryState
-			s.logger.Printf("Successfully read initial states - Vehicle: %s, Battery: %s", vehicleState, batteryState)
-			return nil
-		}
-
-		if i < maxRetries-1 {
-			s.logger.Printf("Failed to read initial states (attempt %d/%d) - Vehicle error: %v, Battery error: %v. Retrying in %v...",
-				i+1, maxRetries, vehicleErr, batteryErr, retryDelay)
-			time.Sleep(retryDelay)
-		}
-	}
-
-	s.fsmData.VehicleState = "initializing"
-	s.fsmData.BatteryState = "initializing"
-	s.logger.Printf("WARNING: Failed to read initial states from Redis after %d attempts. Using safe default state 'initializing'.", maxRetries)
 
 	return nil
 }
@@ -722,8 +693,7 @@ func (s *Service) publishInhibitors() {
 	}
 
 	// ReplaceAll does: DEL + HMSET + PUBLISH atomically
-	busyServicesPub := s.redis.NewHashPublisher("power-manager:busy-services")
-	if err := busyServicesPub.ReplaceAll(fields); err != nil {
+	if err := s.busyServicesPub.ReplaceAll(fields); err != nil {
 		s.logger.Printf("Failed to publish inhibitors: %v", err)
 	}
 }
