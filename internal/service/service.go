@@ -338,6 +338,10 @@ func (s *Service) batteryStateFromContext(c *librefsm.Context) string {
 // Actions interface implementation
 
 func (s *Service) EnterRunning(c *librefsm.Context) error {
+	if c.FromState == fsm.StateRunning {
+		// Self-transition (catch-all vehicle/battery state update) — no reset needed
+		return nil
+	}
 	s.logger.Printf("Entering running state")
 	s.fsmData.LowPowerStateIssued = false
 	return nil
