@@ -12,21 +12,19 @@ import (
 	"sync"
 	"time"
 
+	redis_ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/librefsm"
 	"github.com/librescoot/pm-service/internal/config"
 	"github.com/librescoot/pm-service/internal/fsm"
 	"github.com/librescoot/pm-service/internal/hibernation"
 	"github.com/librescoot/pm-service/internal/inhibitor"
 	"github.com/librescoot/pm-service/internal/systemd"
-	"github.com/redis/go-redis/v9"
-	redis_ipc "github.com/librescoot/redis-ipc"
 )
 
 type Service struct {
 	config           *config.Config
 	logger           *log.Logger
 	redis            *redis_ipc.Client
-	standardRedis    *redis.Client
 	inhibitorManager *inhibitor.Manager
 	hibernationTimer *hibernation.Timer
 	systemdClient    *systemd.Client
@@ -55,11 +53,6 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		return nil, fmt.Errorf("failed to create Redis client: %v", err)
 	}
 
-	standardRedisClient := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", cfg.RedisHost, cfg.RedisPort),
-		DB:   0,
-	})
-
 	systemdClient, err := systemd.NewClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create systemd client: %v", err)
@@ -69,7 +62,6 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		config:          cfg,
 		logger:          logger,
 		redis:           redisClient,
-		standardRedis:   standardRedisClient,
 		systemdClient:   systemdClient,
 		powerManagerPub: redisClient.NewHashPublisher("power-manager"),
 		systemPub:       redisClient.NewHashPublisher("system"),
@@ -109,7 +101,6 @@ func (s *Service) Run(ctx context.Context) error {
 	// Create hibernation timer with the run context
 	s.hibernationTimer = hibernation.NewTimer(
 		ctx,
-		s.standardRedis,
 		s.logger,
 		s.config.HibernationTimer,
 		func() {
@@ -141,10 +132,14 @@ func (s *Service) Run(ctx context.Context) error {
 	redis_ipc.HandleRequests(s.redis, "scooter:governor", s.onGovernorCommand)
 
 	// Start Redis inhibitor listener (syncs power:inhibits hash into inhibitor manager)
-	go s.inhibitorManager.StartRedisListener(ctx, s.standardRedis, s.logger)
+	go s.inhibitorManager.StartRedisListener(ctx, s.redis, s.logger)
 
-	// Start hibernation timer settings listener
-	go s.listenForHibernationSettings(ctx, s.standardRedis)
+	// Watch hibernation timer setting in Redis
+	if err := s.redis.NewHashWatcher("settings").
+		OnField("hibernation-timer", s.onHibernationTimerSetting).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start settings watcher: %v", err)
+	}
 
 	// Build FSM
 	def := fsm.NewDefinition(s, s.config.PreSuspendDelay, s.config.SuspendImminentDelay)
@@ -827,38 +822,13 @@ func (s *Service) enableWakeupSources() {
 	}
 }
 
-func (s *Service) listenForHibernationSettings(ctx context.Context, redis *redis.Client) {
-	pubsub := redis.Subscribe(ctx, "settings")
-	defer pubsub.Close()
-
-	s.loadHibernationTimerSetting(redis)
-
-	ch := pubsub.Channel()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case msg := <-ch:
-			if msg == nil {
-				s.logger.Printf("Redis connection lost, initiating shutdown")
-				s.ctxCancel()
-				return
-			}
-			if msg.Payload == "hibernation-timer" {
-				s.loadHibernationTimerSetting(redis)
-			}
-		}
+func (s *Service) onHibernationTimerSetting(value string) error {
+	timerValue, err := strconv.ParseInt(value, 10, 32)
+	if err != nil {
+		s.logger.Printf("Failed to parse hibernation timer setting: %v", err)
+		return nil
 	}
-}
-
-func (s *Service) loadHibernationTimerSetting(redis *redis.Client) {
-	result := redis.HGet(context.Background(), "settings", "hibernation-timer")
-	if result.Err() == nil {
-		if timerValue, err := strconv.ParseInt(result.Val(), 10, 32); err == nil {
-			s.hibernationTimer.SetTimerValue(int32(timerValue))
-			s.logger.Printf("Updated hibernation timer setting: %d seconds", timerValue)
-		} else {
-			s.logger.Printf("Failed to parse hibernation timer setting: %v", err)
-		}
-	}
+	s.hibernationTimer.SetTimerValue(int32(timerValue))
+	s.logger.Printf("Updated hibernation timer setting: %d seconds", timerValue)
+	return nil
 }

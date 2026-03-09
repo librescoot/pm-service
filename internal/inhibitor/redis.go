@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"log"
 
-	"github.com/redis/go-redis/v9"
+	redis_ipc "github.com/librescoot/redis-ipc"
 )
 
 const (
@@ -27,32 +27,28 @@ type redisInhibitData struct {
 // StartRedisListener subscribes to the power:inhibits channel and syncs
 // inhibitors from the power:inhibits Redis hash into the Manager.
 // Must be called as a goroutine.
-func (m *Manager) StartRedisListener(ctx context.Context, client *redis.Client, logger *log.Logger) {
+func (m *Manager) StartRedisListener(ctx context.Context, client *redis_ipc.Client, logger *log.Logger) {
 	// Initial sync: load any existing inhibitors from Redis hash
-	m.syncRedisInhibitors(ctx, client, logger)
+	m.syncRedisInhibitors(client, logger)
 
 	// Subscribe to changes
-	pubsub := client.Subscribe(ctx, redisInhibitChannel)
-	defer pubsub.Close()
-
-	ch := pubsub.Channel()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-ch:
-			if !ok {
-				return
-			}
-			m.syncRedisInhibitors(ctx, client, logger)
-		}
+	sub, err := redis_ipc.Subscribe[string](client, redisInhibitChannel, func(_ string) error {
+		m.syncRedisInhibitors(client, logger)
+		return nil
+	})
+	if err != nil {
+		logger.Printf("Failed to subscribe to %s: %v", redisInhibitChannel, err)
+		return
 	}
+	defer sub.Unsubscribe()
+
+	<-ctx.Done()
 }
 
 // syncRedisInhibitors reads the power:inhibits hash and updates
 // the manager's manual inhibitors to match.
-func (m *Manager) syncRedisInhibitors(ctx context.Context, client *redis.Client, logger *log.Logger) {
-	entries, err := client.HGetAll(ctx, redisInhibitHash).Result()
+func (m *Manager) syncRedisInhibitors(client *redis_ipc.Client, logger *log.Logger) {
+	entries, err := client.HGetAll(redisInhibitHash)
 	if err != nil {
 		logger.Printf("Failed to read %s: %v", redisInhibitHash, err)
 		return
