@@ -116,6 +116,7 @@ type Actions interface {
 	IsBatteryNotActive(c *librefsm.Context) bool
 	IsTargetSuspend(c *librefsm.Context) bool
 	IsTargetHibernate(c *librefsm.Context) bool
+	IsPowerCommandHigherPriority(c *librefsm.Context) bool
 
 	// Transition actions
 	OnPreSuspendTimeout(c *librefsm.Context) error
@@ -123,7 +124,10 @@ type Actions interface {
 	OnInhibitorsChanged(c *librefsm.Context) error
 	OnWakeup(c *librefsm.Context) error
 	OnDisableModem(c *librefsm.Context) error
+	OnVehicleStateChanged(c *librefsm.Context) error
 	OnVehicleLeftLowPowerState(c *librefsm.Context) error
+	OnBatteryStateChanged(c *librefsm.Context) error
+	OnPowerCommand(c *librefsm.Context) error
 
 	// Publishing
 	PublishState(state string) error

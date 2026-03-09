@@ -51,39 +51,56 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		// Suspend path - power command
 		Transition(StateRunning, EvPowerSuspend, StatePreSuspend,
-			librefsm.WithGuard(actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
 		// Hibernate path - power commands
 		Transition(StateRunning, EvPowerHibernate, StatePreHibernate,
-			librefsm.WithGuard(actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
 		).
 		Transition(StateRunning, EvPowerHibernateManual, StatePreHibernate,
-			librefsm.WithGuard(actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
 		).
 		Transition(StateRunning, EvPowerHibernateTimer, StatePreHibernate,
-			librefsm.WithGuard(actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
 		).
 		Transition(StateRunning, EvPowerReboot, StatePreHibernate,
-			librefsm.WithGuard(actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
 		// Auto-hibernation timer expired
 		Transition(StateRunning, EvHibernationTimerExpired, StatePreHibernate,
-			librefsm.WithGuard(actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
 		// Vehicle state changes may enable low-power transition
 		Transition(StateRunning, EvVehicleStateChanged, StatePreSuspend,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),
+			librefsm.WithAction(actions.OnVehicleStateChanged),
 		).
 		Transition(StateRunning, EvVehicleStateChanged, StatePreHibernate,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetHibernate),
+			librefsm.WithAction(actions.OnVehicleStateChanged),
+		).
+		// Catch-all: vehicle state changed but no low-power transition applies
+		Transition(StateRunning, EvVehicleStateChanged, StateRunning,
+			librefsm.WithAction(actions.OnVehicleStateChanged),
 		).
 
 		// Battery became inactive - only relevant for suspend
 		Transition(StateRunning, EvBatteryBecameInactive, StatePreSuspend,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),
+			librefsm.WithAction(actions.OnBatteryStateChanged),
+		).
+		// Battery state change with no transition (e.g. no active suspend target)
+		Transition(StateRunning, EvBatteryBecameInactive, StateRunning,
+			librefsm.WithAction(actions.OnBatteryStateChanged),
 		).
 
 		// === Transitions from PreSuspend (suspend path) ===
@@ -93,7 +110,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		).
 
 		// Cancel: target set to run
-		Transition(StatePreSuspend, EvPowerRun, StateRunning).
+		Transition(StatePreSuspend, EvPowerRun, StateRunning,
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 
 		// Cancel: vehicle left standby/parked
 		Transition(StatePreSuspend, EvVehicleStateChanged, StateRunning,
@@ -102,7 +121,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		).
 
 		// Cancel: battery became active (suspend only - no guard needed!)
-		Transition(StatePreSuspend, EvBatteryBecameActive, StateRunning).
+		Transition(StatePreSuspend, EvBatteryBecameActive, StateRunning,
+			librefsm.WithAction(actions.OnBatteryStateChanged),
+		).
 
 		// === Transitions from SuspendImminent (suspend path) ===
 
@@ -111,7 +132,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		).
 
 		// Cancel: target set to run
-		Transition(StateSuspendImminent, EvPowerRun, StateRunning).
+		Transition(StateSuspendImminent, EvPowerRun, StateRunning,
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 
 		// Cancel: vehicle left standby/parked
 		Transition(StateSuspendImminent, EvVehicleStateChanged, StateRunning,
@@ -120,7 +143,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		).
 
 		// Cancel: battery became active (suspend only - no guard needed!)
-		Transition(StateSuspendImminent, EvBatteryBecameActive, StateRunning).
+		Transition(StateSuspendImminent, EvBatteryBecameActive, StateRunning,
+			librefsm.WithAction(actions.OnBatteryStateChanged),
+		).
 
 		// === Transitions from PreHibernate (hibernate path) ===
 
@@ -129,7 +154,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		).
 
 		// Cancel: target set to run
-		Transition(StatePreHibernate, EvPowerRun, StateRunning).
+		Transition(StatePreHibernate, EvPowerRun, StateRunning,
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 
 		// Cancel: vehicle left standby/parked
 		Transition(StatePreHibernate, EvVehicleStateChanged, StateRunning,
@@ -146,7 +173,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		).
 
 		// Cancel: target set to run
-		Transition(StateHibernateImminent, EvPowerRun, StateRunning).
+		Transition(StateHibernateImminent, EvPowerRun, StateRunning,
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 
 		// Cancel: vehicle left standby/parked
 		Transition(StateHibernateImminent, EvVehicleStateChanged, StateRunning,
@@ -170,7 +199,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		).
 
 		// Cancel: target set to run
-		Transition(StateWaitingInhibitors, EvPowerRun, StateRunning).
+		Transition(StateWaitingInhibitors, EvPowerRun, StateRunning,
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 
 		// Cancel: vehicle left standby/parked
 		Transition(StateWaitingInhibitors, EvVehicleStateChanged, StateRunning,
@@ -217,6 +248,14 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// RTC wakeup: go to running if conditions don't allow
 		Transition(StateSuspended, EvWakeupRTC, StateRunning,
 			librefsm.WithAction(actions.OnWakeup),
+		).
+
+		// Keep battery state current while suspended so wakeup guards see the right value
+		Transition(StateSuspended, EvBatteryBecameActive, StateSuspended,
+			librefsm.WithAction(actions.OnBatteryStateChanged),
+		).
+		Transition(StateSuspended, EvBatteryBecameInactive, StateSuspended,
+			librefsm.WithAction(actions.OnBatteryStateChanged),
 		).
 
 		// Initial state

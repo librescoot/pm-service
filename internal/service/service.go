@@ -100,6 +100,18 @@ func (s *Service) Run(ctx context.Context) error {
 	s.ctx = ctx
 	s.ctxCancel = cancel
 
+	// Read initial states directly before starting any goroutines.
+	// This populates fsmData for startup decisions (hibernation timer, initial trigger)
+	// without racing against FSM action writers.
+	if vehicleState, err := s.redis.HGet("vehicle", "state"); err == nil && vehicleState != "" {
+		s.fsmData.VehicleState = vehicleState
+		s.logger.Printf("Initial vehicle state: %s", vehicleState)
+	}
+	if batteryState, err := s.redis.HGet("battery:0", "state"); err == nil && batteryState != "" {
+		s.fsmData.BatteryState = batteryState
+		s.logger.Printf("Initial battery state: %s", batteryState)
+	}
+
 	// Create hibernation timer with the run context
 	s.hibernationTimer = hibernation.NewTimer(
 		ctx,
@@ -107,41 +119,16 @@ func (s *Service) Run(ctx context.Context) error {
 		s.config.HibernationTimer,
 		func() {
 			if s.machine != nil {
-				s.fsmData.TargetPowerState = fsm.TargetHibernateTimer
-				s.machine.Send(librefsm.Event{ID: fsm.EvHibernationTimerExpired})
+				s.machine.Send(librefsm.Event{
+					ID:      fsm.EvHibernationTimerExpired,
+					Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetHibernateTimer},
+				})
 			}
 		},
 	)
 
 	// Enable wakeup on configured serial ports
 	s.enableWakeupSources()
-
-	// Set up Redis hash watchers with initial sync
-	// StartWithSync fetches current state and calls handlers before processing new messages
-	if err := s.redis.NewHashWatcher("vehicle").
-		OnField("state", s.onVehicleStateChanged).
-		StartWithSync(); err != nil {
-		return fmt.Errorf("failed to start vehicle state watcher: %v", err)
-	}
-
-	if err := s.redis.NewHashWatcher("battery:0").
-		OnField("state", s.onBatteryStateChanged).
-		StartWithSync(); err != nil {
-		return fmt.Errorf("failed to start battery state watcher: %v", err)
-	}
-
-	redis_ipc.HandleRequests(s.redis, "scooter:power", s.onPowerCommand)
-	redis_ipc.HandleRequests(s.redis, "scooter:governor", s.onGovernorCommand)
-
-	// Start Redis inhibitor listener (syncs power:inhibits hash into inhibitor manager)
-	go s.inhibitorManager.StartRedisListener(ctx, s.redis, s.logger)
-
-	// Watch hibernation timer setting in Redis
-	if err := s.redis.NewHashWatcher("settings").
-		OnField("hibernation-timer", s.onHibernationTimerSetting).
-		StartWithSync(); err != nil {
-		return fmt.Errorf("failed to start settings watcher: %v", err)
-	}
 
 	// Build FSM
 	def := fsm.NewDefinition(s, s.config.PreSuspendDelay, s.config.SuspendImminentDelay)
@@ -169,19 +156,46 @@ func (s *Service) Run(ctx context.Context) error {
 	// Publish initial power state
 	s.publishFSMState(s.machine.CurrentState())
 
-	// Initialize hibernation timer if vehicle is not actively being used
+	// Initialize hibernation timer based on initial vehicle state (read above, before any races)
 	if s.fsmData.VehicleState != "ready-to-drive" {
 		s.hibernationTimer.ResetTimer(true)
 		s.logger.Printf("Initialized hibernation timer - vehicle in idle state: %s", s.fsmData.VehicleState)
 	}
 
-	// Trigger low-power sequence evaluation if default state is not "run"
-	// The FSM transition guards will determine if conditions allow
-	if s.fsmData.TargetPowerState != fsm.TargetRun {
+	// Trigger low-power sequence evaluation if default state is not "run".
+	// Uses cfg.DefaultState to avoid reading fsmData from a potentially racing goroutine.
+	if s.config.DefaultState != fsm.TargetRun {
 		s.machine.Send(librefsm.Event{
 			ID:      fsm.EvVehicleStateChanged,
 			Payload: fsm.VehicleStatePayload{State: s.fsmData.VehicleState},
 		})
+	}
+
+	// Set up Redis hash watchers with initial sync.
+	// FSM is running; callbacks send events which are processed by FSM actions.
+	if err := s.redis.NewHashWatcher("vehicle").
+		OnField("state", s.onVehicleStateChanged).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start vehicle state watcher: %v", err)
+	}
+
+	if err := s.redis.NewHashWatcher("battery:0").
+		OnField("state", s.onBatteryStateChanged).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start battery state watcher: %v", err)
+	}
+
+	redis_ipc.HandleRequests(s.redis, "scooter:power", s.onPowerCommand)
+	redis_ipc.HandleRequests(s.redis, "scooter:governor", s.onGovernorCommand)
+
+	// Start Redis inhibitor listener (syncs power:inhibits hash into inhibitor manager)
+	go s.inhibitorManager.StartRedisListener(ctx, s.redis, s.logger)
+
+	// Watch hibernation timer setting in Redis
+	if err := s.redis.NewHashWatcher("settings").
+		OnField("hibernation-timer", s.onHibernationTimerSetting).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start settings watcher: %v", err)
 	}
 
 	// Wait for context cancellation
@@ -206,83 +220,32 @@ func (s *Service) Run(ctx context.Context) error {
 	return nil
 }
 
-// Redis handlers - send FSM events
+// Redis handlers - send FSM events only, no fsmData writes
 
 func (s *Service) onVehicleStateChanged(vehicleState string) error {
-	oldState := s.fsmData.VehicleState
-	s.fsmData.VehicleState = vehicleState
-
-	// Only log when state actually changes
-	if oldState != vehicleState {
-		s.logger.Printf("Vehicle state: %s -> %s", oldState, vehicleState)
-	}
-
-	// Update hibernation timer based on vehicle state
-	// Timer runs in all unattended/idle states (everything except ready-to-drive)
-	// Timer resets when leaving ready-to-drive (user finished using scooter)
-	isActive := vehicleState == "ready-to-drive"
-	wasActive := oldState == "ready-to-drive"
-
-	if wasActive && !isActive {
-		// Just left ready-to-drive - reset timer for fresh countdown
-		s.hibernationTimer.ResetTimer(true)
-	} else if isActive && !wasActive {
-		// Entering ready-to-drive - stop timer
-		s.hibernationTimer.ResetTimer(false)
-	} else if !isActive && oldState == "" {
-		// Bootstrap: starting in idle state - start timer
-		s.hibernationTimer.ResetTimer(true)
-	}
-	// Else: transitions between idle states (timer continues) or staying in ready-to-drive
-
-	// Send FSM event
 	if s.machine != nil {
 		s.machine.Send(librefsm.Event{
 			ID:      fsm.EvVehicleStateChanged,
 			Payload: fsm.VehicleStatePayload{State: vehicleState},
 		})
 	}
-
-	// If vehicle left standby/parked, cancel any pending low power state
-	if (oldState == "stand-by" || oldState == "parked") && vehicleState != "stand-by" && vehicleState != "parked" {
-		s.fsmData.TargetPowerState = fsm.TargetRun
-		s.fsmData.ModemDisabled = false
-	}
-
 	return nil
 }
 
 func (s *Service) onBatteryStateChanged(newState string) error {
-	oldState := s.fsmData.BatteryState
-	s.fsmData.BatteryState = newState
-
-	// Only log when state actually changes
-	if oldState != newState {
-		s.logger.Printf("Battery state: %s -> %s", oldState, newState)
-	}
-
 	if s.machine != nil {
-		// Send semantic battery events
-		if oldState != "active" && newState == "active" {
-			s.machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameActive})
-		} else if oldState == "active" && newState != "active" {
-			s.machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameInactive})
+		payload := fsm.BatteryStatePayload{State: newState}
+		if newState == "active" {
+			s.machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameActive, Payload: payload})
+		} else {
+			s.machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameInactive, Payload: payload})
 		}
 	}
-
 	return nil
 }
 
 func (s *Service) onPowerCommand(command string) error {
 	s.logger.Printf("Received power command: %s", command)
-
-	// Check priority and update target state
-	if !s.canSetTargetState(command) {
-		s.logger.Printf("Power command %s ignored due to priority (current target: %s)", command, s.fsmData.TargetPowerState)
-		return nil
-	}
-
-	s.fsmData.TargetPowerState = command
 
 	var eventID librefsm.EventID
 	switch command {
@@ -304,7 +267,10 @@ func (s *Service) onPowerCommand(command string) error {
 	}
 
 	if s.machine != nil {
-		s.machine.Send(librefsm.Event{ID: eventID})
+		s.machine.Send(librefsm.Event{
+			ID:      eventID,
+			Payload: fsm.PowerCommandPayload{TargetState: command},
+		})
 	}
 
 	return nil
@@ -333,32 +299,40 @@ func (s *Service) onGovernorCommand(governor string) error {
 	return nil
 }
 
-// Priority-based power state setting
-func (s *Service) canSetTargetState(newState string) bool {
-	current := s.fsmData.TargetPowerState
-
-	// Run can always be set
-	if newState == "run" {
-		return true
-	}
-
-	// Priority order: run > hibernate-manual > hibernate > hibernate-timer > suspend/reboot
-	switch current {
-	case "hibernate-manual":
-		if newState == "hibernate" || newState == "hibernate-timer" || newState == "suspend" || newState == "reboot" {
-			return false
-		}
-	case "hibernate":
-		if newState == "hibernate-timer" || newState == "suspend" || newState == "reboot" {
-			return false
-		}
-	case "hibernate-timer":
-		if newState == "suspend" || newState == "reboot" {
-			return false
+// vehicleStateFromContext returns the vehicle state from the event payload if available,
+// otherwise falls back to fsmData. This ensures guards see the correct state during
+// EvVehicleStateChanged transitions before the action has updated fsmData.
+func (s *Service) vehicleStateFromContext(c *librefsm.Context) string {
+	if c.Event != nil {
+		if p, ok := c.Event.Payload.(fsm.VehicleStatePayload); ok {
+			return p.State
 		}
 	}
+	return s.fsmData.VehicleState
+}
 
-	return true
+// targetPowerStateFromContext returns the target power state from the event payload if available,
+// otherwise falls back to fsmData. This ensures guards see the correct state during
+// power command transitions before the action has updated fsmData.
+func (s *Service) targetPowerStateFromContext(c *librefsm.Context) string {
+	if c.Event != nil {
+		if p, ok := c.Event.Payload.(fsm.PowerCommandPayload); ok {
+			return p.TargetState
+		}
+	}
+	return s.fsmData.TargetPowerState
+}
+
+// batteryStateFromContext returns the battery state from the event payload if available,
+// otherwise falls back to fsmData. This ensures guards see the correct state during
+// EvBatteryBecame* transitions before the action has updated fsmData.
+func (s *Service) batteryStateFromContext(c *librefsm.Context) string {
+	if c.Event != nil {
+		if p, ok := c.Event.Payload.(fsm.BatteryStatePayload); ok {
+			return p.State
+		}
+	}
+	return s.fsmData.BatteryState
 }
 
 // Actions interface implementation
@@ -526,25 +500,28 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 // Guards
 
 func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
-	if s.fsmData.TargetPowerState == fsm.TargetRun {
+	targetState := s.targetPowerStateFromContext(c)
+	vehicleState := s.vehicleStateFromContext(c)
+
+	if targetState == fsm.TargetRun {
 		return false
 	}
 
 	// Special case for reboot - allow in both stand-by and shutting-down states
-	if s.fsmData.TargetPowerState == fsm.TargetReboot {
-		if s.fsmData.VehicleState != "stand-by" && s.fsmData.VehicleState != "shutting-down" {
-			s.logger.Printf("Cannot enter reboot state: vehicle state is %s", s.fsmData.VehicleState)
+	if targetState == fsm.TargetReboot {
+		if vehicleState != "stand-by" && vehicleState != "shutting-down" {
+			s.logger.Printf("Cannot enter reboot state: vehicle state is %s", vehicleState)
 			return false
 		}
 		return true
 	}
 
-	if s.fsmData.VehicleState != "stand-by" && s.fsmData.VehicleState != "parked" && s.fsmData.VehicleState != "shutting-down" {
-		s.logger.Printf("Cannot enter low power state: vehicle state is %s", s.fsmData.VehicleState)
+	if vehicleState != "stand-by" && vehicleState != "parked" && vehicleState != "shutting-down" {
+		s.logger.Printf("Cannot enter low power state: vehicle state is %s", vehicleState)
 		return false
 	}
 
-	if s.fsmData.TargetPowerState == fsm.TargetSuspend && s.fsmData.BatteryState == "active" {
+	if targetState == fsm.TargetSuspend && s.batteryStateFromContext(c) == "active" {
 		s.logger.Printf("Cannot enter suspend state: battery is active")
 		return false
 	}
@@ -561,15 +538,17 @@ func (s *Service) HasOnlyModemInhibitors(c *librefsm.Context) bool {
 }
 
 func (s *Service) IsVehicleInStandbyOrParked(c *librefsm.Context) bool {
-	return s.fsmData.VehicleState == "stand-by" || s.fsmData.VehicleState == "parked"
+	state := s.vehicleStateFromContext(c)
+	return state == "stand-by" || state == "parked"
 }
 
 func (s *Service) IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool {
-	return s.fsmData.VehicleState != "stand-by" && s.fsmData.VehicleState != "parked"
+	state := s.vehicleStateFromContext(c)
+	return state != "stand-by" && state != "parked"
 }
 
 func (s *Service) IsTargetNotRun(c *librefsm.Context) bool {
-	return s.fsmData.TargetPowerState != fsm.TargetRun
+	return s.targetPowerStateFromContext(c) != fsm.TargetRun
 }
 
 func (s *Service) IsBatteryNotActive(c *librefsm.Context) bool {
@@ -577,16 +556,47 @@ func (s *Service) IsBatteryNotActive(c *librefsm.Context) bool {
 }
 
 func (s *Service) IsTargetSuspend(c *librefsm.Context) bool {
-	return s.fsmData.TargetPowerState == fsm.TargetSuspend
+	return s.targetPowerStateFromContext(c) == fsm.TargetSuspend
 }
 
 func (s *Service) IsTargetHibernate(c *librefsm.Context) bool {
-	// Hibernate includes all non-suspend low-power states except run
-	switch s.fsmData.TargetPowerState {
+	switch s.targetPowerStateFromContext(c) {
 	case fsm.TargetHibernate, fsm.TargetHibernateManual, fsm.TargetHibernateTimer, fsm.TargetReboot:
 		return true
 	}
 	return false
+}
+
+// IsPowerCommandHigherPriority checks if the command in the event payload can override
+// the current target power state. Guards against priority downgrades.
+// Priority order: run > hibernate-manual > hibernate > hibernate-timer > suspend/reboot
+func (s *Service) IsPowerCommandHigherPriority(c *librefsm.Context) bool {
+	newState := s.targetPowerStateFromContext(c)
+	current := s.fsmData.TargetPowerState
+
+	if newState == "run" {
+		return true
+	}
+
+	switch current {
+	case "hibernate-manual":
+		if newState == "hibernate" || newState == "hibernate-timer" || newState == "suspend" || newState == "reboot" {
+			s.logger.Printf("Power command %s ignored due to priority (current target: %s)", newState, current)
+			return false
+		}
+	case "hibernate":
+		if newState == "hibernate-timer" || newState == "suspend" || newState == "reboot" {
+			s.logger.Printf("Power command %s ignored due to priority (current target: %s)", newState, current)
+			return false
+		}
+	case "hibernate-timer":
+		if newState == "suspend" || newState == "reboot" {
+			s.logger.Printf("Power command %s ignored due to priority (current target: %s)", newState, current)
+			return false
+		}
+	}
+
+	return true
 }
 
 // Transition actions
@@ -618,11 +628,78 @@ func (s *Service) OnDisableModem(c *librefsm.Context) error {
 	return nil
 }
 
+// OnVehicleStateChanged updates fsmData from the event payload, manages the hibernation
+// timer, and resets target power state if the vehicle left standby/parked.
+func (s *Service) OnVehicleStateChanged(c *librefsm.Context) error {
+	p, ok := c.Event.Payload.(fsm.VehicleStatePayload)
+	if !ok {
+		return nil
+	}
+
+	oldState := s.fsmData.VehicleState
+	newState := p.State
+
+	if oldState != newState {
+		s.logger.Printf("Vehicle state: %s -> %s", oldState, newState)
+	}
+
+	s.fsmData.VehicleState = newState
+
+	// Manage hibernation timer: runs in all idle states (everything except ready-to-drive)
+	isActive := newState == "ready-to-drive"
+	wasActive := oldState == "ready-to-drive"
+	if wasActive && !isActive {
+		s.hibernationTimer.ResetTimer(true)
+	} else if isActive && !wasActive {
+		s.hibernationTimer.ResetTimer(false)
+	}
+
+	// Reset target if vehicle left standby/parked (cancel any pending low-power intent)
+	if (oldState == "stand-by" || oldState == "parked") && newState != "stand-by" && newState != "parked" {
+		s.fsmData.TargetPowerState = fsm.TargetRun
+		s.fsmData.ModemDisabled = false
+	}
+
+	return nil
+}
+
 func (s *Service) OnVehicleLeftLowPowerState(c *librefsm.Context) error {
 	s.logger.Printf("Vehicle left low power state, aborting")
+
+	// Update vehicle state and manage timer (same as OnVehicleStateChanged)
+	if p, ok := c.Event.Payload.(fsm.VehicleStatePayload); ok {
+		oldState := s.fsmData.VehicleState
+		s.fsmData.VehicleState = p.State
+
+		isActive := p.State == "ready-to-drive"
+		wasActive := oldState == "ready-to-drive"
+		if wasActive && !isActive {
+			s.hibernationTimer.ResetTimer(true)
+		} else if isActive && !wasActive {
+			s.hibernationTimer.ResetTimer(false)
+		}
+	}
+
 	s.fsmData.TargetPowerState = fsm.TargetRun
 	s.fsmData.ModemDisabled = false
 	s.publishState("running")
+	return nil
+}
+
+// OnBatteryStateChanged updates fsmData.BatteryState from the event payload.
+func (s *Service) OnBatteryStateChanged(c *librefsm.Context) error {
+	if p, ok := c.Event.Payload.(fsm.BatteryStatePayload); ok {
+		s.logger.Printf("Battery state -> %s", p.State)
+		s.fsmData.BatteryState = p.State
+	}
+	return nil
+}
+
+// OnPowerCommand updates fsmData.TargetPowerState from the event payload.
+func (s *Service) OnPowerCommand(c *librefsm.Context) error {
+	if p, ok := c.Event.Payload.(fsm.PowerCommandPayload); ok {
+		s.fsmData.TargetPowerState = p.TargetState
+	}
 	return nil
 }
 

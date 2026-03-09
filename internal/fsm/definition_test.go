@@ -46,14 +46,18 @@ func (m *mockActions) IsTargetNotRun(c *librefsm.Context) bool              { re
 func (m *mockActions) IsBatteryNotActive(c *librefsm.Context) bool          { return true }
 func (m *mockActions) IsTargetSuspend(c *librefsm.Context) bool             { return m.targetSuspend }
 func (m *mockActions) IsTargetHibernate(c *librefsm.Context) bool           { return m.targetHibernate }
-func (m *mockActions) OnPreSuspendTimeout(c *librefsm.Context) error        { return nil }
-func (m *mockActions) OnSuspendImminentTimeout(c *librefsm.Context) error   { return nil }
-func (m *mockActions) OnInhibitorsChanged(c *librefsm.Context) error { return nil }
-func (m *mockActions) OnWakeup(c *librefsm.Context) error            { return nil }
-func (m *mockActions) OnDisableModem(c *librefsm.Context) error      { return nil }
-func (m *mockActions) OnVehicleLeftLowPowerState(c *librefsm.Context) error { return nil }
-func (m *mockActions) PublishState(state string) error                      { return nil }
-func (m *mockActions) PublishWakeupSource(reason string) error              { return nil }
+func (m *mockActions) IsPowerCommandHigherPriority(c *librefsm.Context) bool { return true }
+func (m *mockActions) OnPreSuspendTimeout(c *librefsm.Context) error         { return nil }
+func (m *mockActions) OnSuspendImminentTimeout(c *librefsm.Context) error    { return nil }
+func (m *mockActions) OnInhibitorsChanged(c *librefsm.Context) error         { return nil }
+func (m *mockActions) OnWakeup(c *librefsm.Context) error                    { return nil }
+func (m *mockActions) OnDisableModem(c *librefsm.Context) error              { return nil }
+func (m *mockActions) OnVehicleStateChanged(c *librefsm.Context) error       { return nil }
+func (m *mockActions) OnVehicleLeftLowPowerState(c *librefsm.Context) error  { return nil }
+func (m *mockActions) OnBatteryStateChanged(c *librefsm.Context) error       { return nil }
+func (m *mockActions) OnPowerCommand(c *librefsm.Context) error              { return nil }
+func (m *mockActions) PublishState(state string) error                       { return nil }
+func (m *mockActions) PublishWakeupSource(reason string) error               { return nil }
 
 func TestSuspendPathWithBattery(t *testing.T) {
 	actions := &mockActions{
