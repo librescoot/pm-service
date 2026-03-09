@@ -97,7 +97,6 @@ type FSMData struct {
 // The Service struct implements this interface.
 type Actions interface {
 	// State entry actions
-	EnterRunning(c *librefsm.Context) error
 	EnterPreSuspend(c *librefsm.Context) error
 	EnterSuspendImminent(c *librefsm.Context) error
 	EnterPreHibernate(c *librefsm.Context) error

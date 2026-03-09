@@ -337,16 +337,6 @@ func (s *Service) batteryStateFromContext(c *librefsm.Context) string {
 
 // Actions interface implementation
 
-func (s *Service) EnterRunning(c *librefsm.Context) error {
-	if c.FromState == fsm.StateRunning {
-		// Self-transition (catch-all vehicle/battery state update) — no reset needed
-		return nil
-	}
-	s.logger.Printf("Entering running state")
-	s.fsmData.LowPowerStateIssued = false
-	return nil
-}
-
 func (s *Service) EnterPreSuspend(c *librefsm.Context) error {
 	s.logger.Printf("Entering pre-suspend state, waiting %v", s.config.PreSuspendDelay)
 	return nil
@@ -620,6 +610,7 @@ func (s *Service) OnInhibitorsChanged(c *librefsm.Context) error {
 }
 
 func (s *Service) OnWakeup(c *librefsm.Context) error {
+	s.fsmData.LowPowerStateIssued = false
 	if payload, ok := c.Event.Payload.(fsm.WakeupPayload); ok {
 		s.publishWakeupSource(payload.Reason)
 	}

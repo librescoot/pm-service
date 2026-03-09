@@ -21,7 +21,6 @@ type mockActions struct {
 	targetNotRun             bool
 }
 
-func (m *mockActions) EnterRunning(c *librefsm.Context) error             { return nil }
 func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error          { return nil }
 func (m *mockActions) EnterSuspendImminent(c *librefsm.Context) error     { return nil }
 func (m *mockActions) EnterPreHibernate(c *librefsm.Context) error        { return nil }

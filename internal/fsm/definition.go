@@ -13,9 +13,7 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 	return librefsm.NewDefinition().
 		// === Main States ===
 
-		State(StateRunning,
-			librefsm.WithOnEnter(actions.EnterRunning),
-		).
+		State(StateRunning).
 
 		// Suspend path (battery-sensitive)
 		State(StatePreSuspend,
