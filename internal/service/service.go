@@ -108,8 +108,15 @@ func (s *Service) Run(ctx context.Context) error {
 		s.logger.Printf("Initial vehicle state: %s", vehicleState)
 	}
 	if batteryState, err := s.redis.HGet("battery:0", "state"); err == nil && batteryState != "" {
-		s.fsmData.BatteryState = batteryState
-		s.logger.Printf("Initial battery state: %s", batteryState)
+		s.fsmData.Battery0State = batteryState
+		s.logger.Printf("Initial battery:0 state: %s", batteryState)
+	}
+	if batteryState, err := s.redis.HGet("battery:1", "state"); err == nil && batteryState != "" {
+		s.fsmData.Battery1State = batteryState
+		s.logger.Printf("Initial battery:1 state: %s", batteryState)
+	}
+	if s.fsmData.Battery0State == "active" || s.fsmData.Battery1State == "active" {
+		s.fsmData.BatteryState = "active"
 	}
 
 	// Create hibernation timer with the run context
@@ -180,9 +187,15 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if err := s.redis.NewHashWatcher("battery:0").
-		OnField("state", s.onBatteryStateChanged).
+		OnField("state", func(state string) error { return s.onBatteryStateChanged("0", state) }).
 		StartWithSync(); err != nil {
-		return fmt.Errorf("failed to start battery state watcher: %v", err)
+		return fmt.Errorf("failed to start battery:0 state watcher: %v", err)
+	}
+
+	if err := s.redis.NewHashWatcher("battery:1").
+		OnField("state", func(state string) error { return s.onBatteryStateChanged("1", state) }).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start battery:1 state watcher: %v", err)
 	}
 
 	redis_ipc.HandleRequests(s.redis, "scooter:power", s.onPowerCommand)
@@ -232,9 +245,9 @@ func (s *Service) onVehicleStateChanged(vehicleState string) error {
 	return nil
 }
 
-func (s *Service) onBatteryStateChanged(newState string) error {
+func (s *Service) onBatteryStateChanged(slot, newState string) error {
 	if s.machine != nil {
-		payload := fsm.BatteryStatePayload{State: newState}
+		payload := fsm.BatteryStatePayload{Slot: slot, State: newState}
 		if newState == "active" {
 			s.machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameActive, Payload: payload})
 		} else {
@@ -681,11 +694,21 @@ func (s *Service) OnVehicleLeftLowPowerState(c *librefsm.Context) error {
 	return nil
 }
 
-// OnBatteryStateChanged updates fsmData.BatteryState from the event payload.
+// OnBatteryStateChanged updates per-slot battery state and derives the aggregate.
 func (s *Service) OnBatteryStateChanged(c *librefsm.Context) error {
 	if p, ok := c.Event.Payload.(fsm.BatteryStatePayload); ok {
-		s.logger.Printf("Battery state -> %s", p.State)
-		s.fsmData.BatteryState = p.State
+		switch p.Slot {
+		case "0":
+			s.fsmData.Battery0State = p.State
+		case "1":
+			s.fsmData.Battery1State = p.State
+		}
+		if s.fsmData.Battery0State == "active" || s.fsmData.Battery1State == "active" {
+			s.fsmData.BatteryState = "active"
+		} else {
+			s.fsmData.BatteryState = p.State
+		}
+		s.logger.Printf("Battery %s state -> %s (any active: %v)", p.Slot, p.State, s.fsmData.BatteryState == "active")
 	}
 	return nil
 }

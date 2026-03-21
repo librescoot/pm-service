@@ -72,6 +72,7 @@ type VehicleStatePayload struct {
 }
 
 type BatteryStatePayload struct {
+	Slot  string // "0" or "1"
 	State string
 }
 
@@ -87,7 +88,9 @@ type PowerCommandPayload struct {
 type FSMData struct {
 	TargetPowerState    string // run, suspend, hibernate, hibernate-manual, hibernate-timer, reboot
 	VehicleState        string
-	BatteryState        string
+	BatteryState        string // derived: "active" if either slot is active
+	Battery0State       string
+	Battery1State       string
 	LowPowerStateIssued bool
 	ModemDisabled       bool
 	WakeupReason        string
