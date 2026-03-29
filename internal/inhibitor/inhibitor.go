@@ -12,8 +12,9 @@ import (
 type InhibitorType string
 
 const (
-	TypeBlock InhibitorType = "block"
-	TypeDelay InhibitorType = "delay"
+	TypeBlock       InhibitorType = "block"
+	TypeDelay       InhibitorType = "delay"
+	TypeSuspendOnly InhibitorType = "suspend-only" // Blocks suspend but not hibernate/poweroff/reboot
 )
 
 type Inhibitor struct {
@@ -179,17 +180,28 @@ func (m *Manager) GetInhibitors() []*Inhibitor {
 	return inhibitors
 }
 
-func (m *Manager) HasBlockingInhibitors() bool {
+func (m *Manager) HasBlockingInhibitors(targetPowerState string) bool {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	for _, inhibitor := range m.inhibitors {
-		if inhibitor.Type == TypeBlock {
+	isHibernatePath := targetPowerState == "hibernate" ||
+		targetPowerState == "hibernate-manual" ||
+		targetPowerState == "hibernate-timer" ||
+		targetPowerState == "reboot"
+
+	for _, inh := range m.inhibitors {
+		if inh.Type == TypeSuspendOnly && isHibernatePath {
+			continue
+		}
+		if inh.Type == TypeBlock || inh.Type == TypeSuspendOnly {
 			return true
 		}
 	}
-	for _, inhibitor := range m.manualInhibitors {
-		if inhibitor.Type == TypeBlock {
+	for _, inh := range m.manualInhibitors {
+		if inh.Type == TypeSuspendOnly && isHibernatePath {
+			continue
+		}
+		if inh.Type == TypeBlock || inh.Type == TypeSuspendOnly {
 			return true
 		}
 	}
