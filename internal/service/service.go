@@ -377,12 +377,12 @@ func (s *Service) EnterHibernateImminent(c *librefsm.Context) error {
 func (s *Service) EnterWaitingInhibitors(c *librefsm.Context) error {
 	s.logger.Printf("Entering waiting-for-inhibitors state")
 
+	target := s.fsmData.TargetPowerState
+
 	// Check if we can proceed immediately
-	if !s.inhibitorManager.HasBlockingInhibitors() {
-		// No blocking inhibitors, proceed to issuing
+	if !s.inhibitorManager.HasBlockingInhibitors(target) {
 		c.Send(librefsm.Event{ID: fsm.EvInhibitorsChanged})
-	} else if s.hasOnlyModemBlockingInhibitors() {
-		// Only modem inhibitors, try to disable modem
+	} else if s.hasOnlyModemBlockingInhibitors(target) {
 		s.disableModem()
 	}
 
@@ -537,11 +537,13 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 }
 
 func (s *Service) HasNoBlockingInhibitors(c *librefsm.Context) bool {
-	return !s.inhibitorManager.HasBlockingInhibitors()
+	target := s.fsmData.TargetPowerState
+	return !s.inhibitorManager.HasBlockingInhibitors(target)
 }
 
 func (s *Service) HasOnlyModemInhibitors(c *librefsm.Context) bool {
-	return s.hasOnlyModemBlockingInhibitors() && !s.fsmData.ModemDisabled
+	target := s.fsmData.TargetPowerState
+	return s.hasOnlyModemBlockingInhibitors(target) && !s.fsmData.ModemDisabled
 }
 
 func (s *Service) IsVehicleInStandbyOrParked(c *librefsm.Context) bool {
@@ -824,14 +826,22 @@ func (s *Service) mapPowerStateToRedis(state string) string {
 
 // Helper methods
 
-func (s *Service) hasOnlyModemBlockingInhibitors() bool {
+func (s *Service) hasOnlyModemBlockingInhibitors(targetPowerState string) bool {
 	inhibitors := s.inhibitorManager.GetInhibitors()
+
+	isHibernatePath := targetPowerState == "hibernate" ||
+		targetPowerState == "hibernate-manual" ||
+		targetPowerState == "hibernate-timer" ||
+		targetPowerState == "reboot"
 
 	hasModemInhibitor := false
 	hasOtherInhibitors := false
 
 	for _, inh := range inhibitors {
-		if inh.Type == inhibitor.TypeBlock {
+		if inh.Type == inhibitor.TypeSuspendOnly && isHibernatePath {
+			continue
+		}
+		if inh.Type == inhibitor.TypeBlock || inh.Type == inhibitor.TypeSuspendOnly {
 			if inh.Who == "unu-modem" || inh.Who == "modem-service" {
 				hasModemInhibitor = true
 			} else {

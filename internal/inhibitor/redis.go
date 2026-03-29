@@ -90,8 +90,11 @@ func (m *Manager) syncRedisInhibitors(client *redis_ipc.Client, logger *log.Logg
 	// Add new inhibitors from Redis
 	for id, data := range wantIDs {
 		inhibType := TypeBlock
-		if data.Type == "delay" {
+		switch data.Type {
+		case "delay":
 			inhibType = TypeDelay
+		case "suspend-only":
+			inhibType = TypeSuspendOnly
 		}
 		inh := &Inhibitor{
 			Who:     data.Who,
