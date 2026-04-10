@@ -191,8 +191,29 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		Transition(StateIssuingLowPower, EvLowPowerIssued, StateSuspended).
 
-		// Wakeup during issuing (e.g., suspend failed or returned quickly)
+		// Wakeup from suspend: route to correct path based on target (same logic as StateSuspended)
+		Transition(StateIssuingLowPower, EvWakeup, StatePreSuspend,
+			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),
+			librefsm.WithAction(actions.OnWakeup),
+		).
+		Transition(StateIssuingLowPower, EvWakeup, StateHibernateImminent,
+			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetHibernate),
+			librefsm.WithAction(actions.OnWakeup),
+		).
 		Transition(StateIssuingLowPower, EvWakeup, StateRunning,
+			librefsm.WithAction(actions.OnWakeup),
+		).
+
+		// RTC wakeup from suspend: skip pre-delay (same logic as StateSuspended)
+		Transition(StateIssuingLowPower, EvWakeupRTC, StateSuspendImminent,
+			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),
+			librefsm.WithAction(actions.OnWakeup),
+		).
+		Transition(StateIssuingLowPower, EvWakeupRTC, StateHibernateImminent,
+			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetHibernate),
+			librefsm.WithAction(actions.OnWakeup),
+		).
+		Transition(StateIssuingLowPower, EvWakeupRTC, StateRunning,
 			librefsm.WithAction(actions.OnWakeup),
 		).
 
