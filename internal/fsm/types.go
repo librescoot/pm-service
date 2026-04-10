@@ -10,7 +10,6 @@ const (
 	StateRunning           librefsm.StateID = "running"
 	StatePreSuspend        librefsm.StateID = "pre-suspend"
 	StateSuspendImminent   librefsm.StateID = "suspend-imminent"
-	StatePreHibernate      librefsm.StateID = "pre-hibernate"
 	StateHibernateImminent librefsm.StateID = "hibernate-imminent"
 	StateWaitingInhibitors librefsm.StateID = "waiting-inhibitors"
 	StateIssuingLowPower   librefsm.StateID = "issuing-low-power"
@@ -102,7 +101,6 @@ type Actions interface {
 	// State entry actions
 	EnterPreSuspend(c *librefsm.Context) error
 	EnterSuspendImminent(c *librefsm.Context) error
-	EnterPreHibernate(c *librefsm.Context) error
 	EnterHibernateImminent(c *librefsm.Context) error
 	EnterWaitingInhibitors(c *librefsm.Context) error
 	EnterIssuingLowPower(c *librefsm.Context) error
@@ -112,8 +110,7 @@ type Actions interface {
 	CanEnterLowPowerState(c *librefsm.Context) bool
 	HasNoBlockingInhibitors(c *librefsm.Context) bool
 	HasOnlyModemInhibitors(c *librefsm.Context) bool
-	IsVehicleInStandbyOrParked(c *librefsm.Context) bool
-	IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool
+	IsVehicleNotInStandby(c *librefsm.Context) bool
 	IsTargetNotRun(c *librefsm.Context) bool
 	IsBatteryNotActive(c *librefsm.Context) bool
 	IsTargetSuspend(c *librefsm.Context) bool

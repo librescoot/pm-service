@@ -11,40 +11,35 @@ import (
 
 // mockActions implements fsm.Actions for testing
 type mockActions struct {
-	canEnterLowPower         bool
-	vehicleInStandbyOrParked bool
-	vehicleNotInStandby      bool
-	targetSuspend            bool
-	targetHibernate          bool
-	hasBlockingInhibitors    bool
-	hasOnlyModemInhibitors   bool
-	targetNotRun             bool
+	canEnterLowPower       bool
+	vehicleNotInStandby    bool
+	targetSuspend          bool
+	targetHibernate        bool
+	hasBlockingInhibitors  bool
+	hasOnlyModemInhibitors bool
+	targetNotRun           bool
 }
 
-func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error          { return nil }
-func (m *mockActions) EnterSuspendImminent(c *librefsm.Context) error     { return nil }
-func (m *mockActions) EnterPreHibernate(c *librefsm.Context) error        { return nil }
-func (m *mockActions) EnterHibernateImminent(c *librefsm.Context) error   { return nil }
-func (m *mockActions) EnterWaitingInhibitors(c *librefsm.Context) error   { return nil }
-func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error { return nil }
-func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error  { return nil }
-func (m *mockActions) CanEnterLowPowerState(c *librefsm.Context) bool { return m.canEnterLowPower }
+func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error        { return nil }
+func (m *mockActions) EnterSuspendImminent(c *librefsm.Context) error   { return nil }
+func (m *mockActions) EnterHibernateImminent(c *librefsm.Context) error { return nil }
+func (m *mockActions) EnterWaitingInhibitors(c *librefsm.Context) error { return nil }
+func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error   { return nil }
+func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error    { return nil }
+func (m *mockActions) CanEnterLowPowerState(c *librefsm.Context) bool   { return m.canEnterLowPower }
 func (m *mockActions) HasNoBlockingInhibitors(c *librefsm.Context) bool {
 	return !m.hasBlockingInhibitors
 }
 func (m *mockActions) HasOnlyModemInhibitors(c *librefsm.Context) bool {
 	return m.hasOnlyModemInhibitors
 }
-func (m *mockActions) IsVehicleInStandbyOrParked(c *librefsm.Context) bool {
-	return m.vehicleInStandbyOrParked
-}
-func (m *mockActions) IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool {
+func (m *mockActions) IsVehicleNotInStandby(c *librefsm.Context) bool {
 	return m.vehicleNotInStandby
 }
-func (m *mockActions) IsTargetNotRun(c *librefsm.Context) bool              { return m.targetNotRun }
-func (m *mockActions) IsBatteryNotActive(c *librefsm.Context) bool          { return true }
-func (m *mockActions) IsTargetSuspend(c *librefsm.Context) bool             { return m.targetSuspend }
-func (m *mockActions) IsTargetHibernate(c *librefsm.Context) bool           { return m.targetHibernate }
+func (m *mockActions) IsTargetNotRun(c *librefsm.Context) bool               { return m.targetNotRun }
+func (m *mockActions) IsBatteryNotActive(c *librefsm.Context) bool           { return true }
+func (m *mockActions) IsTargetSuspend(c *librefsm.Context) bool              { return m.targetSuspend }
+func (m *mockActions) IsTargetHibernate(c *librefsm.Context) bool            { return m.targetHibernate }
 func (m *mockActions) IsPowerCommandHigherPriority(c *librefsm.Context) bool { return true }
 func (m *mockActions) OnPreSuspendTimeout(c *librefsm.Context) error         { return nil }
 func (m *mockActions) OnSuspendImminentTimeout(c *librefsm.Context) error    { return nil }
@@ -58,7 +53,9 @@ func (m *mockActions) OnPowerCommand(c *librefsm.Context) error              { r
 func (m *mockActions) PublishState(state string) error                       { return nil }
 func (m *mockActions) PublishWakeupSource(reason string) error               { return nil }
 
-func TestSuspendPathWithBattery(t *testing.T) {
+// TestExplicitSuspendSkipsPreDelay verifies that an explicit suspend command
+// goes directly to SuspendImminent (skipping the pre-suspend delay).
+func TestExplicitSuspendSkipsPreDelay(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
 		targetSuspend:    true,
@@ -76,14 +73,13 @@ func TestSuspendPathWithBattery(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Test: suspend command routes to PreSuspend
 	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
-	time.Sleep(10 * time.Millisecond) // Let FSM process
-	if !machine.IsInState(fsm.StatePreSuspend) {
-		t.Errorf("Expected StatePreSuspend, got %v", machine.CurrentState())
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateSuspendImminent) {
+		t.Errorf("Expected StateSuspendImminent (commands skip pre-delay), got %v", machine.CurrentState())
 	}
 
-	// Test: battery became active cancels suspend (no guard needed!)
+	// Battery active still cancels suspend
 	machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameActive})
 	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StateRunning) {
@@ -91,7 +87,9 @@ func TestSuspendPathWithBattery(t *testing.T) {
 	}
 }
 
-func TestHibernatePathNoBattery(t *testing.T) {
+// TestExplicitHibernateSkipsPreDelay verifies hibernate command goes directly
+// to HibernateImminent.
+func TestExplicitHibernateSkipsPreDelay(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
 		targetHibernate:  true,
@@ -109,22 +107,23 @@ func TestHibernatePathNoBattery(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Test: hibernate command routes to PreHibernate
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StatePreHibernate) {
-		t.Errorf("Expected StatePreHibernate, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent, got %v", machine.CurrentState())
 	}
 
-	// Test: battery became active does NOT cancel hibernate
+	// Battery active does NOT cancel hibernate
 	machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameActive})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StatePreHibernate) {
-		t.Errorf("Expected StatePreHibernate (battery shouldn't affect hibernate), got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent (battery shouldn't affect hibernate), got %v", machine.CurrentState())
 	}
 }
 
-func TestVehicleStateRoutingToSuspend(t *testing.T) {
+// TestNaturalSuspendUsesPreDelay verifies that the natural suspend path
+// (vehicle enters stand-by with target=suspend) goes through PreSuspend.
+func TestNaturalSuspendUsesPreDelay(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
 		targetSuspend:    true,
@@ -142,15 +141,16 @@ func TestVehicleStateRoutingToSuspend(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Test: vehicle state change with suspend target routes to PreSuspend
 	machine.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
 	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StatePreSuspend) {
-		t.Errorf("Expected StatePreSuspend, got %v", machine.CurrentState())
+		t.Errorf("Expected StatePreSuspend (natural suspend uses pre-delay), got %v", machine.CurrentState())
 	}
 }
 
-func TestVehicleStateRoutingToHibernate(t *testing.T) {
+// TestNaturalHibernateSkipsPreDelay verifies that vehicle state change with
+// hibernate target goes directly to HibernateImminent (no pre-delay).
+func TestNaturalHibernateSkipsPreDelay(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
 		targetHibernate:  true,
@@ -168,15 +168,16 @@ func TestVehicleStateRoutingToHibernate(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Test: vehicle state change with hibernate target routes to PreHibernate (guard fallthrough!)
 	machine.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StatePreHibernate) {
-		t.Errorf("Expected StatePreHibernate, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent (hibernate skips pre-delay), got %v", machine.CurrentState())
 	}
 }
 
-func TestBatteryInactiveOnlySuspend(t *testing.T) {
+// TestBatteryInactiveTriggersNaturalSuspend: battery-inactive while in stand-by
+// with target=suspend enters the pre-delay natural path.
+func TestBatteryInactiveTriggersNaturalSuspend(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
 		targetSuspend:    true,
@@ -194,7 +195,6 @@ func TestBatteryInactiveOnlySuspend(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Test: battery inactive with suspend target routes to PreSuspend
 	machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameInactive})
 	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StatePreSuspend) {
@@ -202,6 +202,8 @@ func TestBatteryInactiveOnlySuspend(t *testing.T) {
 	}
 }
 
+// TestBatteryInactiveIgnoredForHibernate: battery events do not start the
+// hibernate path.
 func TestBatteryInactiveIgnoredForHibernate(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
@@ -220,14 +222,14 @@ func TestBatteryInactiveIgnoredForHibernate(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Test: battery inactive with hibernate target does NOT trigger transition
 	machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameInactive})
 	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StateRunning) {
-		t.Errorf("Expected StateRunning (battery inactive shouldn't trigger hibernate), got %v", machine.CurrentState())
+		t.Errorf("Expected StateRunning, got %v", machine.CurrentState())
 	}
 }
 
+// TestSuspendImminentCancelOnBattery: battery active in SuspendImminent cancels.
 func TestSuspendImminentCancelOnBattery(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
@@ -246,14 +248,13 @@ func TestSuspendImminentCancelOnBattery(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Get to SuspendImminent
+	// Explicit suspend → SuspendImminent directly
 	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
-	time.Sleep(70 * time.Millisecond) // Wait for PreSuspend timeout
+	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StateSuspendImminent) {
 		t.Errorf("Expected StateSuspendImminent, got %v", machine.CurrentState())
 	}
 
-	// Battery active should cancel
 	machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameActive})
 	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StateRunning) {
@@ -261,15 +262,16 @@ func TestSuspendImminentCancelOnBattery(t *testing.T) {
 	}
 }
 
+// TestWakeupRoutingBasedOnTarget is a placeholder for wakeup routing logic —
+// driving from StateSuspended requires more setup than this mock provides.
 func TestWakeupRoutingBasedOnTarget(t *testing.T) {
 	tests := []struct {
 		name            string
 		targetSuspend   bool
 		targetHibernate bool
-		expectedState   librefsm.StateID
 	}{
-		{"suspend target routes to PreSuspend", true, false, fsm.StatePreSuspend},
-		{"hibernate target routes to PreHibernate", false, true, fsm.StatePreHibernate},
+		{"suspend target", true, false},
+		{"hibernate target", false, true},
 	}
 
 	for _, tt := range tests {
@@ -292,18 +294,15 @@ func TestWakeupRoutingBasedOnTarget(t *testing.T) {
 			}
 			defer machine.Stop()
 
-			// Simulate wakeup from suspended state
-			// First get to suspended (shortcut via direct state - not testing full flow here)
 			machine.Send(librefsm.Event{ID: fsm.EvWakeup})
 			time.Sleep(10 * time.Millisecond)
-			// Note: Since we start in Running, wakeup from Running won't do anything
-			// This test is limited - in real scenario we'd be in StateSuspended
 		})
 	}
 }
 
-func TestPriorityBlocking(t *testing.T) {
-	// Hibernate should have priority over suspend
+// TestHibernateCommandInHibernate: a second hibernate command from Running
+// state in hibernate goes straight to HibernateImminent (priority passes).
+func TestHibernateCommandInHibernate(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
 		targetHibernate:  true,
@@ -321,21 +320,15 @@ func TestPriorityBlocking(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Send hibernate command
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StatePreHibernate) {
-		t.Errorf("Expected StatePreHibernate, got %v", machine.CurrentState())
-	}
-
-	// Now send suspend command - should stay in PreHibernate (hibernate has priority)
-	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
-	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StatePreHibernate) {
-		t.Errorf("Expected StatePreHibernate (hibernate priority), got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent, got %v", machine.CurrentState())
 	}
 }
 
+// TestRapidStateChanges: a sequence of commands collapses back to Running
+// when the last command is run.
 func TestRapidStateChanges(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
@@ -355,7 +348,6 @@ func TestRapidStateChanges(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Send rapid sequence of commands
 	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
 	time.Sleep(5 * time.Millisecond)
 	machine.Send(librefsm.Event{ID: fsm.EvPowerRun})
@@ -367,13 +359,13 @@ func TestRapidStateChanges(t *testing.T) {
 	machine.Send(librefsm.Event{ID: fsm.EvPowerRun})
 	time.Sleep(10 * time.Millisecond)
 
-	// Should end up in Running state
 	if !machine.IsInState(fsm.StateRunning) {
 		t.Errorf("Expected StateRunning after rapid changes, got %v", machine.CurrentState())
 	}
 }
 
-func TestTimeoutProgression(t *testing.T) {
+// TestNaturalSuspendTimeoutProgression: PreSuspend → SuspendImminent → WaitingInhibitors.
+func TestNaturalSuspendTimeoutProgression(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
 		targetSuspend:    true,
@@ -391,26 +383,26 @@ func TestTimeoutProgression(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Send suspend command
-	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
+	// Natural path via EvVehicleStateChanged
+	machine.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
 	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StatePreSuspend) {
 		t.Errorf("Expected StatePreSuspend, got %v", machine.CurrentState())
 	}
 
-	// Wait for PreSuspend timeout
 	time.Sleep(60 * time.Millisecond)
 	if !machine.IsInState(fsm.StateSuspendImminent) {
 		t.Errorf("Expected StateSuspendImminent after timeout, got %v", machine.CurrentState())
 	}
 
-	// Wait for SuspendImminent timeout
 	time.Sleep(60 * time.Millisecond)
 	if !machine.IsInState(fsm.StateWaitingInhibitors) {
 		t.Errorf("Expected StateWaitingInhibitors after timeout, got %v", machine.CurrentState())
 	}
 }
 
+// TestVehicleLeavingStandbyCancel: leaving stand-by cancels from any
+// low-power waiting state.
 func TestVehicleLeavingStandbyCancel(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower:    true,
@@ -430,18 +422,15 @@ func TestVehicleLeavingStandbyCancel(t *testing.T) {
 	}
 	defer machine.Stop()
 
-	// Enter PreSuspend
 	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StatePreSuspend) {
-		t.Errorf("Expected StatePreSuspend, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateSuspendImminent) {
+		t.Errorf("Expected StateSuspendImminent, got %v", machine.CurrentState())
 	}
 
-	// Vehicle leaves standby/parked - should cancel
 	machine.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
 	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StateRunning) {
-		t.Errorf("Expected StateRunning after vehicle left standby, got %v", machine.CurrentState())
+		t.Errorf("Expected StateRunning after vehicle left stand-by, got %v", machine.CurrentState())
 	}
 }
-

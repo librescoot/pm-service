@@ -9,13 +9,17 @@ import (
 // NewDefinition creates the power management FSM definition.
 // The actions parameter provides the implementation for state entry/exit,
 // guards, and transition actions.
+//
+// Only the natural suspend path (vehicle entering stand-by or battery becoming
+// inactive while in stand-by with target=suspend) uses the pre-suspend delay.
+// Explicit commands and the hibernate path go directly to the imminent state.
 func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.Duration) *librefsm.Definition {
 	return librefsm.NewDefinition().
 		// === Main States ===
 
 		State(StateRunning).
 
-		// Suspend path (battery-sensitive)
+		// Suspend path (battery-sensitive) — pre-delay only on natural entry
 		State(StatePreSuspend,
 			librefsm.WithOnEnter(actions.EnterPreSuspend),
 			librefsm.WithTimeout(preSuspendDelay, EvPreSuspendTimeout),
@@ -25,11 +29,7 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithTimeout(suspendImminentDelay, EvSuspendImminentTimeout),
 		).
 
-		// Hibernate path (no battery concern)
-		State(StatePreHibernate,
-			librefsm.WithOnEnter(actions.EnterPreHibernate),
-			librefsm.WithTimeout(preSuspendDelay, EvPreSuspendTimeout),
-		).
+		// Hibernate path (no pre-delay)
 		State(StateHibernateImminent,
 			librefsm.WithOnEnter(actions.EnterHibernateImminent),
 			librefsm.WithTimeout(suspendImminentDelay, EvSuspendImminentTimeout),
@@ -47,42 +47,41 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		// === Transitions from Running ===
 
-		// Suspend path - power command
-		Transition(StateRunning, EvPowerSuspend, StatePreSuspend,
+		// Explicit power commands skip pre-delay
+		Transition(StateRunning, EvPowerSuspend, StateSuspendImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvPowerHibernate, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvPowerHibernateManual, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvPowerHibernateTimer, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvPowerReboot, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
-		// Hibernate path - power commands
-		Transition(StateRunning, EvPowerHibernate, StatePreHibernate,
-			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
-			librefsm.WithAction(actions.OnPowerCommand),
-		).
-		Transition(StateRunning, EvPowerHibernateManual, StatePreHibernate,
-			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
-			librefsm.WithAction(actions.OnPowerCommand),
-		).
-		Transition(StateRunning, EvPowerHibernateTimer, StatePreHibernate,
-			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
-			librefsm.WithAction(actions.OnPowerCommand),
-		).
-		Transition(StateRunning, EvPowerReboot, StatePreHibernate,
+		// Auto-hibernation timer expired — treated like a command, skip pre-delay
+		Transition(StateRunning, EvHibernationTimerExpired, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
-		// Auto-hibernation timer expired
-		Transition(StateRunning, EvHibernationTimerExpired, StatePreHibernate,
-			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
-			librefsm.WithAction(actions.OnPowerCommand),
-		).
-
-		// Vehicle state changes may enable low-power transition
+		// Natural suspend path: vehicle enters stand-by with target=suspend — use pre-delay
 		Transition(StateRunning, EvVehicleStateChanged, StatePreSuspend,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),
 			librefsm.WithAction(actions.OnVehicleStateChanged),
 		).
-		Transition(StateRunning, EvVehicleStateChanged, StatePreHibernate,
+		// Natural hibernate path: vehicle enters stand-by with hibernate target — no pre-delay
+		Transition(StateRunning, EvVehicleStateChanged, StateHibernateImminent,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetHibernate),
 			librefsm.WithAction(actions.OnVehicleStateChanged),
 		).
@@ -91,12 +90,12 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnVehicleStateChanged),
 		).
 
-		// Battery became inactive - only relevant for suspend
+		// Natural suspend path: battery became inactive with target=suspend — use pre-delay
 		Transition(StateRunning, EvBatteryBecameInactive, StatePreSuspend,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),
 			librefsm.WithAction(actions.OnBatteryStateChanged),
 		).
-		// Battery state change with no transition (e.g. no active suspend target)
+		// Battery state change with no transition
 		Transition(StateRunning, EvBatteryBecameInactive, StateRunning,
 			librefsm.WithAction(actions.OnBatteryStateChanged),
 		).
@@ -112,9 +111,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
-		// Cancel: vehicle left standby/parked
+		// Cancel: vehicle left stand-by (any other state, including parked)
 		Transition(StatePreSuspend, EvVehicleStateChanged, StateRunning,
-			librefsm.WithGuard(actions.IsVehicleNotInStandbyOrParked),
+			librefsm.WithGuard(actions.IsVehicleNotInStandby),
 			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
 		).
 
@@ -134,9 +133,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
-		// Cancel: vehicle left standby/parked
+		// Cancel: vehicle left stand-by
 		Transition(StateSuspendImminent, EvVehicleStateChanged, StateRunning,
-			librefsm.WithGuard(actions.IsVehicleNotInStandbyOrParked),
+			librefsm.WithGuard(actions.IsVehicleNotInStandby),
 			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
 		).
 
@@ -144,25 +143,6 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		Transition(StateSuspendImminent, EvBatteryBecameActive, StateRunning,
 			librefsm.WithAction(actions.OnBatteryStateChanged),
 		).
-
-		// === Transitions from PreHibernate (hibernate path) ===
-
-		Transition(StatePreHibernate, EvPreSuspendTimeout, StateHibernateImminent,
-			librefsm.WithGuard(actions.CanEnterLowPowerState),
-		).
-
-		// Cancel: target set to run
-		Transition(StatePreHibernate, EvPowerRun, StateRunning,
-			librefsm.WithAction(actions.OnPowerCommand),
-		).
-
-		// Cancel: vehicle left standby/parked
-		Transition(StatePreHibernate, EvVehicleStateChanged, StateRunning,
-			librefsm.WithGuard(actions.IsVehicleNotInStandbyOrParked),
-			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
-		).
-
-		// Note: No battery transitions from hibernate path
 
 		// === Transitions from HibernateImminent (hibernate path) ===
 
@@ -175,9 +155,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
-		// Cancel: vehicle left standby/parked
+		// Cancel: vehicle left stand-by
 		Transition(StateHibernateImminent, EvVehicleStateChanged, StateRunning,
-			librefsm.WithGuard(actions.IsVehicleNotInStandbyOrParked),
+			librefsm.WithGuard(actions.IsVehicleNotInStandby),
 			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
 		).
 
@@ -201,9 +181,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
-		// Cancel: vehicle left standby/parked
+		// Cancel: vehicle left stand-by
 		Transition(StateWaitingInhibitors, EvVehicleStateChanged, StateRunning,
-			librefsm.WithGuard(actions.IsVehicleNotInStandbyOrParked),
+			librefsm.WithGuard(actions.IsVehicleNotInStandby),
 			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
 		).
 
@@ -223,7 +203,7 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),
 			librefsm.WithAction(actions.OnWakeup),
 		).
-		Transition(StateSuspended, EvWakeup, StatePreHibernate,
+		Transition(StateSuspended, EvWakeup, StateHibernateImminent,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetHibernate),
 			librefsm.WithAction(actions.OnWakeup),
 		).

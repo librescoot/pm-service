@@ -362,11 +362,6 @@ func (s *Service) EnterSuspendImminent(c *librefsm.Context) error {
 	return nil
 }
 
-func (s *Service) EnterPreHibernate(c *librefsm.Context) error {
-	s.logger.Printf("Entering pre-hibernate state, waiting %v", s.config.PreSuspendDelay)
-	return nil
-}
-
 func (s *Service) EnterHibernateImminent(c *librefsm.Context) error {
 	s.logger.Printf("Entering hibernate-imminent state")
 	// Publish imminent state
@@ -514,7 +509,8 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 		return false
 	}
 
-	// Special case for reboot - allow in both stand-by and shutting-down states
+	// Reboot is also allowed during an in-progress shutdown so a reboot command
+	// can supersede an ongoing poweroff sequence (librescoot-specific).
 	if targetState == fsm.TargetReboot {
 		if vehicleState != "stand-by" && vehicleState != "shutting-down" {
 			s.logger.Printf("Cannot enter reboot state: vehicle state is %s", vehicleState)
@@ -523,7 +519,8 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 		return true
 	}
 
-	if vehicleState != "stand-by" && vehicleState != "parked" && vehicleState != "shutting-down" {
+	// Only stand-by is a valid LPM entry state.
+	if vehicleState != "stand-by" {
 		s.logger.Printf("Cannot enter low power state: vehicle state is %s", vehicleState)
 		return false
 	}
@@ -546,14 +543,8 @@ func (s *Service) HasOnlyModemInhibitors(c *librefsm.Context) bool {
 	return s.hasOnlyModemBlockingInhibitors(target) && !s.fsmData.ModemDisabled
 }
 
-func (s *Service) IsVehicleInStandbyOrParked(c *librefsm.Context) bool {
-	state := s.vehicleStateFromContext(c)
-	return state == "stand-by" || state == "parked"
-}
-
-func (s *Service) IsVehicleNotInStandbyOrParked(c *librefsm.Context) bool {
-	state := s.vehicleStateFromContext(c)
-	return state != "stand-by" && state != "parked"
+func (s *Service) IsVehicleNotInStandby(c *librefsm.Context) bool {
+	return s.vehicleStateFromContext(c) != "stand-by"
 }
 
 func (s *Service) IsTargetNotRun(c *librefsm.Context) bool {
@@ -664,9 +655,11 @@ func (s *Service) OnVehicleStateChanged(c *librefsm.Context) error {
 		s.hibernationTimer.ResetTimer(false)
 	}
 
-	// Reset target if vehicle left standby/parked (cancel any pending low-power intent)
-	if (oldState == "stand-by" || oldState == "parked") && newState != "stand-by" && newState != "parked" {
-		s.fsmData.TargetPowerState = fsm.TargetRun
+	// Reset target to configured default when vehicle leaves stand-by.
+	// Cancels any pending low-power intent but keeps the target seeded at
+	// the default so re-entering stand-by re-triggers the natural low-power path.
+	if oldState == "stand-by" && newState != "stand-by" {
+		s.fsmData.TargetPowerState = s.config.DefaultState
 		s.fsmData.ModemDisabled = false
 	}
 
@@ -690,7 +683,7 @@ func (s *Service) OnVehicleLeftLowPowerState(c *librefsm.Context) error {
 		}
 	}
 
-	s.fsmData.TargetPowerState = fsm.TargetRun
+	s.fsmData.TargetPowerState = s.config.DefaultState
 	s.fsmData.ModemDisabled = false
 	s.publishState("running")
 	return nil
@@ -751,7 +744,7 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 	switch state {
 	case fsm.StateRunning:
 		redisState = "running"
-	case fsm.StatePreSuspend, fsm.StatePreHibernate:
+	case fsm.StatePreSuspend:
 		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState) + "-pending"
 	case fsm.StateSuspendImminent, fsm.StateHibernateImminent:
 		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState + "-imminent")
@@ -842,7 +835,7 @@ func (s *Service) hasOnlyModemBlockingInhibitors(targetPowerState string) bool {
 			continue
 		}
 		if inh.Type == inhibitor.TypeBlock || inh.Type == inhibitor.TypeSuspendOnly {
-			if inh.Who == "unu-modem" || inh.Who == "modem-service" {
+			if inh.Who == "modem-service" {
 				hasModemInhibitor = true
 			} else {
 				hasOtherInhibitors = true
