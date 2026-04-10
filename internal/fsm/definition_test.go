@@ -401,6 +401,180 @@ func TestNaturalSuspendTimeoutProgression(t *testing.T) {
 	}
 }
 
+// TestPreSuspendUpgradeToHibernate: hibernate command while in PreSuspend
+// should upgrade to HibernateImminent (skipping the pre-delay).
+func TestPreSuspendUpgradeToHibernate(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: true,
+		targetSuspend:    true,
+	}
+
+	def := fsm.NewDefinition(actions, 200*time.Millisecond, 200*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	// Enter PreSuspend via the natural path
+	machine.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StatePreSuspend) {
+		t.Fatalf("Expected StatePreSuspend, got %v", machine.CurrentState())
+	}
+
+	// Hibernate upgrade — jumps directly to HibernateImminent
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent after hibernate upgrade, got %v", machine.CurrentState())
+	}
+}
+
+// TestSuspendImminentUpgradeOnHibernationTimer: the hibernation timer firing
+// while in SuspendImminent should upgrade the in-flight sequence.
+func TestSuspendImminentUpgradeOnHibernationTimer(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: true,
+		targetSuspend:    true,
+	}
+
+	def := fsm.NewDefinition(actions, 200*time.Millisecond, 200*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	// Explicit suspend → SuspendImminent directly
+	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateSuspendImminent) {
+		t.Fatalf("Expected StateSuspendImminent, got %v", machine.CurrentState())
+	}
+
+	// Hibernation timer fires — should upgrade to HibernateImminent
+	machine.Send(librefsm.Event{ID: fsm.EvHibernationTimerExpired})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent after timer upgrade, got %v", machine.CurrentState())
+	}
+}
+
+// TestHibernateImminentSelfUpgrade: hibernate-manual while in HibernateImminent
+// is a valid priority upgrade and re-enters the imminent state.
+func TestHibernateImminentSelfUpgrade(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: true,
+		targetHibernate:  true,
+	}
+
+	def := fsm.NewDefinition(actions, 200*time.Millisecond, 200*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Fatalf("Expected StateHibernateImminent, got %v", machine.CurrentState())
+	}
+
+	// hibernate-manual upgrade stays in HibernateImminent
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernateManual})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent after self-upgrade, got %v", machine.CurrentState())
+	}
+}
+
+// TestWaitingInhibitorsUpgradeToHibernate: upgrades from WaitingInhibitors
+// bounce back to HibernateImminent to restart the imminent sequence.
+func TestWaitingInhibitorsUpgradeToHibernate(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:      true,
+		targetSuspend:         true,
+		hasBlockingInhibitors: true,
+	}
+
+	def := fsm.NewDefinition(actions, 30*time.Millisecond, 30*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
+	time.Sleep(50 * time.Millisecond) // past the imminent timeout
+	if !machine.IsInState(fsm.StateWaitingInhibitors) {
+		t.Fatalf("Expected StateWaitingInhibitors, got %v", machine.CurrentState())
+	}
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent after hibernate upgrade from waiting, got %v", machine.CurrentState())
+	}
+}
+
+// TestPreSuspendHibernateDowngradeRejected: a suspend command while in
+// HibernateImminent should not downgrade — stays in hibernate path.
+func TestHibernateDowngradeRejected(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: true,
+		targetHibernate:  true,
+	}
+
+	def := fsm.NewDefinition(actions, 200*time.Millisecond, 200*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Fatalf("Expected StateHibernateImminent, got %v", machine.CurrentState())
+	}
+
+	// Suspend command should not downgrade — mockActions always reports
+	// IsPowerCommandHigherPriority=true so this test guards against the
+	// missing-transition case, not the priority check itself.
+	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent (no suspend transition from hibernate), got %v", machine.CurrentState())
+	}
+}
+
 // TestVehicleLeavingStandbyCancel: leaving stand-by cancels from any
 // low-power waiting state.
 func TestVehicleLeavingStandbyCancel(t *testing.T) {

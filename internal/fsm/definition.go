@@ -122,6 +122,28 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnBatteryStateChanged),
 		).
 
+		// Upgrade: higher-priority hibernate-path events jump straight to HibernateImminent
+		Transition(StatePreSuspend, EvPowerHibernate, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StatePreSuspend, EvPowerHibernateManual, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StatePreSuspend, EvPowerHibernateTimer, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StatePreSuspend, EvPowerReboot, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StatePreSuspend, EvHibernationTimerExpired, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+
 		// === Transitions from SuspendImminent (suspend path) ===
 
 		Transition(StateSuspendImminent, EvSuspendImminentTimeout, StateWaitingInhibitors,
@@ -144,6 +166,29 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnBatteryStateChanged),
 		).
 
+		// Upgrade: higher-priority hibernate-path events jump to HibernateImminent
+		// (re-enters imminent state, restarting the imminent timer)
+		Transition(StateSuspendImminent, EvPowerHibernate, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateSuspendImminent, EvPowerHibernateManual, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateSuspendImminent, EvPowerHibernateTimer, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateSuspendImminent, EvPowerReboot, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateSuspendImminent, EvHibernationTimerExpired, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+
 		// === Transitions from HibernateImminent (hibernate path) ===
 
 		Transition(StateHibernateImminent, EvSuspendImminentTimeout, StateWaitingInhibitors,
@@ -159,6 +204,17 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		Transition(StateHibernateImminent, EvVehicleStateChanged, StateRunning,
 			librefsm.WithGuard(actions.IsVehicleNotInStandby),
 			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
+		).
+
+		// Upgrade within hibernate priorities (e.g., timer → hibernate → hibernate-manual).
+		// Self-transitions re-enter the state and restart the imminent timer.
+		Transition(StateHibernateImminent, EvPowerHibernate, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateHibernateImminent, EvPowerHibernateManual, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
 		// Note: No battery transitions from hibernate path
@@ -185,6 +241,35 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		Transition(StateWaitingInhibitors, EvVehicleStateChanged, StateRunning,
 			librefsm.WithGuard(actions.IsVehicleNotInStandby),
 			librefsm.WithAction(actions.OnVehicleLeftLowPowerState),
+		).
+
+		// Cancel: battery became active during waiting (only relevant for suspend target)
+		Transition(StateWaitingInhibitors, EvBatteryBecameActive, StateRunning,
+			librefsm.WithGuard(actions.IsTargetSuspend),
+			librefsm.WithAction(actions.OnBatteryStateChanged),
+		).
+
+		// Upgrade: higher-priority events bounce back to HibernateImminent
+		// to restart the imminent sequence under the new target.
+		Transition(StateWaitingInhibitors, EvPowerHibernate, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateWaitingInhibitors, EvPowerHibernateManual, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateWaitingInhibitors, EvPowerHibernateTimer, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateWaitingInhibitors, EvPowerReboot, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateWaitingInhibitors, EvHibernationTimerExpired, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
 		// === Transitions from IssuingLowPower ===
