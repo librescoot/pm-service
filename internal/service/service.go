@@ -12,30 +12,30 @@ import (
 	"sync"
 	"time"
 
-	redis_ipc "github.com/librescoot/redis-ipc"
 	"github.com/librescoot/librefsm"
 	"github.com/librescoot/pm-service/internal/config"
 	"github.com/librescoot/pm-service/internal/fsm"
 	"github.com/librescoot/pm-service/internal/hibernation"
 	"github.com/librescoot/pm-service/internal/inhibitor"
 	"github.com/librescoot/pm-service/internal/systemd"
+	redis_ipc "github.com/librescoot/redis-ipc"
 )
 
 type Service struct {
-	config           *config.Config
-	logger           *log.Logger
-	redis            *redis_ipc.Client
-	inhibitorManager *inhibitor.Manager
-	hibernationTimer *hibernation.Timer
-	systemdClient    *systemd.Client
-	delayInhibitor       *inhibitor.Inhibitor
-	delayInhibitorMu     sync.Mutex
-	cancelDelayRemoval   context.CancelFunc
-	powerManagerPub  *redis_ipc.HashPublisher
-	systemPub        *redis_ipc.HashPublisher
-	busyServicesPub  *redis_ipc.HashPublisher
-	ctx              context.Context
-	ctxCancel        context.CancelFunc
+	config             *config.Config
+	logger             *log.Logger
+	redis              *redis_ipc.Client
+	inhibitorManager   *inhibitor.Manager
+	hibernationTimer   *hibernation.Timer
+	systemdClient      *systemd.Client
+	delayInhibitor     *inhibitor.Inhibitor
+	delayInhibitorMu   sync.Mutex
+	cancelDelayRemoval context.CancelFunc
+	powerManagerPub    *redis_ipc.HashPublisher
+	systemPub          *redis_ipc.HashPublisher
+	busyServicesPub    *redis_ipc.HashPublisher
+	ctx                context.Context
+	ctxCancel          context.CancelFunc
 
 	// librefsm
 	machine *librefsm.Machine
