@@ -357,15 +357,11 @@ func (s *Service) EnterPreSuspend(c *librefsm.Context) error {
 
 func (s *Service) EnterSuspendImminent(c *librefsm.Context) error {
 	s.logger.Printf("Entering suspend-imminent state")
-	// Publish imminent state
-	s.publishState(s.fsmData.TargetPowerState + "-imminent")
 	return nil
 }
 
 func (s *Service) EnterHibernateImminent(c *librefsm.Context) error {
 	s.logger.Printf("Entering hibernate-imminent state")
-	// Publish imminent state
-	s.publishState(s.fsmData.TargetPowerState + "-imminent")
 	return nil
 }
 
@@ -412,7 +408,6 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	}
 
 	s.fsmData.LowPowerStateIssued = true
-	s.publishState(s.fsmData.TargetPowerState)
 
 	s.logger.Printf("Issuing %s command", target)
 	// Note: For suspend, this call blocks until the system wakes up
@@ -685,7 +680,6 @@ func (s *Service) OnVehicleLeftLowPowerState(c *librefsm.Context) error {
 
 	s.fsmData.TargetPowerState = s.config.DefaultState
 	s.fsmData.ModemDisabled = false
-	s.publishState("running")
 	return nil
 }
 
