@@ -119,6 +119,17 @@ func (s *Service) Run(ctx context.Context) error {
 		s.fsmData.BatteryState = "active"
 	}
 
+	// Read default power state from settings; CLI arg is the fallback
+	if defaultState, err := s.redis.HGet("settings", "pm.default-state"); err == nil && defaultState != "" {
+		if isValidDefaultState(defaultState) {
+			s.logger.Printf("Default power state from settings: %s (CLI fallback: %s)", defaultState, s.config.DefaultState)
+			s.config.DefaultState = defaultState
+			s.fsmData.TargetPowerState = defaultState
+		} else {
+			s.logger.Printf("Ignoring invalid pm.default-state setting %q, using CLI default: %s", defaultState, s.config.DefaultState)
+		}
+	}
+
 	// Create hibernation timer with the run context
 	s.hibernationTimer = hibernation.NewTimer(
 		ctx,
@@ -204,9 +215,10 @@ func (s *Service) Run(ctx context.Context) error {
 	// Start Redis inhibitor listener (syncs power:inhibits hash into inhibitor manager)
 	go s.inhibitorManager.StartRedisListener(ctx, s.redis, s.logger)
 
-	// Watch hibernation timer setting in Redis
+	// Watch settings in Redis
 	if err := s.redis.NewHashWatcher("settings").
 		OnField("hibernation-timer", s.onHibernationTimerSetting).
+		OnField("pm.default-state", s.onDefaultStateSetting).
 		StartWithSync(); err != nil {
 		return fmt.Errorf("failed to start settings watcher: %v", err)
 	}
@@ -893,4 +905,26 @@ func (s *Service) onHibernationTimerSetting(value string) error {
 	s.hibernationTimer.SetTimerValue(int32(timerValue))
 	s.logger.Printf("Updated hibernation timer setting: %d seconds", timerValue)
 	return nil
+}
+
+func (s *Service) onDefaultStateSetting(value string) error {
+	if !isValidDefaultState(value) {
+		s.logger.Printf("Ignoring invalid pm.default-state setting: %q", value)
+		return nil
+	}
+	if s.config.DefaultState == value {
+		return nil
+	}
+	s.logger.Printf("Default power state changed: %s -> %s", s.config.DefaultState, value)
+	s.config.DefaultState = value
+	return nil
+}
+
+func isValidDefaultState(state string) bool {
+	switch state {
+	case fsm.TargetRun, fsm.TargetSuspend, fsm.TargetHibernate,
+		fsm.TargetHibernateManual, fsm.TargetHibernateTimer, fsm.TargetReboot:
+		return true
+	}
+	return false
 }

@@ -55,5 +55,5 @@ func (c *Config) RegisterFlags() {
 		"Dry run state (don't actually issue power state changes)")
 
 	flag.StringVar(&c.DefaultState, "default-state", c.DefaultState,
-		"Default power state (run, suspend, hibernate, hibernate-manual, hibernate-timer, reboot)")
+		"Fallback power state if pm.default-state setting is not configured (run, suspend, hibernate, hibernate-manual, hibernate-timer, reboot)")
 }
