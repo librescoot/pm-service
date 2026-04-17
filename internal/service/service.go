@@ -217,7 +217,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// Watch settings in Redis
 	if err := s.redis.NewHashWatcher("settings").
-		OnField("hibernation-timer", s.onHibernationTimerSetting).
+		OnField("pm.hibernation-timer", s.onHibernationTimerSetting).
 		OnField("pm.default-state", s.onDefaultStateSetting).
 		StartWithSync(); err != nil {
 		return fmt.Errorf("failed to start settings watcher: %v", err)
