@@ -765,7 +765,7 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 		return
 	}
 
-	if err := s.powerManagerPub.Set("state", redisState); err != nil {
+	if _, err := s.powerManagerPub.SetIfChanged("state", redisState); err != nil {
 		s.logger.Printf("Failed to publish FSM state: %v", err)
 	}
 }
