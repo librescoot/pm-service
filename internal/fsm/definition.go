@@ -47,31 +47,70 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		// === Transitions from Running ===
 
-		// Explicit power commands skip pre-delay
+		// Explicit power commands skip pre-delay.
+		//
+		// Each command has two transitions: a guarded one that fires when the
+		// vehicle is already in stand-by, and a self-transition fallback that
+		// records the target via OnPowerCommand when CanEnterLowPowerState
+		// rejects (e.g., vehicle still in parked/shutting-down). The natural
+		// EvVehicleStateChanged transitions below pick up the stored target
+		// when stand-by arrives, mirroring the OEM unu-pm setTargetMode +
+		// onVehicleState pattern. Without the fallback, lock-hibernate races
+		// with vehicle.state updates and gets dropped.
 		Transition(StateRunning, EvPowerSuspend, StateSuspendImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvPowerSuspend, StateRunning,
+			librefsm.WithGuard(actions.IsPowerCommandHigherPriority),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 		Transition(StateRunning, EvPowerHibernate, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
+		Transition(StateRunning, EvPowerHibernate, StateRunning,
+			librefsm.WithGuard(actions.IsPowerCommandHigherPriority),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 		Transition(StateRunning, EvPowerHibernateManual, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvPowerHibernateManual, StateRunning,
+			librefsm.WithGuard(actions.IsPowerCommandHigherPriority),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 		Transition(StateRunning, EvPowerHibernateTimer, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
+		Transition(StateRunning, EvPowerHibernateTimer, StateRunning,
+			librefsm.WithGuard(actions.IsPowerCommandHigherPriority),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 		Transition(StateRunning, EvPowerReboot, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvPowerReboot, StateRunning,
+			librefsm.WithGuard(actions.IsPowerCommandHigherPriority),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
 		// Auto-hibernation timer expired — treated like a command, skip pre-delay
 		Transition(StateRunning, EvHibernationTimerExpired, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvHibernationTimerExpired, StateRunning,
+			librefsm.WithGuard(actions.IsPowerCommandHigherPriority),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+
+		// EvPowerRun in Running clears any buffered low-power target.
+		// Counterpart to the fallback transitions above.
+		Transition(StateRunning, EvPowerRun, StateRunning,
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 

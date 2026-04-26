@@ -18,6 +18,7 @@ type mockActions struct {
 	hasBlockingInhibitors  bool
 	hasOnlyModemInhibitors bool
 	targetNotRun           bool
+	onPowerCommandCount    int
 }
 
 func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error        { return nil }
@@ -49,7 +50,10 @@ func (m *mockActions) OnDisableModem(c *librefsm.Context) error              { r
 func (m *mockActions) OnVehicleStateChanged(c *librefsm.Context) error       { return nil }
 func (m *mockActions) OnVehicleLeftLowPowerState(c *librefsm.Context) error  { return nil }
 func (m *mockActions) OnBatteryStateChanged(c *librefsm.Context) error       { return nil }
-func (m *mockActions) OnPowerCommand(c *librefsm.Context) error              { return nil }
+func (m *mockActions) OnPowerCommand(c *librefsm.Context) error {
+	m.onPowerCommandCount++
+	return nil
+}
 func (m *mockActions) PublishState(state string) error                       { return nil }
 func (m *mockActions) PublishWakeupSource(reason string) error               { return nil }
 
@@ -606,5 +610,114 @@ func TestVehicleLeavingStandbyCancel(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	if !machine.IsInState(fsm.StateRunning) {
 		t.Errorf("Expected StateRunning after vehicle left stand-by, got %v", machine.CurrentState())
+	}
+}
+
+// TestHibernateManualBufferedWhenVehicleNotInStandby verifies the lock-hibernate
+// race fix: when a hibernate-manual command arrives while CanEnterLowPowerState
+// rejects (vehicle still in parked/shutting-down), the FSM stays in Running but
+// the fallback transition runs OnPowerCommand to record the target. The natural
+// EvVehicleStateChanged path picks it up later when stand-by arrives.
+func TestHibernateManualBufferedWhenVehicleNotInStandby(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: false, // vehicle still parked/shutting-down
+		targetHibernate:  false,
+	}
+
+	def := fsm.NewDefinition(actions, 100*time.Millisecond, 100*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernateManual})
+	time.Sleep(10 * time.Millisecond)
+
+	// Guarded transition rejected → stay in Running
+	if !machine.IsInState(fsm.StateRunning) {
+		t.Errorf("Expected StateRunning (vehicle not in stand-by yet), got %v", machine.CurrentState())
+	}
+	// Fallback transition fired → OnPowerCommand ran, target recorded
+	if actions.onPowerCommandCount != 1 {
+		t.Errorf("Expected OnPowerCommand to run once via fallback, got count=%d", actions.onPowerCommandCount)
+	}
+}
+
+// TestStandbyArrivesAfterStoredHibernate verifies the second half of the
+// lock-hibernate fix: once the target is stored and vehicle reaches stand-by,
+// the natural EvVehicleStateChanged → StateHibernateImminent transition fires.
+func TestStandbyArrivesAfterStoredHibernate(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: false, // initially: vehicle still parked/shutting-down
+		targetHibernate:  false,
+	}
+
+	def := fsm.NewDefinition(actions, 100*time.Millisecond, 100*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	// Step 1: hibernate-manual arrives early — buffered via fallback
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernateManual})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateRunning) {
+		t.Fatalf("Expected StateRunning after early hibernate, got %v", machine.CurrentState())
+	}
+
+	// Step 2: vehicle reaches stand-by (simulate by flipping the guard flags
+	// the way the real Actions impl would after OnPowerCommand stored target).
+	actions.canEnterLowPower = true
+	actions.targetHibernate = true
+
+	machine.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StateHibernateImminent) {
+		t.Errorf("Expected StateHibernateImminent after stand-by arrival picks up stored target, got %v", machine.CurrentState())
+	}
+}
+
+// TestHibernationTimerExpiredBufferedWhenVehicleNotInStandby: same race scenario
+// for the auto-hibernation timer. Timer fires while vehicle is parked (not yet
+// stand-by), target is recorded via fallback, fires later when stand-by arrives.
+func TestHibernationTimerExpiredBufferedWhenVehicleNotInStandby(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: false,
+		targetHibernate:  false,
+	}
+
+	def := fsm.NewDefinition(actions, 100*time.Millisecond, 100*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvHibernationTimerExpired})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StateRunning) {
+		t.Errorf("Expected StateRunning, got %v", machine.CurrentState())
+	}
+	if actions.onPowerCommandCount != 1 {
+		t.Errorf("Expected OnPowerCommand via fallback, count=%d", actions.onPowerCommandCount)
 	}
 }

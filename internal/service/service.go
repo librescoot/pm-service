@@ -662,10 +662,15 @@ func (s *Service) OnVehicleStateChanged(c *librefsm.Context) error {
 		s.hibernationTimer.ResetTimer(false)
 	}
 
-	// Reset target to configured default when vehicle leaves stand-by.
-	// Cancels any pending low-power intent but keeps the target seeded at
-	// the default so re-entering stand-by re-triggers the natural low-power path.
-	if oldState == "stand-by" && newState != "stand-by" {
+	// Reset target to configured default on either signal:
+	//   - leaving stand-by: cancels pending low-power intent but keeps the
+	//     target seeded at default so re-entering stand-by re-triggers the
+	//     natural low-power path.
+	//   - entering ready-to-drive: explicit "user is using the scooter"
+	//     signal that cancels any stored intent from an aborted lock-
+	//     hibernate (e.g., user tapped lock-hibernate, then unlocked
+	//     during the 5s shutting-down window, then drove off).
+	if (oldState == "stand-by" && newState != "stand-by") || newState == "ready-to-drive" {
 		s.fsmData.TargetPowerState = s.config.DefaultState
 		s.fsmData.ModemDisabled = false
 	}
@@ -717,6 +722,9 @@ func (s *Service) OnBatteryStateChanged(c *librefsm.Context) error {
 // OnPowerCommand updates fsmData.TargetPowerState from the event payload.
 func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 	if p, ok := c.Event.Payload.(fsm.PowerCommandPayload); ok {
+		if s.fsmData.TargetPowerState != p.TargetState {
+			s.logger.Printf("Target power state: %s -> %s", s.fsmData.TargetPowerState, p.TargetState)
+		}
 		s.fsmData.TargetPowerState = p.TargetState
 	}
 	return nil
