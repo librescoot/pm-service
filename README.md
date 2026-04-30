@@ -1,6 +1,8 @@
-# LibreScoot Power Management Service
+# Librescoot Power Management Service
 
 The power management service is responsible for managing power states (run, suspend, hibernate, poweroff, reboot) on the scooter. It monitors vehicle and battery state via Redis, handles power state transitions, and manages inhibitors to prevent unwanted power state changes.
+
+Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
 ## Overview
 
@@ -175,3 +177,14 @@ The service logs to standard output, which is captured by systemd when running a
 ```bash
 journalctl -u librescoot-pm.service
 ```
+
+## License
+
+This project is dual-licensed. The source code is available under the
+[GNU Affero General Public License v3.0][agpl-3.0].
+The maintainers reserve the right to grant separate licenses for commercial distribution; please contact the maintainers to discuss commercial licensing.
+
+[![AGPL v3][agpl-image]][agpl-3.0]
+
+[agpl-3.0]: https://www.gnu.org/licenses/agpl-3.0.en.html
+[agpl-image]: https://www.gnu.org/graphics/agplv3-88x31.png
