@@ -27,7 +27,7 @@ func New() *Config {
 		PreSuspendDelay:      60 * time.Second,
 		SuspendImminentDelay: 5 * time.Second,
 		InhibitorDuration:    500 * time.Millisecond,
-		HibernationTimer:     5 * 24 * time.Hour, // 5 days
+		HibernationTimer:     3 * 24 * time.Hour, // 3 days
 		SocketPath:           "/tmp/suspend_inhibitor",
 		DryRun:               false,
 		DefaultState:         "suspend",
