@@ -264,13 +264,18 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start settings watcher: %v", err)
 	}
 
-	// Watch the system hash for time-synced so the scheduler knows when the
-	// wall clock is trustworthy. Until this fires true, the scheduler refuses
-	// to dispatch any cron occurrence.
-	if err := s.redis.NewHashWatcher("system").
-		OnField("time-synced", s.onTimeSyncedSetting).
+	// Watch the gps hash for "active" as a proxy for "the wall clock has been
+	// bootstrapped from GPS". modem-service calls chronyc settime in the same
+	// loop iteration that flips gps.active to true on a valid fix, so seeing
+	// active=true means modem-service has either just synced chrony or is
+	// about to within milliseconds. The scheduler latches this signal — once
+	// observed true, the wall clock stays trustworthy for the session even if
+	// the GPS fix is later lost. NTP-only scooters without a GPS receiver
+	// would never flip this; that's a documented v1 limitation.
+	if err := s.redis.NewHashWatcher("gps").
+		OnField("active", s.onGPSActive).
 		StartWithSync(); err != nil {
-		return fmt.Errorf("failed to start system watcher: %v", err)
+		return fmt.Errorf("failed to start gps watcher: %v", err)
 	}
 
 	// Watch power-manager hash for the nRF52 wake-timer ACK so EnterIssuingLowPower
@@ -1194,14 +1199,18 @@ func (s *Service) onScheduledHibernateDurationSetting(value string) error {
 	return nil
 }
 
-// onTimeSyncedSetting is the gate that lets the scheduler start firing once
-// the wall clock has been confirmed plausible by an external time source
-// (typically GPS sync).
-func (s *Service) onTimeSyncedSetting(value string) error {
+// onGPSActive is the gate that lets the scheduler start firing once the wall
+// clock has been bootstrapped from a GPS fix. modem-service publishes
+// gps.active=true on each loop iteration where it has a valid fix; chronyc
+// settime runs in the same iteration. The scheduler latches this signal so a
+// later loss of GPS fix does not re-lock the gate.
+func (s *Service) onGPSActive(value string) error {
 	if s.scheduler == nil {
 		return nil
 	}
-	s.scheduler.SetTimeSynced(value == "true")
+	if value == "true" {
+		s.scheduler.SetTimeSynced(true)
+	}
 	return nil
 }
 

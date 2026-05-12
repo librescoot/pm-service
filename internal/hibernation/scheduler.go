@@ -3,6 +3,7 @@ package hibernation
 import (
 	"context"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -131,32 +132,35 @@ func (s *Scheduler) SetDuration(d time.Duration) {
 	// No rebuild needed: duration is read at fire time.
 }
 
-// SetTimeSynced toggles the wall-clock validity gate. While false, no cron
-// fires are dispatched and any deferred pending fire stays armed. When it
-// flips true after a sync, the cron schedule is rebuilt so its next-fire
-// reflects the corrected clock.
+// SetTimeSynced is a latch. While false, no cron fires are dispatched and any
+// deferred pending fire stays armed. The first true call rebuilds the cron
+// schedule so its next-fire reflects the corrected wall clock; further calls
+// (including false) are ignored — once chrony has bootstrapped the clock, it
+// stays trustworthy for the session even if the underlying source (GPS fix,
+// NTP reachability) drops out later.
 func (s *Scheduler) SetTimeSynced(synced bool) {
+	if !synced {
+		return
+	}
 	s.mu.Lock()
-	if s.timeSynced == synced {
+	if s.timeSynced {
 		s.mu.Unlock()
 		return
 	}
-	s.timeSynced = synced
+	s.timeSynced = true
 	pending := s.pendingWake
 	s.mu.Unlock()
-	s.logger.Printf("Scheduled hibernation time-synced=%v", synced)
+	s.logger.Printf("Scheduled hibernation time-synced=true (latched)")
 
-	if synced {
-		// Rebuild so next-fire is computed against the new (synced) wall clock.
-		s.rebuild()
-		// Drop pending fires whose target wake is now in the past (the jump may
-		// have moved the clock far forward).
-		if pending != nil && time.Now().After(*pending) {
-			s.logger.Printf("Dropping deferred wake whose target is now in the past after time sync")
-			s.mu.Lock()
-			s.pendingWake = nil
-			s.mu.Unlock()
-		}
+	// Rebuild so next-fire is computed against the now-synced wall clock.
+	s.rebuild()
+	// Drop pending fires whose target wake is now in the past (the sync may
+	// have stepped the clock far forward).
+	if pending != nil && time.Now().After(*pending) {
+		s.logger.Printf("Dropping deferred wake whose target is now in the past after time sync")
+		s.mu.Lock()
+		s.pendingWake = nil
+		s.mu.Unlock()
 	}
 }
 
@@ -198,8 +202,18 @@ func (s *Scheduler) OnVehicleStateChanged(state string) {
 func (s *Scheduler) fire() {
 	s.mu.Lock()
 	if !s.enabled || !s.timeSynced || s.duration <= 0 {
+		reasons := make([]string, 0, 3)
+		if !s.enabled {
+			reasons = append(reasons, "disabled")
+		}
+		if !s.timeSynced {
+			reasons = append(reasons, "wall clock not time-synced")
+		}
+		if s.duration <= 0 {
+			reasons = append(reasons, "duration is zero")
+		}
 		s.mu.Unlock()
-		s.logger.Printf("Scheduled hibernation fire suppressed (enabled/synced/duration not all satisfied)")
+		s.logger.Printf("Scheduled hibernation fire suppressed: %s", strings.Join(reasons, ", "))
 		return
 	}
 	now := time.Now()
