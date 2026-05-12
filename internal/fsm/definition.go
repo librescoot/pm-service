@@ -81,6 +81,14 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithGuard(actions.IsPowerCommandHigherPriority),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
+		Transition(StateRunning, EvPowerHibernateFor, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateRunning, EvPowerHibernateFor, StateRunning,
+			librefsm.WithGuard(actions.IsPowerCommandHigherPriority),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 		Transition(StateRunning, EvPowerHibernateTimer, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
@@ -170,6 +178,10 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
+		Transition(StatePreSuspend, EvPowerHibernateFor, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 		Transition(StatePreSuspend, EvPowerHibernateTimer, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
@@ -215,6 +227,10 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
+		Transition(StateSuspendImminent, EvPowerHibernateFor, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 		Transition(StateSuspendImminent, EvPowerHibernateTimer, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
@@ -252,6 +268,10 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 		Transition(StateHibernateImminent, EvPowerHibernateManual, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateHibernateImminent, EvPowerHibernateFor, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
@@ -295,6 +315,10 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 		Transition(StateWaitingInhibitors, EvPowerHibernateManual, StateHibernateImminent,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateWaitingInhibitors, EvPowerHibernateFor, StateHibernateImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
 		).

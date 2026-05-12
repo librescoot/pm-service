@@ -24,6 +24,7 @@ const (
 	EvPowerHibernate       librefsm.EventID = "power-hibernate"
 	EvPowerHibernateManual librefsm.EventID = "power-hibernate-manual"
 	EvPowerHibernateTimer  librefsm.EventID = "power-hibernate-timer"
+	EvPowerHibernateFor    librefsm.EventID = "power-hibernate-for"
 	EvPowerReboot          librefsm.EventID = "power-reboot"
 
 	// State change events
@@ -61,6 +62,7 @@ const (
 	TargetHibernate       = "hibernate"
 	TargetHibernateManual = "hibernate-manual"
 	TargetHibernateTimer  = "hibernate-timer"
+	TargetHibernateFor    = "hibernate-for"
 	TargetReboot          = "reboot"
 )
 
@@ -81,11 +83,14 @@ type WakeupPayload struct {
 
 type PowerCommandPayload struct {
 	TargetState string
+	// WakeSeconds is non-zero only for the hibernate-for target: it carries the
+	// number of seconds from "now" at which the nRF52 should wake the iMX6.
+	WakeSeconds uint32
 }
 
 // FSMData holds runtime data for the FSM context
 type FSMData struct {
-	TargetPowerState    string // run, suspend, hibernate, hibernate-manual, hibernate-timer, reboot
+	TargetPowerState    string // run, suspend, hibernate, hibernate-manual, hibernate-timer, hibernate-for, reboot
 	VehicleState        string
 	BatteryState        string // derived: "active" if either slot is active
 	Battery0State       string
@@ -93,6 +98,10 @@ type FSMData struct {
 	LowPowerStateIssued bool
 	ModemDisabled       bool
 	WakeupReason        string
+	// HibernateForWakeSeconds is the deferred wake-up duration that should be
+	// armed on the nRF52 when EnterHibernateImminent runs. Set by OnPowerCommand
+	// from the EvPowerHibernateFor payload and cleared on return to Running.
+	HibernateForWakeSeconds uint32
 }
 
 // Actions defines the callbacks for the pm-service FSM.

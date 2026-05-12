@@ -14,6 +14,13 @@ type Config struct {
 	InhibitorDuration    time.Duration
 	HibernationTimer     time.Duration
 
+	// WakeTimerMaxSeconds is the upper bound applied to any hibernate-for
+	// duration before it is sent to the nRF52 wake timer.
+	WakeTimerMaxSeconds uint32
+	// WakeTimerAckTimeout is how long EnterIssuingLowPower waits for the nRF52
+	// to confirm a wake timer was armed before aborting the hibernation.
+	WakeTimerAckTimeout time.Duration
+
 	SocketPath    string
 	DryRun        bool
 	DefaultState  string
@@ -28,6 +35,8 @@ func New() *Config {
 		SuspendImminentDelay: 5 * time.Second,
 		InhibitorDuration:    500 * time.Millisecond,
 		HibernationTimer:     3 * 24 * time.Hour, // 3 days
+		WakeTimerMaxSeconds:  7 * 24 * 60 * 60,   // 1 week
+		WakeTimerAckTimeout:  10 * time.Second,
 		SocketPath:           "/tmp/suspend_inhibitor",
 		DryRun:               false,
 		DefaultState:         "suspend",
