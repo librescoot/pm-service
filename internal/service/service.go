@@ -264,19 +264,19 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start settings watcher: %v", err)
 	}
 
-	// Watch the gps hash for "active" as a proxy for "the wall clock has been
-	// bootstrapped from GPS". modem-service calls chronyc settime in the same
-	// loop iteration that flips gps.active to true on a valid fix, so seeing
-	// active=true means modem-service has either just synced chrony or is
-	// about to within milliseconds. The scheduler latches this signal — once
-	// observed true, the wall clock stays trustworthy for the session even if
-	// the GPS fix is later lost. NTP-only scooters without a GPS receiver
-	// would never flip this; that's a documented v1 limitation.
-	if err := s.redis.NewHashWatcher("gps").
-		OnField("active", s.onGPSActive).
-		StartWithSync(); err != nil {
-		return fmt.Errorf("failed to start gps watcher: %v", err)
-	}
+	// Poll gps.active as the proxy for "the wall clock has been bootstrapped
+	// from GPS". modem-service calls chronyc settime in the same loop
+	// iteration that flips gps.active to true on a valid fix, so once it's
+	// true, chrony has the time.
+	//
+	// We poll instead of pub/sub-watching: modem-service writes the gps hash
+	// either via SetMany(NoPublish) (offline scooters, always) or
+	// SetManyPublishOne(data, "timestamp") (online recovery only) — neither
+	// path fires an OnField("active") subscription. The poller does an
+	// immediate first check, then every 30 s; once it sees "true" the
+	// scheduler is latched and the poller exits. NTP-only scooters without a
+	// GPS receiver would never flip this; documented v1 limitation.
+	go s.pollGPSActiveForTimeSync(ctx)
 
 	// Watch power-manager hash for the nRF52 wake-timer ACK so EnterIssuingLowPower
 	// can confirm the wake source is armed before issuing systemctl poweroff.
@@ -1199,19 +1199,36 @@ func (s *Service) onScheduledHibernateDurationSetting(value string) error {
 	return nil
 }
 
-// onGPSActive is the gate that lets the scheduler start firing once the wall
-// clock has been bootstrapped from a GPS fix. modem-service publishes
-// gps.active=true on each loop iteration where it has a valid fix; chronyc
-// settime runs in the same iteration. The scheduler latches this signal so a
-// later loss of GPS fix does not re-lock the gate.
-func (s *Service) onGPSActive(value string) error {
-	if s.scheduler == nil {
-		return nil
+// pollGPSActiveForTimeSync polls Redis until gps.active becomes "true", then
+// latches the scheduler's time-synced gate and exits. See the wiring comment
+// in Run() for why a poller is used instead of a hash watcher.
+func (s *Service) pollGPSActiveForTimeSync(ctx context.Context) {
+	check := func() bool {
+		val, err := s.redis.HGet("gps", "active")
+		if err != nil {
+			return false
+		}
+		if val == "true" && s.scheduler != nil {
+			s.scheduler.SetTimeSynced(true)
+			return true
+		}
+		return false
 	}
-	if value == "true" {
-		s.scheduler.SetTimeSynced(true)
+	if check() {
+		return
 	}
-	return nil
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if check() {
+				return
+			}
+		}
+	}
 }
 
 // onWakeTimerArmed is invoked by the power-manager hash watcher whenever
