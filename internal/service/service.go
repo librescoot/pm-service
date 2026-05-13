@@ -481,8 +481,8 @@ func (s *Service) EnterSuspendImminent(c *librefsm.Context) error {
 	return nil
 }
 
-func (s *Service) EnterHibernateImminent(c *librefsm.Context) error {
-	s.logger.Printf("Entering hibernate-imminent state")
+func (s *Service) EnterLowPowerImminent(c *librefsm.Context) error {
+	s.logger.Printf("Entering low-power-imminent state (target: %s)", s.fsmData.TargetPowerState)
 	// Kick the wake-timer ARM as early as possible so the ACK has time to
 	// arrive before we hit EnterIssuingLowPower. Drain stale ACKs first so the
 	// wait there sees only this round's response.
@@ -924,7 +924,7 @@ func (s *Service) publishFSMState(state librefsm.StateID) {
 		redisState = "running"
 	case fsm.StatePreSuspend:
 		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState) + "-pending"
-	case fsm.StateSuspendImminent, fsm.StateHibernateImminent:
+	case fsm.StateSuspendImminent, fsm.StateLowPowerImminent:
 		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState + "-imminent")
 	case fsm.StateWaitingInhibitors:
 		redisState = s.mapPowerStateToRedis(s.fsmData.TargetPowerState + "-imminent")

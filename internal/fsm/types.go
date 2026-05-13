@@ -10,7 +10,13 @@ const (
 	StateRunning           librefsm.StateID = "running"
 	StatePreSuspend        librefsm.StateID = "pre-suspend"
 	StateSuspendImminent   librefsm.StateID = "suspend-imminent"
-	StateHibernateImminent librefsm.StateID = "hibernate-imminent"
+	// StateLowPowerImminent is the generic "preparing for a low-power
+	// transition" state. It's entered for hibernate, hibernate-for,
+	// hibernate-manual, hibernate-timer AND reboot — the dispatch at the
+	// end of the prep flow picks the actual operation based on
+	// fsmData.TargetPowerState. Naming it "hibernate-*" was historical and
+	// misleading when seen in reboot logs.
+	StateLowPowerImminent librefsm.StateID = "low-power-imminent"
 	StateWaitingInhibitors librefsm.StateID = "waiting-inhibitors"
 	StateIssuingLowPower   librefsm.StateID = "issuing-low-power"
 	StateSuspended         librefsm.StateID = "suspended"
@@ -99,7 +105,7 @@ type FSMData struct {
 	ModemDisabled       bool
 	WakeupReason        string
 	// HibernateForWakeSeconds is the deferred wake-up duration that should be
-	// armed on the nRF52 when EnterHibernateImminent runs. Set by OnPowerCommand
+	// armed on the nRF52 when EnterLowPowerImminent runs. Set by OnPowerCommand
 	// from the EvPowerHibernateFor payload and cleared on return to Running.
 	HibernateForWakeSeconds uint32
 }
@@ -110,7 +116,7 @@ type Actions interface {
 	// State entry actions
 	EnterPreSuspend(c *librefsm.Context) error
 	EnterSuspendImminent(c *librefsm.Context) error
-	EnterHibernateImminent(c *librefsm.Context) error
+	EnterLowPowerImminent(c *librefsm.Context) error
 	EnterWaitingInhibitors(c *librefsm.Context) error
 	EnterIssuingLowPower(c *librefsm.Context) error
 	ExitIssuingLowPower(c *librefsm.Context) error

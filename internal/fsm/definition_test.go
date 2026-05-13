@@ -23,7 +23,7 @@ type mockActions struct {
 
 func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error        { return nil }
 func (m *mockActions) EnterSuspendImminent(c *librefsm.Context) error   { return nil }
-func (m *mockActions) EnterHibernateImminent(c *librefsm.Context) error { return nil }
+func (m *mockActions) EnterLowPowerImminent(c *librefsm.Context) error { return nil }
 func (m *mockActions) EnterWaitingInhibitors(c *librefsm.Context) error { return nil }
 func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error   { return nil }
 func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error    { return nil }
@@ -92,7 +92,7 @@ func TestExplicitSuspendSkipsPreDelay(t *testing.T) {
 }
 
 // TestExplicitHibernateSkipsPreDelay verifies hibernate command goes directly
-// to HibernateImminent.
+// to LowPowerImminent.
 func TestExplicitHibernateSkipsPreDelay(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
@@ -113,15 +113,15 @@ func TestExplicitHibernateSkipsPreDelay(t *testing.T) {
 
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent, got %v", machine.CurrentState())
 	}
 
 	// Battery active does NOT cancel hibernate
 	machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameActive})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent (battery shouldn't affect hibernate), got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent (battery shouldn't affect hibernate), got %v", machine.CurrentState())
 	}
 }
 
@@ -153,7 +153,7 @@ func TestNaturalSuspendUsesPreDelay(t *testing.T) {
 }
 
 // TestNaturalHibernateSkipsPreDelay verifies that vehicle state change with
-// hibernate target goes directly to HibernateImminent (no pre-delay).
+// hibernate target goes directly to LowPowerImminent (no pre-delay).
 func TestNaturalHibernateSkipsPreDelay(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
@@ -174,8 +174,8 @@ func TestNaturalHibernateSkipsPreDelay(t *testing.T) {
 
 	machine.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent (hibernate skips pre-delay), got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent (hibernate skips pre-delay), got %v", machine.CurrentState())
 	}
 }
 
@@ -305,7 +305,7 @@ func TestWakeupRoutingBasedOnTarget(t *testing.T) {
 }
 
 // TestHibernateCommandInHibernate: a second hibernate command from Running
-// state in hibernate goes straight to HibernateImminent (priority passes).
+// state in hibernate goes straight to LowPowerImminent (priority passes).
 func TestHibernateCommandInHibernate(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
@@ -326,8 +326,8 @@ func TestHibernateCommandInHibernate(t *testing.T) {
 
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent, got %v", machine.CurrentState())
 	}
 }
 
@@ -406,7 +406,7 @@ func TestNaturalSuspendTimeoutProgression(t *testing.T) {
 }
 
 // TestPreSuspendUpgradeToHibernate: hibernate command while in PreSuspend
-// should upgrade to HibernateImminent (skipping the pre-delay).
+// should upgrade to LowPowerImminent (skipping the pre-delay).
 func TestPreSuspendUpgradeToHibernate(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
@@ -432,11 +432,11 @@ func TestPreSuspendUpgradeToHibernate(t *testing.T) {
 		t.Fatalf("Expected StatePreSuspend, got %v", machine.CurrentState())
 	}
 
-	// Hibernate upgrade — jumps directly to HibernateImminent
+	// Hibernate upgrade — jumps directly to LowPowerImminent
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent after hibernate upgrade, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent after hibernate upgrade, got %v", machine.CurrentState())
 	}
 }
 
@@ -467,17 +467,17 @@ func TestSuspendImminentUpgradeOnHibernationTimer(t *testing.T) {
 		t.Fatalf("Expected StateSuspendImminent, got %v", machine.CurrentState())
 	}
 
-	// Hibernation timer fires — should upgrade to HibernateImminent
+	// Hibernation timer fires — should upgrade to LowPowerImminent
 	machine.Send(librefsm.Event{ID: fsm.EvHibernationTimerExpired})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent after timer upgrade, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent after timer upgrade, got %v", machine.CurrentState())
 	}
 }
 
-// TestHibernateImminentSelfUpgrade: hibernate-manual while in HibernateImminent
+// TestLowPowerImminentSelfUpgrade: hibernate-manual while in LowPowerImminent
 // is a valid priority upgrade and re-enters the imminent state.
-func TestHibernateImminentSelfUpgrade(t *testing.T) {
+func TestLowPowerImminentSelfUpgrade(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
 		targetHibernate:  true,
@@ -497,20 +497,20 @@ func TestHibernateImminentSelfUpgrade(t *testing.T) {
 
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Fatalf("Expected StateHibernateImminent, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Fatalf("Expected StateLowPowerImminent, got %v", machine.CurrentState())
 	}
 
-	// hibernate-manual upgrade stays in HibernateImminent
+	// hibernate-manual upgrade stays in LowPowerImminent
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernateManual})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent after self-upgrade, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent after self-upgrade, got %v", machine.CurrentState())
 	}
 }
 
 // TestWaitingInhibitorsUpgradeToHibernate: upgrades from WaitingInhibitors
-// bounce back to HibernateImminent to restart the imminent sequence.
+// bounce back to LowPowerImminent to restart the imminent sequence.
 func TestWaitingInhibitorsUpgradeToHibernate(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower:      true,
@@ -538,13 +538,13 @@ func TestWaitingInhibitorsUpgradeToHibernate(t *testing.T) {
 
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent after hibernate upgrade from waiting, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent after hibernate upgrade from waiting, got %v", machine.CurrentState())
 	}
 }
 
 // TestPreSuspendHibernateDowngradeRejected: a suspend command while in
-// HibernateImminent should not downgrade — stays in hibernate path.
+// LowPowerImminent should not downgrade — stays in hibernate path.
 func TestHibernateDowngradeRejected(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
@@ -565,8 +565,8 @@ func TestHibernateDowngradeRejected(t *testing.T) {
 
 	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Fatalf("Expected StateHibernateImminent, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Fatalf("Expected StateLowPowerImminent, got %v", machine.CurrentState())
 	}
 
 	// Suspend command should not downgrade — mockActions always reports
@@ -574,8 +574,8 @@ func TestHibernateDowngradeRejected(t *testing.T) {
 	// missing-transition case, not the priority check itself.
 	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
 	time.Sleep(10 * time.Millisecond)
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent (no suspend transition from hibernate), got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent (no suspend transition from hibernate), got %v", machine.CurrentState())
 	}
 }
 
@@ -651,7 +651,7 @@ func TestHibernateManualBufferedWhenVehicleNotInStandby(t *testing.T) {
 
 // TestStandbyArrivesAfterStoredHibernate verifies the second half of the
 // lock-hibernate fix: once the target is stored and vehicle reaches stand-by,
-// the natural EvVehicleStateChanged → StateHibernateImminent transition fires.
+// the natural EvVehicleStateChanged → StateLowPowerImminent transition fires.
 func TestStandbyArrivesAfterStoredHibernate(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: false, // initially: vehicle still parked/shutting-down
@@ -685,8 +685,8 @@ func TestStandbyArrivesAfterStoredHibernate(t *testing.T) {
 	machine.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
 	time.Sleep(10 * time.Millisecond)
 
-	if !machine.IsInState(fsm.StateHibernateImminent) {
-		t.Errorf("Expected StateHibernateImminent after stand-by arrival picks up stored target, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected StateLowPowerImminent after stand-by arrival picks up stored target, got %v", machine.CurrentState())
 	}
 }
 
