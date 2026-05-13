@@ -1,5 +1,5 @@
 [Unit]
-Description=LibreScoot Power Management Service
+Description=Librescoot Power Management Service
 After=redis.service
 After=librescoot-vehicle.service
 After=librescoot-battery.service
