@@ -167,8 +167,13 @@ func (s *Scheduler) SetTimeSynced(synced bool) {
 // OnVehicleStateChanged tells the scheduler the current vehicle state. When
 // the vehicle transitions into standby with a pending deferred wake target,
 // the hibernation request is dispatched with the remaining seconds.
+//
+// Only "stand-by" (locked, idle) counts as standby for the purpose of
+// firing a scheduled hibernation. "parked" (unlocked, idle near the
+// scooter) defers like ready-to-drive so the user has to explicitly lock
+// before scheduled hibernation will hit them.
 func (s *Scheduler) OnVehicleStateChanged(state string) {
-	standby := state == "stand-by" || state == "standby" || state == "parked"
+	standby := state == "stand-by" || state == "standby"
 
 	s.mu.Lock()
 	prev := s.vehicleStandby
