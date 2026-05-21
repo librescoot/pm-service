@@ -21,6 +21,22 @@ import (
 	redis_ipc "github.com/librescoot/redis-ipc"
 )
 
+// Last-ditch hibernate thresholds. Two independent triggers, OR'd together,
+// both intended to forestall a hard brown-out:
+//   * slow path: no usable main battery (both slots present=false OR charge<=0)
+//     AND CBB charge below lastDitchHibernateCBBThreshold (percent).
+//   * fast path: aux 12V rail voltage below lastDitchHibernateAuxEnterMv.
+//     This is the rail that actually feeds the iMX6, so falling below ~11.5 V
+//     is imminent-brown-out territory regardless of main/CBB state.
+// Aux voltage uses a small recovery margin (Schmitt trigger) to avoid event
+// thrash near the threshold; this mirrors the pattern battery-service uses
+// for its aux-low keep-active logic.
+const (
+	lastDitchHibernateCBBThreshold = 50
+	lastDitchHibernateAuxEnterMv   = 11500
+	lastDitchHibernateAuxExitMv    = 11700
+)
+
 type Service struct {
 	config             *config.Config
 	logger             *log.Logger
@@ -36,6 +52,20 @@ type Service struct {
 	busyServicesPub    *redis_ipc.HashPublisher
 	ctx                context.Context
 	ctxCancel          context.CancelFunc
+
+	// Last-ditch hibernate inputs. Updated from Redis hash watchers; reads
+	// happen only inside evaluateLastDitchHibernate, which holds lastDitchMu.
+	// charge==-1 / auxVoltageMv==-1 mean "unknown" (no reading yet) and
+	// suppress their respective sub-conditions.
+	lastDitchMu      sync.Mutex
+	cbBatteryCharge  int  // 0..100, -1 if unknown
+	battery0Present  bool // defaults to true so we don't trigger before first sync
+	battery1Present  bool
+	battery0Charge   int // 0..100, -1 if unknown
+	battery1Charge   int
+	auxVoltageMv     int  // millivolts, -1 if unknown
+	auxLowLatched    bool // Schmitt latch: true once below enter, until above exit
+	lastDitchFired   bool // rising-edge latch on the combined OR'd trigger
 
 	// Settings overrides for the wake timer; protected by settingsMu.
 	settingsMu              sync.Mutex
@@ -82,6 +112,12 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		systemPub:       redisClient.NewHashPublisher("system"),
 		busyServicesPub: redisClient.NewHashPublisher("power-manager:busy-services"),
 		wakeTimerAcks:   make(chan bool, 1),
+		cbBatteryCharge: -1,
+		battery0Present: true,
+		battery1Present: true,
+		battery0Charge:  -1,
+		battery1Charge:  -1,
+		auxVoltageMv:    -1,
 		fsmData: &fsm.FSMData{
 			TargetPowerState: cfg.DefaultState,
 			VehicleState:     "",
@@ -132,6 +168,26 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	if s.fsmData.Battery0State == "active" || s.fsmData.Battery1State == "active" {
 		s.fsmData.BatteryState = "active"
+	}
+
+	// Seed last-ditch hibernate inputs from current Redis state.
+	if v, err := s.redis.HGet("battery:0", "present"); err == nil && v != "" {
+		s.battery0Present = parseBool(v)
+	}
+	if v, err := s.redis.HGet("battery:1", "present"); err == nil && v != "" {
+		s.battery1Present = parseBool(v)
+	}
+	if v, err := s.redis.HGet("battery:0", "charge"); err == nil && v != "" {
+		s.battery0Charge = parseChargeOrUnknown(v)
+	}
+	if v, err := s.redis.HGet("battery:1", "charge"); err == nil && v != "" {
+		s.battery1Charge = parseChargeOrUnknown(v)
+	}
+	if v, err := s.redis.HGet("cb-battery", "charge"); err == nil && v != "" {
+		s.cbBatteryCharge = parseChargeOrUnknown(v)
+	}
+	if v, err := s.redis.HGet("aux-battery", "voltage"); err == nil && v != "" {
+		s.auxVoltageMv = parseNonNegativeInt(v)
 	}
 
 	// Read default power state from settings; CLI arg is the fallback
@@ -235,14 +291,30 @@ func (s *Service) Run(ctx context.Context) error {
 
 	if err := s.redis.NewHashWatcher("battery:0").
 		OnField("state", func(state string) error { return s.onBatteryStateChanged("0", state) }).
+		OnField("present", func(v string) error { return s.onBatteryPresentChanged("0", v) }).
+		OnField("charge", func(v string) error { return s.onBatteryChargeChanged("0", v) }).
 		StartWithSync(); err != nil {
 		return fmt.Errorf("failed to start battery:0 state watcher: %v", err)
 	}
 
 	if err := s.redis.NewHashWatcher("battery:1").
 		OnField("state", func(state string) error { return s.onBatteryStateChanged("1", state) }).
+		OnField("present", func(v string) error { return s.onBatteryPresentChanged("1", v) }).
+		OnField("charge", func(v string) error { return s.onBatteryChargeChanged("1", v) }).
 		StartWithSync(); err != nil {
 		return fmt.Errorf("failed to start battery:1 state watcher: %v", err)
+	}
+
+	if err := s.redis.NewHashWatcher("cb-battery").
+		OnField("charge", s.onCBBatteryChargeChanged).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start cb-battery watcher: %v", err)
+	}
+
+	if err := s.redis.NewHashWatcher("aux-battery").
+		OnField("voltage", s.onAuxVoltageChanged).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start aux-battery watcher: %v", err)
 	}
 
 	redis_ipc.HandleRequests(s.redis, "scooter:power", s.onPowerCommand)
@@ -323,6 +395,10 @@ func (s *Service) onVehicleStateChanged(vehicleState string) error {
 	if s.scheduler != nil {
 		s.scheduler.OnVehicleStateChanged(vehicleState)
 	}
+	// Vehicle state is a guard input for last-ditch hibernate (CanEnterLowPowerState
+	// requires stand-by); re-evaluate so we don't miss the rising edge when the
+	// vehicle settles into stand-by while CBB is already low.
+	s.evaluateLastDitchHibernate()
 	return nil
 }
 
@@ -336,6 +412,150 @@ func (s *Service) onBatteryStateChanged(slot, newState string) error {
 		}
 	}
 	return nil
+}
+
+func (s *Service) onBatteryPresentChanged(slot, v string) error {
+	present := parseBool(v)
+	s.lastDitchMu.Lock()
+	switch slot {
+	case "0":
+		s.battery0Present = present
+	case "1":
+		s.battery1Present = present
+	}
+	s.lastDitchMu.Unlock()
+	s.evaluateLastDitchHibernate()
+	return nil
+}
+
+func (s *Service) onBatteryChargeChanged(slot, v string) error {
+	charge := parseChargeOrUnknown(v)
+	s.lastDitchMu.Lock()
+	switch slot {
+	case "0":
+		s.battery0Charge = charge
+	case "1":
+		s.battery1Charge = charge
+	}
+	s.lastDitchMu.Unlock()
+	s.evaluateLastDitchHibernate()
+	return nil
+}
+
+func (s *Service) onCBBatteryChargeChanged(v string) error {
+	charge := parseChargeOrUnknown(v)
+	s.lastDitchMu.Lock()
+	s.cbBatteryCharge = charge
+	s.lastDitchMu.Unlock()
+	s.evaluateLastDitchHibernate()
+	return nil
+}
+
+func (s *Service) onAuxVoltageChanged(v string) error {
+	mv := parseNonNegativeInt(v)
+	s.lastDitchMu.Lock()
+	s.auxVoltageMv = mv
+	s.lastDitchMu.Unlock()
+	s.evaluateLastDitchHibernate()
+	return nil
+}
+
+// evaluateLastDitchHibernate fires EvPowerHibernate on the rising edge of
+// either trigger:
+//   (a) no usable main battery (both slots present=false OR charge==0) AND
+//       CBB charge < lastDitchHibernateCBBThreshold; or
+//   (b) aux 12V rail below lastDitchHibernateAuxEnterMv (Schmitt-trigger
+//       latched until it climbs above lastDitchHibernateAuxExitMv).
+// The FSM's CanEnterLowPowerState guard handles vehicle-state gating (stand-by
+// only), so an event fired while the rider is interacting just no-ops; the
+// vehicle-state watcher re-evaluates when stand-by is reached.
+func (s *Service) evaluateLastDitchHibernate() {
+	s.lastDitchMu.Lock()
+
+	// Aux Schmitt trigger.
+	if s.auxVoltageMv >= 0 {
+		if s.auxLowLatched {
+			if s.auxVoltageMv >= lastDitchHibernateAuxExitMv {
+				s.auxLowLatched = false
+			}
+		} else {
+			if s.auxVoltageMv < lastDitchHibernateAuxEnterMv {
+				s.auxLowLatched = true
+			}
+		}
+	}
+
+	cbb := s.cbBatteryCharge
+	slot0Unavailable := !s.battery0Present || s.battery0Charge == 0
+	slot1Unavailable := !s.battery1Present || s.battery1Charge == 0
+	cbbTrigger := cbb >= 0 && slot0Unavailable && slot1Unavailable && cbb < lastDitchHibernateCBBThreshold
+	auxTrigger := s.auxLowLatched
+
+	condition := cbbTrigger || auxTrigger
+	prevFired := s.lastDitchFired
+	auxMv := s.auxVoltageMv
+	if !condition {
+		s.lastDitchFired = false
+		s.lastDitchMu.Unlock()
+		return
+	}
+	if prevFired {
+		s.lastDitchMu.Unlock()
+		return
+	}
+	s.lastDitchFired = true
+	s.lastDitchMu.Unlock()
+
+	var reason string
+	switch {
+	case cbbTrigger && auxTrigger:
+		reason = fmt.Sprintf("CBB=%d%% (no usable main battery), aux=%d mV", cbb, auxMv)
+	case cbbTrigger:
+		reason = fmt.Sprintf("CBB=%d%%, no usable main battery", cbb)
+	default:
+		reason = fmt.Sprintf("aux=%d mV", auxMv)
+	}
+	s.logger.Printf("Last-ditch hibernate: %s — requesting hibernation", reason)
+	if s.machine != nil {
+		s.machine.Send(librefsm.Event{
+			ID:      fsm.EvPowerHibernate,
+			Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetHibernate},
+		})
+	}
+}
+
+// parseBool accepts the "true"/"false" form battery-service publishes.
+func parseBool(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes":
+		return true
+	}
+	return false
+}
+
+// parseChargeOrUnknown returns -1 ("unknown") for unparseable input. Values
+// outside 0..100 are clamped to the valid range.
+func parseChargeOrUnknown(v string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil {
+		return -1
+	}
+	if n < 0 {
+		return 0
+	}
+	if n > 100 {
+		return 100
+	}
+	return n
+}
+
+// parseNonNegativeInt returns -1 ("unknown") for unparseable or negative input.
+func parseNonNegativeInt(v string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 func (s *Service) onPowerCommand(command string) error {
