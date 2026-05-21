@@ -21,16 +21,12 @@ import (
 	redis_ipc "github.com/librescoot/redis-ipc"
 )
 
-// Last-ditch hibernate thresholds. Two independent triggers, OR'd together,
-// both intended to forestall a hard brown-out:
-//   * slow path: no usable main battery (both slots present=false OR charge<=0)
-//     AND CBB charge below lastDitchHibernateCBBThreshold (percent).
-//   * fast path: aux 12V rail voltage below lastDitchHibernateAuxEnterMv.
-//     This is the rail that actually feeds the iMX6, so falling below ~11.5 V
-//     is imminent-brown-out territory regardless of main/CBB state.
-// Aux voltage uses a small recovery margin (Schmitt trigger) to avoid event
-// thrash near the threshold; this mirrors the pattern battery-service uses
-// for its aux-low keep-active logic.
+// Last-ditch hibernate thresholds. The trigger fires when both main battery
+// slots are physically absent (present=false) AND the system has lost enough
+// reserve to risk a brown-out — either the CBB is below threshold or the aux
+// 12V rail (which feeds the iMX6) has dipped. Aux uses a Schmitt-trigger
+// recovery margin to avoid event thrash near the threshold, mirroring
+// battery-service's aux-low keep-active logic.
 const (
 	lastDitchHibernateCBBThreshold = 50
 	lastDitchHibernateAuxEnterMv   = 11500
@@ -55,17 +51,17 @@ type Service struct {
 
 	// Last-ditch hibernate inputs. Updated from Redis hash watchers; reads
 	// happen only inside evaluateLastDitchHibernate, which holds lastDitchMu.
-	// charge==-1 / auxVoltageMv==-1 mean "unknown" (no reading yet) and
-	// suppress their respective sub-conditions.
-	lastDitchMu      sync.Mutex
-	cbBatteryCharge  int  // 0..100, -1 if unknown
-	battery0Present  bool // defaults to true so we don't trigger before first sync
-	battery1Present  bool
-	battery0Charge   int // 0..100, -1 if unknown
-	battery1Charge   int
-	auxVoltageMv     int  // millivolts, -1 if unknown
-	auxLowLatched    bool // Schmitt latch: true once below enter, until above exit
-	lastDitchFired   bool // rising-edge latch on the combined OR'd trigger
+	// cbBatteryCharge==-1 / auxVoltageMv==-1 mean "unknown" (no reading yet)
+	// and suppress their respective sub-conditions.
+	lastDitchMu     sync.Mutex
+	cbBatteryCharge int  // 0..100, -1 if unknown
+	battery0Present bool // defaults to true so we don't trigger before first sync
+	battery1Present bool
+	battery0Charge  int // 0..100, -1 if unknown
+	battery1Charge  int
+	auxVoltageMv    int  // millivolts, -1 if unknown
+	auxLowLatched   bool // Schmitt latch: true once below enter, until above exit
+	lastDitchFired  bool // rising-edge latch on the combined trigger
 
 	// Settings overrides for the wake timer; protected by settingsMu.
 	settingsMu              sync.Mutex
@@ -460,12 +456,11 @@ func (s *Service) onAuxVoltageChanged(v string) error {
 	return nil
 }
 
-// evaluateLastDitchHibernate fires EvPowerHibernate on the rising edge of
-// either trigger:
-//   (a) no usable main battery (both slots present=false OR charge==0) AND
-//       CBB charge < lastDitchHibernateCBBThreshold; or
-//   (b) aux 12V rail below lastDitchHibernateAuxEnterMv (Schmitt-trigger
-//       latched until it climbs above lastDitchHibernateAuxExitMv).
+// evaluateLastDitchHibernate fires EvPowerHibernate on the rising edge of:
+//   (both main slots missing — present=false OR charge==0)
+//   AND
+//   (CBB charge < lastDitchHibernateCBBThreshold OR aux below the Schmitt
+//    threshold).
 // The FSM's CanEnterLowPowerState guard handles vehicle-state gating (stand-by
 // only), so an event fired while the rider is interacting just no-ops; the
 // vehicle-state watcher re-evaluates when stand-by is reached.
@@ -486,12 +481,13 @@ func (s *Service) evaluateLastDitchHibernate() {
 	}
 
 	cbb := s.cbBatteryCharge
-	slot0Unavailable := !s.battery0Present || s.battery0Charge == 0
-	slot1Unavailable := !s.battery1Present || s.battery1Charge == 0
-	cbbTrigger := cbb >= 0 && slot0Unavailable && slot1Unavailable && cbb < lastDitchHibernateCBBThreshold
-	auxTrigger := s.auxLowLatched
+	slot0Missing := !s.battery0Present || s.battery0Charge == 0
+	slot1Missing := !s.battery1Present || s.battery1Charge == 0
+	bothMissing := slot0Missing && slot1Missing
+	cbbLow := cbb >= 0 && cbb < lastDitchHibernateCBBThreshold
+	auxLow := s.auxLowLatched
 
-	condition := cbbTrigger || auxTrigger
+	condition := bothMissing && (cbbLow || auxLow)
 	prevFired := s.lastDitchFired
 	auxMv := s.auxVoltageMv
 	if !condition {
@@ -506,16 +502,16 @@ func (s *Service) evaluateLastDitchHibernate() {
 	s.lastDitchFired = true
 	s.lastDitchMu.Unlock()
 
-	var reason string
+	var reserve string
 	switch {
-	case cbbTrigger && auxTrigger:
-		reason = fmt.Sprintf("CBB=%d%% (no usable main battery), aux=%d mV", cbb, auxMv)
-	case cbbTrigger:
-		reason = fmt.Sprintf("CBB=%d%%, no usable main battery", cbb)
+	case cbbLow && auxLow:
+		reserve = fmt.Sprintf("CBB=%d%%, aux=%d mV", cbb, auxMv)
+	case cbbLow:
+		reserve = fmt.Sprintf("CBB=%d%%", cbb)
 	default:
-		reason = fmt.Sprintf("aux=%d mV", auxMv)
+		reserve = fmt.Sprintf("aux=%d mV", auxMv)
 	}
-	s.logger.Printf("Last-ditch hibernate: %s — requesting hibernation", reason)
+	s.logger.Printf("Last-ditch hibernate: no main battery, %s — requesting hibernation", reserve)
 	if s.machine != nil {
 		s.machine.Send(librefsm.Event{
 			ID:      fsm.EvPowerHibernate,
