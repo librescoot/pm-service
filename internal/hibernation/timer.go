@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+// MinTimerSeconds is the floor enforced on any non-zero hibernation timer
+// value. Values below this would risk hibernating the scooter almost as soon
+// as it enters standby, which is virtually never what the user wants.
+// Setting the timer to 0 still disables it; anything between 1 and
+// MinTimerSeconds-1 is clamped up to MinTimerSeconds.
+const MinTimerSeconds = 300
+
 // Timer manages the hibernation timer that triggers hibernation after extended standby
 type Timer struct {
 	mutex            sync.RWMutex
@@ -20,8 +27,16 @@ type Timer struct {
 	onHibernateTimer func() // Callback when hibernation timer triggers
 }
 
-// NewTimer creates a new hibernation timer
+// NewTimer creates a new hibernation timer. defaultDuration is clamped up to
+// MinTimerSeconds when non-zero, matching the runtime floor enforced by
+// SetTimerValue.
 func NewTimer(ctx context.Context, logger *log.Logger, defaultDuration time.Duration, onHibernateTimer func()) *Timer {
+	floor := time.Duration(MinTimerSeconds) * time.Second
+	if defaultDuration > 0 && defaultDuration < floor {
+		logger.Printf("Hibernation timer default %v below floor; clamping to %v",
+			defaultDuration, floor)
+		defaultDuration = floor
+	}
 	return &Timer{
 		logger:           logger,
 		ctx:              ctx,
@@ -33,10 +48,18 @@ func NewTimer(ctx context.Context, logger *log.Logger, defaultDuration time.Dura
 }
 
 // SetTimerValue sets the hibernation timer duration in seconds
-// Setting to 0 disables the timer, negative values are ignored
+// Setting to 0 disables the timer, negative values are ignored.
+// Non-zero values below MinTimerSeconds are clamped up to MinTimerSeconds
+// so a stray 30s setting can't hibernate the scooter the moment it parks.
 func (t *Timer) SetTimerValue(timerValueSeconds int32) {
 	if timerValueSeconds < 0 {
 		return
+	}
+
+	if timerValueSeconds > 0 && timerValueSeconds < MinTimerSeconds {
+		t.logger.Printf("Hibernation timer value %d below floor; clamping to %d",
+			timerValueSeconds, MinTimerSeconds)
+		timerValueSeconds = MinTimerSeconds
 	}
 
 	t.mutex.Lock()

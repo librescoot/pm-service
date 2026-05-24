@@ -10,6 +10,12 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
+// FireCooldown is the minimum wall-clock gap enforced between two scheduled
+// hibernation fires. It both deduplicates same-minute cron ticks and guards
+// against runaway expressions like "* * * * *" or "*/5 * * * *" putting the
+// scooter into a hibernate loop after each wake.
+const FireCooldown = 15 * time.Minute
+
 // Scheduler runs a single cron-style hibernation schedule.
 //
 // Semantics:
@@ -37,7 +43,7 @@ type Scheduler struct {
 	timeSynced     bool
 	vehicleStandby bool
 	pendingWake    *time.Time // wall-clock target if a fire is deferred to next standby
-	lastFired      time.Time  // dedup guard for cron-driven duplicate ticks
+	lastFired      time.Time  // cooldown guard: suppress fires within FireCooldown of the last one
 
 	cronEngine *cron.Cron
 	cronEntry  cron.EntryID
@@ -222,9 +228,13 @@ func (s *Scheduler) fire() {
 		return
 	}
 	now := time.Now()
-	// Dedup: cron should not double-fire the same minute, but guard anyway.
-	if !s.lastFired.IsZero() && now.Sub(s.lastFired) < 30*time.Second {
+	// Cooldown: suppress fires that come within FireCooldown of the previous
+	// one. This both dedupes same-minute cron ticks and prevents pathological
+	// expressions (e.g. "* * * * *") from re-hibernating the scooter the
+	// moment it wakes back up.
+	if !s.lastFired.IsZero() && now.Sub(s.lastFired) < FireCooldown {
 		s.mu.Unlock()
+		s.logger.Printf("Scheduled hibernation fire suppressed: within %v cooldown of last fire", FireCooldown)
 		return
 	}
 	s.lastFired = now
