@@ -41,6 +41,14 @@ const (
 	// condition once the grace expires, so a genuinely battery-less scooter
 	// still hibernates — just not within the first 5 minutes of boot.
 	lastDitchHibernateBootGrace = 5 * time.Minute
+
+	// suspendQuiesceTimeout bounds the wait for bluetooth-service's confirm
+	// that the nRF52 was told we are suspending; on expiry the suspend is
+	// aborted (staying awake beats the suspend/wake loop).
+	suspendQuiesceTimeout = 3 * time.Second
+	// suspendQuiesceMargin lets the nRF's reply to the suspending frame drain
+	// onto ttymxc1 while we are still awake to absorb it.
+	suspendQuiesceMargin = 200 * time.Millisecond
 )
 
 type Service struct {
@@ -96,6 +104,11 @@ type Service struct {
 	// before each wait.
 	wakeTimerAcks chan bool
 
+	// suspendQuiesceAcks receives bluetooth-service's confirmation (the
+	// power-state-sent field) that it forwarded "suspending" to the nRF52.
+	// Same buffered-size-1 discipline as wakeTimerAcks.
+	suspendQuiesceAcks chan struct{}
+
 	// scheduler drives cron-based "hibernate every N at HH:MM for D" plans.
 	scheduler *hibernation.Scheduler
 
@@ -129,7 +142,8 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		powerManagerPub: redisClient.NewHashPublisher("power-manager"),
 		systemPub:       redisClient.NewHashPublisher("system"),
 		busyServicesPub: redisClient.NewHashPublisher("power-manager:busy-services"),
-		wakeTimerAcks:   make(chan bool, 1),
+		wakeTimerAcks:      make(chan bool, 1),
+		suspendQuiesceAcks: make(chan struct{}, 1),
 		cbBatteryCharge: -1,
 		battery0Present: true,
 		battery1Present: true,
@@ -398,6 +412,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// can confirm the wake source is armed before issuing systemctl poweroff.
 	if err := s.redis.NewHashWatcher("power-manager").
 		OnField("wake-timer-armed", s.onWakeTimerArmed).
+		OnField("power-state-sent", s.onPowerStateSent).
 		Start(); err != nil {
 		return fmt.Errorf("failed to start power-manager watcher: %v", err)
 	}
@@ -852,6 +867,38 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	}
 
 	s.fsmData.LowPowerStateIssued = true
+
+	// Before suspending, announce the suspending state and wait until
+	// bluetooth-service confirms it forwarded it to the nRF52. Receiving
+	// "suspending" makes the nRF stop all USOCK TX; without that, its routine
+	// traffic reaches our armed ttymxc1 wakeup and pulls the iMX6 straight back
+	// out of suspend-to-RAM. A fixed delay is not enough: the Redis hop is
+	// jittery, and the nRF's reply to the suspending frame itself must land
+	// while we are still awake. After the confirm, a short margin lets that
+	// reply drain; on timeout, bail back to running rather than suspend into
+	// the wake loop.
+	if target == "suspend" {
+		select {
+		case <-s.suspendQuiesceAcks:
+		default:
+		}
+		if err := s.powerManagerPub.Set("state", s.mapPowerStateToRedis(s.fsmData.TargetPowerState)); err != nil {
+			s.logger.Printf("Failed to announce suspending state before suspend: %v", err)
+		}
+		s.logger.Printf("Waiting up to %v for the suspending state to reach the nRF", suspendQuiesceTimeout)
+		select {
+		case <-s.suspendQuiesceAcks:
+			s.logger.Printf("nRF told we are suspending; settling %v before suspend", suspendQuiesceMargin)
+			time.Sleep(suspendQuiesceMargin)
+		case <-time.After(suspendQuiesceTimeout):
+			s.logger.Printf("No confirmation that the nRF was told; aborting suspend to avoid the wake loop")
+			c.Send(librefsm.Event{
+				ID:      fsm.EvPowerRun,
+				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
+			})
+			return nil
+		}
+	}
 
 	s.logger.Printf("Issuing %s command", target)
 	// Note: For suspend, this call blocks until the system wakes up
@@ -1547,6 +1594,20 @@ func (s *Service) pollGPSActiveForTimeSync(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// onPowerStateSent is invoked when bluetooth-service confirms it forwarded a
+// power state to the nRF52. Only "suspending" matters: it gates the actual
+// suspend in EnterIssuingLowPower. Non-blocking; size-1 buffer, latest wins.
+func (s *Service) onPowerStateSent(value string) error {
+	if value != "suspending" {
+		return nil
+	}
+	select {
+	case s.suspendQuiesceAcks <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 // onWakeTimerArmed is invoked by the power-manager hash watcher whenever
