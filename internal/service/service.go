@@ -31,6 +31,16 @@ const (
 	lastDitchHibernateCBBThreshold = 50
 	lastDitchHibernateAuxEnterMv   = 11500
 	lastDitchHibernateAuxExitMv    = 11700
+
+	// lastDitchHibernateBootGrace suppresses the last-ditch trigger for the
+	// first minutes after pm-service starts. After waking from a last-ditch
+	// hibernation, Redis still holds the pre-hibernate battery state (slots
+	// absent, CBB low) until battery-service re-detects the pack, so firing
+	// on the seeded values would power the scooter straight back off before
+	// a freshly inserted battery is recognized. A timer re-evaluates the
+	// condition once the grace expires, so a genuinely battery-less scooter
+	// still hibernates — just not within the first 5 minutes of boot.
+	lastDitchHibernateBootGrace = 5 * time.Minute
 )
 
 type Service struct {
@@ -62,6 +72,11 @@ type Service struct {
 	auxVoltageMv    int  // millivolts, -1 if unknown
 	auxLowLatched   bool // Schmitt latch: true once below enter, until above exit
 	lastDitchFired  bool // rising-edge latch on the combined trigger
+
+	// lastDitchGraceUntil is set once in Run() before any watcher starts;
+	// evaluateLastDitchHibernate won't fire before this instant.
+	lastDitchGraceUntil time.Time
+	lastDitchGraceLog   bool // one-shot: suppression has been logged this boot
 
 	// Settings overrides for the wake timer; protected by settingsMu.
 	settingsMu              sync.Mutex
@@ -166,7 +181,9 @@ func (s *Service) Run(ctx context.Context) error {
 		s.fsmData.BatteryState = "active"
 	}
 
-	// Seed last-ditch hibernate inputs from current Redis state.
+	// Seed last-ditch hibernate inputs from current Redis state. The boot
+	// grace deadline must be set before any watcher can call the evaluator.
+	s.lastDitchGraceUntil = time.Now().Add(lastDitchHibernateBootGrace)
 	if v, err := s.redis.HGet("battery:0", "present"); err == nil && v != "" {
 		s.battery0Present = parseBool(v)
 	}
@@ -346,6 +363,17 @@ func (s *Service) Run(ctx context.Context) error {
 	// GPS receiver would never flip this; documented v1 limitation.
 	go s.pollGPSActiveForTimeSync(ctx)
 
+	// Re-evaluate the last-ditch condition once the boot grace expires, so a
+	// trigger suppressed during the grace still fires even if no further
+	// battery/CBB/aux updates arrive.
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Until(s.lastDitchGraceUntil) + time.Second):
+			s.evaluateLastDitchHibernate()
+		}
+	}()
+
 	// Watch power-manager hash for the nRF52 wake-timer ACK so EnterIssuingLowPower
 	// can confirm the wake source is armed before issuing systemctl poweroff.
 	if err := s.redis.NewHashWatcher("power-manager").
@@ -463,7 +491,9 @@ func (s *Service) onAuxVoltageChanged(v string) error {
 //    threshold).
 // The FSM's CanEnterLowPowerState guard handles vehicle-state gating (stand-by
 // only), so an event fired while the rider is interacting just no-ops; the
-// vehicle-state watcher re-evaluates when stand-by is reached.
+// vehicle-state watcher re-evaluates when stand-by is reached. Within
+// lastDitchHibernateBootGrace of startup the trigger is suppressed (see the
+// constant's comment for the wake-race rationale).
 func (s *Service) evaluateLastDitchHibernate() {
 	s.lastDitchMu.Lock()
 
@@ -497,6 +527,18 @@ func (s *Service) evaluateLastDitchHibernate() {
 	}
 	if prevFired {
 		s.lastDitchMu.Unlock()
+		return
+	}
+	// Boot grace: don't fire on state seeded from a pre-hibernate Redis
+	// snapshot. lastDitchFired stays false so the post-grace re-evaluation
+	// in Run() still sees a rising edge if the condition persists.
+	if remaining := time.Until(s.lastDitchGraceUntil); remaining > 0 {
+		logIt := !s.lastDitchGraceLog
+		s.lastDitchGraceLog = true
+		s.lastDitchMu.Unlock()
+		if logIt {
+			s.logger.Printf("Last-ditch hibernate condition met within boot grace; deferring up to %v", remaining.Round(time.Second))
+		}
 		return
 	}
 	s.lastDitchFired = true
