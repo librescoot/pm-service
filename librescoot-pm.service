@@ -8,7 +8,7 @@ Requires=redis.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/pm-service -default-state run
+ExecStart=/usr/bin/pm-service
 Restart=on-failure
 RestartSec=5
 User=root
