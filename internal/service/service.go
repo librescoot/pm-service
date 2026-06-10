@@ -83,6 +83,13 @@ type Service struct {
 	wakeTimerMaxSecondsOver uint32
 	wakeTimerAckTimeoutOver time.Duration
 
+	// Setting A ("keep online scooters reachable"): suspendWhenOnline
+	// (pm.suspend-when-online) gates whether a locked scooter with a main
+	// battery inserted may suspend while online; online mirrors
+	// internet.status == "connected". Both guarded by settingsMu.
+	suspendWhenOnline bool
+	online            bool
+
 	// wakeTimerAcks receives the nRF52's wake-timer-set acknowledgement: true
 	// when the timer is armed, false when it was disarmed. Buffered with size 1
 	// so the watcher goroutine never blocks. Consumers drain stale values
@@ -189,6 +196,12 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	if v, err := s.redis.HGet("battery:1", "present"); err == nil && v != "" {
 		s.battery1Present = parseBool(v)
+	}
+	// Seed online state before the first low-power evaluation so the
+	// suspend-when-online guard takes effect immediately (the internet watcher
+	// only syncs later).
+	if v, err := s.redis.HGet("internet", "status"); err == nil && v != "" {
+		s.online = (v == "connected")
 	}
 	if v, err := s.redis.HGet("battery:0", "charge"); err == nil && v != "" {
 		s.battery0Charge = parseChargeOrUnknown(v)
@@ -330,6 +343,12 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start aux-battery watcher: %v", err)
 	}
 
+	if err := s.redis.NewHashWatcher("internet").
+		OnField("status", s.onInternetStatusChanged).
+		StartWithSync(); err != nil {
+		return fmt.Errorf("failed to start internet watcher: %v", err)
+	}
+
 	redis_ipc.HandleRequests(s.redis, "scooter:power", s.onPowerCommand)
 	redis_ipc.HandleRequests(s.redis, "scooter:governor", s.onGovernorCommand)
 
@@ -340,6 +359,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.redis.NewHashWatcher("settings").
 		OnField("pm.hibernation-timer", s.onHibernationTimerSetting).
 		OnField("pm.default-state", s.onDefaultStateSetting).
+		OnField("pm.suspend-when-online", s.onSuspendWhenOnlineSetting).
 		OnField("pm.wake-timer-max-seconds", s.onWakeTimerMaxSecondsSetting).
 		OnField("pm.wake-timer-ack-timeout", s.onWakeTimerAckTimeoutSetting).
 		OnField("pm.scheduled-hibernate-enabled", s.onScheduledHibernateEnabledSetting).
@@ -944,9 +964,29 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 		return false
 	}
 
-	if targetState == fsm.TargetSuspend && s.batteryStateFromContext(c) == "active" {
-		s.logger.Printf("Cannot enter suspend state: battery is active")
-		return false
+	if targetState == fsm.TargetSuspend {
+		// Setting A: keep online, in-service scooters reachable. If
+		// pm.suspend-when-online is off and a main battery is inserted while we
+		// have internet connectivity, stay awake so cloud commands can still
+		// reach us. Checked before the battery-active guard so the operator sees
+		// the connectivity reason.
+		s.settingsMu.Lock()
+		suspendWhenOnline := s.suspendWhenOnline
+		online := s.online
+		s.settingsMu.Unlock()
+		s.lastDitchMu.Lock()
+		batteryPresent := s.battery0Present || s.battery1Present
+		s.lastDitchMu.Unlock()
+		if !suspendWhenOnline && online && batteryPresent {
+			s.logger.Printf("I would like to suspend now but the setting preventeth me! Oh woe!")
+			return false
+		}
+
+		// Don't suspend while a battery is actively delivering power.
+		if s.batteryStateFromContext(c) == "active" {
+			s.logger.Printf("Cannot enter suspend state: battery is active")
+			return false
+		}
 	}
 
 	return true
@@ -1424,6 +1464,26 @@ func (s *Service) onScheduledHibernateEnabledSetting(value string) error {
 		return nil
 	}
 	s.scheduler.SetEnabled(value == "true")
+	return nil
+}
+
+// onSuspendWhenOnlineSetting absorbs pm.suspend-when-online. When false (the
+// default), a locked scooter with a main battery inserted will not suspend
+// while it has internet connectivity, so it stays reachable.
+func (s *Service) onSuspendWhenOnlineSetting(value string) error {
+	s.settingsMu.Lock()
+	s.suspendWhenOnline = (value == "true")
+	s.settingsMu.Unlock()
+	return nil
+}
+
+// onInternetStatusChanged tracks whether we currently have internet
+// connectivity (internet.status == "connected"), consumed by the
+// suspend-when-online guard.
+func (s *Service) onInternetStatusChanged(value string) error {
+	s.settingsMu.Lock()
+	s.online = (value == "connected")
+	s.settingsMu.Unlock()
 	return nil
 }
 
