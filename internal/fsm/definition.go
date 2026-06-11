@@ -122,14 +122,17 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
-		// Last-ditch falling edge: the trigger condition cleared (battery
-		// inserted, aux recovered) while a plain hibernate target is still
-		// buffered in Running. Revert it so the scooter doesn't hibernate at
-		// the next stand-by with a healthy battery inserted. Guarded to plain
-		// hibernate only — hibernate-manual/-for are explicit user intent.
-		Transition(StateRunning, EvLastDitchCleared, StateRunning,
-			librefsm.WithGuard(actions.IsTargetPlainHibernate),
-			librefsm.WithAction(actions.OnLastDitchCleared),
+		// Last-ditch hibernate check (level-triggered). The trigger is a
+		// guard evaluated at transition time, so an aborted or dropped
+		// attempt needs no latch reset: the next input update re-checks.
+		// Nothing is buffered either — when the vehicle isn't in stand-by
+		// yet, the event simply no-ops and the check sent on the stand-by
+		// vehicle-state change fires instead. The priority guard (payload
+		// carries TargetHibernate) prevents downgrading a buffered
+		// hibernate-manual/-for.
+		Transition(StateRunning, EvLastDitchCheck, StateLowPowerImminent,
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnLastDitchTriggered),
 		).
 
 		// Natural suspend path: vehicle enters stand-by with target=suspend — use pre-delay
@@ -205,6 +208,15 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
+		// Last-ditch check upgrades a pending suspend to hibernate. There is
+		// deliberately NO check transition from LowPowerImminent or
+		// WaitingInhibitors: a self-restart there would reset the imminent
+		// sequence on every aux/CBB update and could stall the poweroff.
+		Transition(StatePreSuspend, EvLastDitchCheck, StateLowPowerImminent,
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnLastDitchTriggered),
+		).
+
 		// === Transitions from SuspendImminent (suspend path) ===
 
 		Transition(StateSuspendImminent, EvSuspendImminentTimeout, StateWaitingInhibitors,
@@ -252,6 +264,10 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		Transition(StateSuspendImminent, EvHibernationTimerExpired, StateLowPowerImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateSuspendImminent, EvLastDitchCheck, StateLowPowerImminent,
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnLastDitchTriggered),
 		).
 
 		// === Transitions from LowPowerImminent (hibernate path) ===
@@ -349,6 +365,19 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		Transition(StateIssuingLowPower, EvLowPowerIssued, StateSuspended).
 
+		// Last-ditch wake routing: if the trigger condition holds on resume
+		// (e.g. the CBB drained during suspend), go straight to hibernate
+		// instead of re-entering the suspend loop. Declared before the
+		// regular wake transitions — guards are tried in declaration order.
+		Transition(StateIssuingLowPower, EvWakeup, StateLowPowerImminent,
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnLastDitchWakeup),
+		).
+		Transition(StateIssuingLowPower, EvWakeupRTC, StateLowPowerImminent,
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnLastDitchWakeup),
+		).
+
 		// Wakeup from suspend: route to correct path based on target (same logic as StateSuspended)
 		Transition(StateIssuingLowPower, EvWakeup, StatePreSuspend,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),
@@ -376,6 +405,16 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		).
 
 		// === Transitions from Suspended ===
+
+		// Last-ditch wake routing (see IssuingLowPower note above)
+		Transition(StateSuspended, EvWakeup, StateLowPowerImminent,
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnLastDitchWakeup),
+		).
+		Transition(StateSuspended, EvWakeupRTC, StateLowPowerImminent,
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.CanEnterLowPowerState),
+			librefsm.WithAction(actions.OnLastDitchWakeup),
+		).
 
 		// Wakeup: route to correct path based on target
 		Transition(StateSuspended, EvWakeup, StatePreSuspend,

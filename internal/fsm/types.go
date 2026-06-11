@@ -41,10 +41,13 @@ const (
 	// Inhibitor events
 	EvInhibitorsChanged librefsm.EventID = "inhibitors-changed"
 
-	// Last-ditch hibernate falling edge: the trigger condition cleared (e.g.
-	// a battery was inserted) after the trigger had fired. Reverts a plain
-	// hibernate target still buffered in Running back to the default.
-	EvLastDitchCleared librefsm.EventID = "last-ditch-cleared"
+	// Last-ditch hibernate check: sent by the service whenever a trigger
+	// input (battery presence/charge, CBB charge, aux voltage, vehicle
+	// state) changes and the condition currently holds. Carries a
+	// PowerCommandPayload with TargetHibernate so the priority guard and
+	// OnPowerCommand work unchanged. Level-triggered: guards decide at
+	// transition time, nothing is latched or buffered.
+	EvLastDitchCheck librefsm.EventID = "last-ditch-check"
 
 	// Timer events
 	EvPreSuspendTimeout       librefsm.EventID = "pre-suspend-timeout"
@@ -135,7 +138,7 @@ type Actions interface {
 	IsBatteryNotActive(c *librefsm.Context) bool
 	IsTargetSuspend(c *librefsm.Context) bool
 	IsTargetHibernate(c *librefsm.Context) bool
-	IsTargetPlainHibernate(c *librefsm.Context) bool
+	IsLastDitchTriggered(c *librefsm.Context) bool
 	IsPowerCommandHigherPriority(c *librefsm.Context) bool
 
 	// Transition actions
@@ -148,7 +151,8 @@ type Actions interface {
 	OnVehicleLeftLowPowerState(c *librefsm.Context) error
 	OnBatteryStateChanged(c *librefsm.Context) error
 	OnPowerCommand(c *librefsm.Context) error
-	OnLastDitchCleared(c *librefsm.Context) error
+	OnLastDitchTriggered(c *librefsm.Context) error
+	OnLastDitchWakeup(c *librefsm.Context) error
 
 	// Publishing
 	PublishState(state string) error

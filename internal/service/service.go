@@ -71,8 +71,11 @@ type Service struct {
 	ctx                context.Context
 	ctxCancel          context.CancelFunc
 
-	// Last-ditch hibernate inputs. Updated from Redis hash watchers; reads
-	// happen only inside evaluateLastDitchHibernate, which holds lastDitchMu.
+	// Last-ditch hibernate inputs. Updated from Redis hash watchers under
+	// lastDitchMu; read by lastDitchTriggeredLocked (callers hold the mutex).
+	// The trigger itself is level-triggered and lives in the FSM: watchers
+	// send EvLastDitchCheck and the IsLastDitchTriggered guard decides at
+	// transition time, so no edge latch is needed.
 	// cbBatteryCharge==-1 / auxVoltageMv==-1 mean "unknown" (no reading yet)
 	// and suppress their respective sub-conditions.
 	lastDitchMu     sync.Mutex
@@ -83,10 +86,13 @@ type Service struct {
 	battery1Charge  int
 	auxVoltageMv    int  // millivolts, -1 if unknown
 	auxLowLatched   bool // Schmitt latch: true once below enter, until above exit
-	lastDitchFired  bool // rising-edge latch on the combined trigger
+	// lastDitchVehicleStandby mirrors vehicle.state == "stand-by" for the
+	// sendLastDitchCheck pre-filter only; CanEnterLowPowerState remains the
+	// authoritative vehicle-state guard inside the FSM.
+	lastDitchVehicleStandby bool
 
 	// lastDitchGraceUntil is set once in Run() before any watcher starts;
-	// evaluateLastDitchHibernate won't fire before this instant.
+	// the trigger condition reports false before this instant.
 	lastDitchGraceUntil time.Time
 	lastDitchGraceLog   bool // one-shot: suppression has been logged this boot
 
@@ -192,6 +198,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// without racing against FSM action writers.
 	if vehicleState, err := s.redis.HGet("vehicle", "state"); err == nil && vehicleState != "" {
 		s.fsmData.VehicleState = vehicleState
+		s.lastDitchVehicleStandby = (vehicleState == "stand-by")
 		s.logger.Printf("Initial vehicle state: %s", vehicleState)
 	}
 	if batteryState, err := s.redis.HGet("battery:0", "state"); err == nil && batteryState != "" {
@@ -299,22 +306,6 @@ func (s *Service) Run(ctx context.Context) error {
 	// Set up state change callback for Redis publishing
 	s.machine.OnStateChange(func(from, to librefsm.StateID) {
 		s.logger.Printf("FSM state transition: %s -> %s", from, to)
-		switch to {
-		case fsm.StateRunning, fsm.StatePreSuspend, fsm.StateSuspendImminent:
-			// These states mean no hibernate request is in flight, so a
-			// still-set last-ditch latch is stale: the fired event was either
-			// aborted (vehicle left stand-by), dropped (no transition for it
-			// in StateSuspended), or its buffered target was overwritten by
-			// EvPowerRun. Re-arm and re-check so the trigger can fire again;
-			// all three states accept an EvPowerHibernate upgrade.
-			s.lastDitchMu.Lock()
-			stale := s.lastDitchFired
-			s.lastDitchFired = false
-			s.lastDitchMu.Unlock()
-			if stale {
-				s.evaluateLastDitchHibernate()
-			}
-		}
 		s.publishFSMState(to)
 	})
 
@@ -417,14 +408,14 @@ func (s *Service) Run(ctx context.Context) error {
 	// GPS receiver would never flip this; documented v1 limitation.
 	go s.pollGPSActiveForTimeSync(ctx)
 
-	// Re-evaluate the last-ditch condition once the boot grace expires, so a
+	// Re-check the last-ditch condition once the boot grace expires, so a
 	// trigger suppressed during the grace still fires even if no further
 	// battery/CBB/aux updates arrive.
 	go func() {
 		select {
 		case <-ctx.Done():
 		case <-time.After(time.Until(s.lastDitchGraceUntil) + time.Second):
-			s.evaluateLastDitchHibernate()
+			s.sendLastDitchCheck()
 		}
 	}()
 
@@ -465,6 +456,9 @@ func (s *Service) Run(ctx context.Context) error {
 // Redis handlers - send FSM events only, no fsmData writes
 
 func (s *Service) onVehicleStateChanged(vehicleState string) error {
+	s.lastDitchMu.Lock()
+	s.lastDitchVehicleStandby = (vehicleState == "stand-by")
+	s.lastDitchMu.Unlock()
 	if s.machine != nil {
 		s.machine.Send(librefsm.Event{
 			ID:      fsm.EvVehicleStateChanged,
@@ -474,10 +468,12 @@ func (s *Service) onVehicleStateChanged(vehicleState string) error {
 	if s.scheduler != nil {
 		s.scheduler.OnVehicleStateChanged(vehicleState)
 	}
-	// Vehicle state is a guard input for last-ditch hibernate (CanEnterLowPowerState
-	// requires stand-by); re-evaluate so we don't miss the rising edge when the
-	// vehicle settles into stand-by while CBB is already low.
-	s.evaluateLastDitchHibernate()
+	// Vehicle state is a guard input for last-ditch hibernate
+	// (CanEnterLowPowerState requires stand-by); re-check after the vehicle
+	// event so the trigger fires when the vehicle settles into stand-by
+	// while CBB is already low. The check event queues behind the vehicle
+	// event, so the guard sees the updated fsmData.VehicleState.
+	s.sendLastDitchCheck()
 	return nil
 }
 
@@ -503,7 +499,7 @@ func (s *Service) onBatteryPresentChanged(slot, v string) error {
 		s.battery1Present = present
 	}
 	s.lastDitchMu.Unlock()
-	s.evaluateLastDitchHibernate()
+	s.sendLastDitchCheck()
 	return nil
 }
 
@@ -517,7 +513,7 @@ func (s *Service) onBatteryChargeChanged(slot, v string) error {
 		s.battery1Charge = charge
 	}
 	s.lastDitchMu.Unlock()
-	s.evaluateLastDitchHibernate()
+	s.sendLastDitchCheck()
 	return nil
 }
 
@@ -526,7 +522,7 @@ func (s *Service) onCBBatteryChargeChanged(v string) error {
 	s.lastDitchMu.Lock()
 	s.cbBatteryCharge = charge
 	s.lastDitchMu.Unlock()
-	s.evaluateLastDitchHibernate()
+	s.sendLastDitchCheck()
 	return nil
 }
 
@@ -534,81 +530,92 @@ func (s *Service) onAuxVoltageChanged(v string) error {
 	mv := parseNonNegativeInt(v)
 	s.lastDitchMu.Lock()
 	s.auxVoltageMv = mv
+	// Aux Schmitt trigger: latch below the enter threshold, release above
+	// the exit threshold. Updated here (not in the guard) so the guard
+	// stays read-only no matter how often the FSM evaluates it.
+	if mv >= 0 {
+		if s.auxLowLatched {
+			if mv >= lastDitchHibernateAuxExitMv {
+				s.auxLowLatched = false
+			}
+		} else if mv < lastDitchHibernateAuxEnterMv {
+			s.auxLowLatched = true
+		}
+	}
 	s.lastDitchMu.Unlock()
-	s.evaluateLastDitchHibernate()
+	s.sendLastDitchCheck()
 	return nil
 }
 
-// evaluateLastDitchHibernate fires EvPowerHibernate on the rising edge of:
+// lastDitchTriggeredLocked reports whether the last-ditch hibernate condition
+// currently holds:
 //
 //	(both main slots missing — present=false OR charge==0)
 //	AND
 //	(CBB charge < lastDitchHibernateCBBThreshold OR aux below the Schmitt
 //	 threshold).
 //
-// The FSM's CanEnterLowPowerState guard handles vehicle-state gating (stand-by
-// only), so an event fired while the rider is interacting just no-ops; the
-// vehicle-state watcher re-evaluates when stand-by is reached. Within
-// lastDitchHibernateBootGrace of startup the trigger is suppressed (see the
-// constant's comment for the wake-race rationale).
-func (s *Service) evaluateLastDitchHibernate() {
-	s.lastDitchMu.Lock()
-
-	// Aux Schmitt trigger.
-	if s.auxVoltageMv >= 0 {
-		if s.auxLowLatched {
-			if s.auxVoltageMv >= lastDitchHibernateAuxExitMv {
-				s.auxLowLatched = false
-			}
-		} else {
-			if s.auxVoltageMv < lastDitchHibernateAuxEnterMv {
-				s.auxLowLatched = true
-			}
-		}
-	}
-
+// Within lastDitchHibernateBootGrace of startup it reports false (see the
+// constant's comment for the wake-race rationale); the grace suppression is
+// logged once per boot. Callers must hold lastDitchMu.
+func (s *Service) lastDitchTriggeredLocked() bool {
 	cbb := s.cbBatteryCharge
 	slot0Missing := !s.battery0Present || s.battery0Charge == 0
 	slot1Missing := !s.battery1Present || s.battery1Charge == 0
 	bothMissing := slot0Missing && slot1Missing
 	cbbLow := cbb >= 0 && cbb < lastDitchHibernateCBBThreshold
-	auxLow := s.auxLowLatched
 
-	condition := bothMissing && (cbbLow || auxLow)
-	prevFired := s.lastDitchFired
-	auxMv := s.auxVoltageMv
-	if !condition {
-		s.lastDitchFired = false
-		s.lastDitchMu.Unlock()
-		// Falling edge after a fire: the request may still sit in the FSM as
-		// a buffered plain-hibernate target (recorded by the Running fallback
-		// transition while the vehicle wasn't in stand-by). Revert it so a
-		// battery inserted after the trigger doesn't hibernate the scooter at
-		// the next stand-by. The FSM guards this to Running + target ==
-		// hibernate; a plain cloud `hibernate` racing the falling edge gets
-		// downgraded too, which is the safe direction.
-		if prevFired && s.machine != nil {
-			s.machine.Send(librefsm.Event{ID: fsm.EvLastDitchCleared})
-		}
-		return
+	if !(bothMissing && (cbbLow || s.auxLowLatched)) {
+		return false
 	}
-	if prevFired {
-		s.lastDitchMu.Unlock()
-		return
-	}
-	// Boot grace: don't fire on state seeded from a pre-hibernate Redis
-	// snapshot. lastDitchFired stays false so the post-grace re-evaluation
-	// in Run() still sees a rising edge if the condition persists.
 	if remaining := time.Until(s.lastDitchGraceUntil); remaining > 0 {
-		logIt := !s.lastDitchGraceLog
-		s.lastDitchGraceLog = true
-		s.lastDitchMu.Unlock()
-		if logIt {
+		if !s.lastDitchGraceLog {
+			s.lastDitchGraceLog = true
 			s.logger.Printf("Last-ditch hibernate condition met within boot grace; deferring up to %v", remaining.Round(time.Second))
 		}
+		return false
+	}
+	return true
+}
+
+// sendLastDitchCheck enqueues EvLastDitchCheck when the trigger condition
+// currently holds and the vehicle is in stand-by. The FSM guards re-evaluate
+// authoritatively at transition time; this pre-check only keeps no-op events
+// out of the queue (and CanEnterLowPowerState's rejection log quiet while
+// e.g. a battery swap is in progress with the seatbox open). The payload
+// carries the plain hibernate target so the priority guard and
+// OnPowerCommand see a regular power command.
+func (s *Service) sendLastDitchCheck() {
+	if s.machine == nil {
 		return
 	}
-	s.lastDitchFired = true
+	s.lastDitchMu.Lock()
+	triggered := s.lastDitchTriggeredLocked() && s.lastDitchVehicleStandby
+	s.lastDitchMu.Unlock()
+	if !triggered {
+		return
+	}
+	s.machine.Send(librefsm.Event{
+		ID:      fsm.EvLastDitchCheck,
+		Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetHibernate},
+	})
+}
+
+// IsLastDitchTriggered is the FSM guard for EvLastDitchCheck transitions and
+// the last-ditch wake routing.
+func (s *Service) IsLastDitchTriggered(c *librefsm.Context) bool {
+	s.lastDitchMu.Lock()
+	defer s.lastDitchMu.Unlock()
+	return s.lastDitchTriggeredLocked()
+}
+
+// logLastDitchTrigger reports which reserve ran low when the trigger fires.
+func (s *Service) logLastDitchTrigger() {
+	s.lastDitchMu.Lock()
+	cbb := s.cbBatteryCharge
+	cbbLow := cbb >= 0 && cbb < lastDitchHibernateCBBThreshold
+	auxLow := s.auxLowLatched
+	auxMv := s.auxVoltageMv
 	s.lastDitchMu.Unlock()
 
 	var reserve string
@@ -620,13 +627,27 @@ func (s *Service) evaluateLastDitchHibernate() {
 	default:
 		reserve = fmt.Sprintf("aux=%d mV", auxMv)
 	}
-	s.logger.Printf("Last-ditch hibernate: no main battery, %s — requesting hibernation", reserve)
-	if s.machine != nil {
-		s.machine.Send(librefsm.Event{
-			ID:      fsm.EvPowerHibernate,
-			Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetHibernate},
-		})
+	s.logger.Printf("Last-ditch hibernate: no main battery, %s — hibernating", reserve)
+}
+
+// OnLastDitchTriggered logs the trigger and records the hibernate target from
+// the event payload (delegates to OnPowerCommand).
+func (s *Service) OnLastDitchTriggered(c *librefsm.Context) error {
+	s.logLastDitchTrigger()
+	return s.OnPowerCommand(c)
+}
+
+// OnLastDitchWakeup handles a wake from suspend that routes straight to
+// hibernate because the trigger condition holds (e.g. the CBB drained during
+// suspend). Performs the regular wakeup bookkeeping, then sets the target.
+func (s *Service) OnLastDitchWakeup(c *librefsm.Context) error {
+	if err := s.OnWakeup(c); err != nil {
+		return err
 	}
+	s.logLastDitchTrigger()
+	s.fsmData.TargetPowerState = fsm.TargetHibernate
+	s.fsmData.HibernateForWakeSeconds = 0
+	return nil
 }
 
 // parseBool accepts the "true"/"false" form battery-service publishes.
@@ -1122,13 +1143,6 @@ func (s *Service) IsTargetHibernate(c *librefsm.Context) bool {
 	return false
 }
 
-// IsTargetPlainHibernate matches only the plain `hibernate` target — the one
-// the last-ditch trigger buffers. hibernate-manual/-for/-timer must not be
-// reverted by EvLastDitchCleared.
-func (s *Service) IsTargetPlainHibernate(c *librefsm.Context) bool {
-	return s.fsmData.TargetPowerState == fsm.TargetHibernate
-}
-
 // IsPowerCommandHigherPriority checks if the command in the event payload can override
 // the current target power state. Guards against priority downgrades.
 // Priority order: run > hibernate-manual/hibernate-for > hibernate > hibernate-timer > suspend/reboot
@@ -1292,14 +1306,6 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 			s.fsmData.HibernateForWakeSeconds = 0
 		}
 	}
-	return nil
-}
-
-// OnLastDitchCleared reverts a buffered last-ditch hibernate target to the
-// configured default once the trigger condition has cleared.
-func (s *Service) OnLastDitchCleared(c *librefsm.Context) error {
-	s.logger.Printf("Last-ditch hibernate condition cleared; reverting buffered target %s -> %s", s.fsmData.TargetPowerState, s.config.DefaultState)
-	s.fsmData.TargetPowerState = s.config.DefaultState
 	return nil
 }
 
