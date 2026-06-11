@@ -11,19 +11,21 @@ import (
 
 // mockActions implements fsm.Actions for testing
 type mockActions struct {
-	canEnterLowPower       bool
-	vehicleNotInStandby    bool
-	targetSuspend          bool
-	targetHibernate        bool
-	hasBlockingInhibitors  bool
-	hasOnlyModemInhibitors bool
-	targetNotRun           bool
-	onPowerCommandCount    int
+	canEnterLowPower        bool
+	vehicleNotInStandby     bool
+	targetSuspend           bool
+	targetHibernate         bool
+	targetPlainHibernate    bool
+	hasBlockingInhibitors   bool
+	hasOnlyModemInhibitors  bool
+	targetNotRun            bool
+	onPowerCommandCount     int
+	onLastDitchClearedCount int
 }
 
 func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error        { return nil }
 func (m *mockActions) EnterSuspendImminent(c *librefsm.Context) error   { return nil }
-func (m *mockActions) EnterLowPowerImminent(c *librefsm.Context) error { return nil }
+func (m *mockActions) EnterLowPowerImminent(c *librefsm.Context) error  { return nil }
 func (m *mockActions) EnterWaitingInhibitors(c *librefsm.Context) error { return nil }
 func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error   { return nil }
 func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error    { return nil }
@@ -37,10 +39,13 @@ func (m *mockActions) HasOnlyModemInhibitors(c *librefsm.Context) bool {
 func (m *mockActions) IsVehicleNotInStandby(c *librefsm.Context) bool {
 	return m.vehicleNotInStandby
 }
-func (m *mockActions) IsTargetNotRun(c *librefsm.Context) bool               { return m.targetNotRun }
-func (m *mockActions) IsBatteryNotActive(c *librefsm.Context) bool           { return true }
-func (m *mockActions) IsTargetSuspend(c *librefsm.Context) bool              { return m.targetSuspend }
-func (m *mockActions) IsTargetHibernate(c *librefsm.Context) bool            { return m.targetHibernate }
+func (m *mockActions) IsTargetNotRun(c *librefsm.Context) bool     { return m.targetNotRun }
+func (m *mockActions) IsBatteryNotActive(c *librefsm.Context) bool { return true }
+func (m *mockActions) IsTargetSuspend(c *librefsm.Context) bool    { return m.targetSuspend }
+func (m *mockActions) IsTargetHibernate(c *librefsm.Context) bool  { return m.targetHibernate }
+func (m *mockActions) IsTargetPlainHibernate(c *librefsm.Context) bool {
+	return m.targetPlainHibernate
+}
 func (m *mockActions) IsPowerCommandHigherPriority(c *librefsm.Context) bool { return true }
 func (m *mockActions) OnPreSuspendTimeout(c *librefsm.Context) error         { return nil }
 func (m *mockActions) OnSuspendImminentTimeout(c *librefsm.Context) error    { return nil }
@@ -54,8 +59,12 @@ func (m *mockActions) OnPowerCommand(c *librefsm.Context) error {
 	m.onPowerCommandCount++
 	return nil
 }
-func (m *mockActions) PublishState(state string) error                       { return nil }
-func (m *mockActions) PublishWakeupSource(reason string) error               { return nil }
+func (m *mockActions) OnLastDitchCleared(c *librefsm.Context) error {
+	m.onLastDitchClearedCount++
+	return nil
+}
+func (m *mockActions) PublishState(state string) error         { return nil }
+func (m *mockActions) PublishWakeupSource(reason string) error { return nil }
 
 // TestExplicitSuspendSkipsPreDelay verifies that an explicit suspend command
 // goes directly to SuspendImminent (skipping the pre-suspend delay).
@@ -719,5 +728,103 @@ func TestHibernationTimerExpiredBufferedWhenVehicleNotInStandby(t *testing.T) {
 	}
 	if actions.onPowerCommandCount != 1 {
 		t.Errorf("Expected OnPowerCommand via fallback, count=%d", actions.onPowerCommandCount)
+	}
+}
+
+// TestLastDitchClearedRevertsBufferedHibernate: a last-ditch fire buffered a
+// plain hibernate target in Running; the condition then cleared (battery
+// inserted). EvLastDitchCleared must run OnLastDitchCleared so the target is
+// reverted before the next stand-by.
+func TestLastDitchClearedRevertsBufferedHibernate(t *testing.T) {
+	actions := &mockActions{
+		targetPlainHibernate: true,
+	}
+
+	def := fsm.NewDefinition(actions, 100*time.Millisecond, 100*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCleared})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StateRunning) {
+		t.Errorf("Expected StateRunning, got %v", machine.CurrentState())
+	}
+	if actions.onLastDitchClearedCount != 1 {
+		t.Errorf("Expected OnLastDitchCleared once, count=%d", actions.onLastDitchClearedCount)
+	}
+}
+
+// TestLastDitchClearedIgnoresOtherTargets: hibernate-manual/-for (or any
+// non-plain-hibernate target) must not be reverted by the falling edge.
+func TestLastDitchClearedIgnoresOtherTargets(t *testing.T) {
+	actions := &mockActions{
+		targetPlainHibernate: false,
+	}
+
+	def := fsm.NewDefinition(actions, 100*time.Millisecond, 100*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCleared})
+	time.Sleep(10 * time.Millisecond)
+
+	if actions.onLastDitchClearedCount != 0 {
+		t.Errorf("Expected OnLastDitchCleared not to run, count=%d", actions.onLastDitchClearedCount)
+	}
+}
+
+// TestLastDitchClearedIgnoredDuringHibernateExecution: once the hibernate
+// sequence is executing (LowPowerImminent), the falling edge is dropped — we
+// deliberately don't abort an in-flight low-power transition.
+func TestLastDitchClearedIgnoredDuringHibernateExecution(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:     true,
+		targetHibernate:      true,
+		targetPlainHibernate: true,
+	}
+
+	def := fsm.NewDefinition(actions, 100*time.Millisecond, 100*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernate})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Fatalf("Expected StateLowPowerImminent, got %v", machine.CurrentState())
+	}
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCleared})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Expected to stay in StateLowPowerImminent, got %v", machine.CurrentState())
+	}
+	if actions.onLastDitchClearedCount != 0 {
+		t.Errorf("Expected OnLastDitchCleared not to run, count=%d", actions.onLastDitchClearedCount)
 	}
 }

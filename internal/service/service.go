@@ -22,9 +22,9 @@ import (
 )
 
 // Last-ditch hibernate thresholds. The trigger fires when both main battery
-// slots are physically absent (present=false) AND the system has lost enough
-// reserve to risk a brown-out — either the CBB is below threshold or the aux
-// 12V rail (which feeds the iMX6) has dipped. Aux uses a Schmitt-trigger
+// slots are unusable (present=false, or present but charge==0) AND the system
+// has lost enough reserve to risk a brown-out — either the CBB is below
+// threshold or the aux 12V rail (which feeds the iMX6) has dipped. Aux uses a Schmitt-trigger
 // recovery margin to avoid event thrash near the threshold, mirroring
 // battery-service's aux-low keep-active logic.
 const (
@@ -49,6 +49,10 @@ const (
 	// suspendQuiesceMargin lets the nRF's reply to the suspending frame drain
 	// onto ttymxc1 while we are still awake to absorb it.
 	suspendQuiesceMargin = 200 * time.Millisecond
+	// suspendEnterTimeout bounds the wait for logind's PrepareForSleep(true)
+	// after requesting a suspend. logind emits it before honoring delay
+	// inhibitors, so this only expires if the suspend job failed outright.
+	suspendEnterTimeout = 15 * time.Second
 )
 
 type Service struct {
@@ -135,21 +139,21 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 	}
 
 	service := &Service{
-		config:          cfg,
-		logger:          logger,
-		redis:           redisClient,
-		systemdClient:   systemdClient,
-		powerManagerPub: redisClient.NewHashPublisher("power-manager"),
-		systemPub:       redisClient.NewHashPublisher("system"),
-		busyServicesPub: redisClient.NewHashPublisher("power-manager:busy-services"),
+		config:             cfg,
+		logger:             logger,
+		redis:              redisClient,
+		systemdClient:      systemdClient,
+		powerManagerPub:    redisClient.NewHashPublisher("power-manager"),
+		systemPub:          redisClient.NewHashPublisher("system"),
+		busyServicesPub:    redisClient.NewHashPublisher("power-manager:busy-services"),
 		wakeTimerAcks:      make(chan bool, 1),
 		suspendQuiesceAcks: make(chan struct{}, 1),
-		cbBatteryCharge: -1,
-		battery0Present: true,
-		battery1Present: true,
-		battery0Charge:  -1,
-		battery1Charge:  -1,
-		auxVoltageMv:    -1,
+		cbBatteryCharge:    -1,
+		battery0Present:    true,
+		battery1Present:    true,
+		battery0Charge:     -1,
+		battery1Charge:     -1,
+		auxVoltageMv:       -1,
 		fsmData: &fsm.FSMData{
 			TargetPowerState: cfg.DefaultState,
 			VehicleState:     "",
@@ -295,6 +299,22 @@ func (s *Service) Run(ctx context.Context) error {
 	// Set up state change callback for Redis publishing
 	s.machine.OnStateChange(func(from, to librefsm.StateID) {
 		s.logger.Printf("FSM state transition: %s -> %s", from, to)
+		switch to {
+		case fsm.StateRunning, fsm.StatePreSuspend, fsm.StateSuspendImminent:
+			// These states mean no hibernate request is in flight, so a
+			// still-set last-ditch latch is stale: the fired event was either
+			// aborted (vehicle left stand-by), dropped (no transition for it
+			// in StateSuspended), or its buffered target was overwritten by
+			// EvPowerRun. Re-arm and re-check so the trigger can fire again;
+			// all three states accept an EvPowerHibernate upgrade.
+			s.lastDitchMu.Lock()
+			stale := s.lastDitchFired
+			s.lastDitchFired = false
+			s.lastDitchMu.Unlock()
+			if stale {
+				s.evaluateLastDitchHibernate()
+			}
+		}
 		s.publishFSMState(to)
 	})
 
@@ -520,10 +540,12 @@ func (s *Service) onAuxVoltageChanged(v string) error {
 }
 
 // evaluateLastDitchHibernate fires EvPowerHibernate on the rising edge of:
-//   (both main slots missing — present=false OR charge==0)
-//   AND
-//   (CBB charge < lastDitchHibernateCBBThreshold OR aux below the Schmitt
-//    threshold).
+//
+//	(both main slots missing — present=false OR charge==0)
+//	AND
+//	(CBB charge < lastDitchHibernateCBBThreshold OR aux below the Schmitt
+//	 threshold).
+//
 // The FSM's CanEnterLowPowerState guard handles vehicle-state gating (stand-by
 // only), so an event fired while the rider is interacting just no-ops; the
 // vehicle-state watcher re-evaluates when stand-by is reached. Within
@@ -558,6 +580,16 @@ func (s *Service) evaluateLastDitchHibernate() {
 	if !condition {
 		s.lastDitchFired = false
 		s.lastDitchMu.Unlock()
+		// Falling edge after a fire: the request may still sit in the FSM as
+		// a buffered plain-hibernate target (recorded by the Running fallback
+		// transition while the vehicle wasn't in stand-by). Revert it so a
+		// battery inserted after the trigger doesn't hibernate the scooter at
+		// the next stand-by. The FSM guards this to Running + target ==
+		// hibernate; a plain cloud `hibernate` racing the falling edge gets
+		// downgraded too, which is the safe direction.
+		if prevFired && s.machine != nil {
+			s.machine.Send(librefsm.Event{ID: fsm.EvLastDitchCleared})
+		}
 		return
 	}
 	if prevFired {
@@ -901,15 +933,32 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	}
 
 	s.logger.Printf("Issuing %s command", target)
-	// Note: For suspend, this call blocks until the system wakes up
+
+	if target == "suspend" {
+		// Block on logind's PrepareForSleep cycle so the return only means
+		// "the system slept and resumed". `systemctl suspend` alone returns
+		// when the job is enqueued, which used to make the FSM read a stale
+		// wakeup reason and cycle through pre-suspend while the kernel was
+		// still on its way down.
+		if err := s.systemdClient.SuspendAndWaitResume(s.ctx, suspendEnterTimeout); err != nil {
+			s.fsmData.LowPowerStateIssued = false
+			if s.ctx.Err() != nil {
+				return nil
+			}
+			s.logger.Printf("Suspend did not complete: %v; returning to running", err)
+			c.Send(librefsm.Event{
+				ID:      fsm.EvPowerRun,
+				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
+			})
+			return nil
+		}
+		s.handleWakeupAfterSuspend(c)
+		return nil
+	}
+
 	if err := s.systemdClient.IssueCommand(target); err != nil {
 		s.fsmData.LowPowerStateIssued = false
 		return fmt.Errorf("failed to issue %s command: %v", target, err)
-	}
-
-	// For suspend, we just woke up - handle wakeup
-	if target == "suspend" {
-		s.handleWakeupAfterSuspend(c)
 	}
 	// For poweroff/reboot, the system will have stopped - we won't reach here
 
@@ -1071,6 +1120,13 @@ func (s *Service) IsTargetHibernate(c *librefsm.Context) bool {
 		return true
 	}
 	return false
+}
+
+// IsTargetPlainHibernate matches only the plain `hibernate` target — the one
+// the last-ditch trigger buffers. hibernate-manual/-for/-timer must not be
+// reverted by EvLastDitchCleared.
+func (s *Service) IsTargetPlainHibernate(c *librefsm.Context) bool {
+	return s.fsmData.TargetPowerState == fsm.TargetHibernate
 }
 
 // IsPowerCommandHigherPriority checks if the command in the event payload can override
@@ -1236,6 +1292,14 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 			s.fsmData.HibernateForWakeSeconds = 0
 		}
 	}
+	return nil
+}
+
+// OnLastDitchCleared reverts a buffered last-ditch hibernate target to the
+// configured default once the trigger condition has cleared.
+func (s *Service) OnLastDitchCleared(c *librefsm.Context) error {
+	s.logger.Printf("Last-ditch hibernate condition cleared; reverting buffered target %s -> %s", s.fsmData.TargetPowerState, s.config.DefaultState)
+	s.fsmData.TargetPowerState = s.config.DefaultState
 	return nil
 }
 

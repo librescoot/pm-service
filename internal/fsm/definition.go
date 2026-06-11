@@ -122,6 +122,16 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
+		// Last-ditch falling edge: the trigger condition cleared (battery
+		// inserted, aux recovered) while a plain hibernate target is still
+		// buffered in Running. Revert it so the scooter doesn't hibernate at
+		// the next stand-by with a healthy battery inserted. Guarded to plain
+		// hibernate only — hibernate-manual/-for are explicit user intent.
+		Transition(StateRunning, EvLastDitchCleared, StateRunning,
+			librefsm.WithGuard(actions.IsTargetPlainHibernate),
+			librefsm.WithAction(actions.OnLastDitchCleared),
+		).
+
 		// Natural suspend path: vehicle enters stand-by with target=suspend — use pre-delay
 		Transition(StateRunning, EvVehicleStateChanged, StatePreSuspend,
 			librefsm.WithGuards(actions.CanEnterLowPowerState, actions.IsTargetSuspend),

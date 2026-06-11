@@ -7,16 +7,16 @@ import (
 // Power management states
 const (
 	// Main states
-	StateRunning           librefsm.StateID = "running"
-	StatePreSuspend        librefsm.StateID = "pre-suspend"
-	StateSuspendImminent   librefsm.StateID = "suspend-imminent"
+	StateRunning         librefsm.StateID = "running"
+	StatePreSuspend      librefsm.StateID = "pre-suspend"
+	StateSuspendImminent librefsm.StateID = "suspend-imminent"
 	// StateLowPowerImminent is the generic "preparing for a low-power
 	// transition" state. It's entered for hibernate, hibernate-for,
 	// hibernate-manual, hibernate-timer AND reboot — the dispatch at the
 	// end of the prep flow picks the actual operation based on
 	// fsmData.TargetPowerState. Naming it "hibernate-*" was historical and
 	// misleading when seen in reboot logs.
-	StateLowPowerImminent librefsm.StateID = "low-power-imminent"
+	StateLowPowerImminent  librefsm.StateID = "low-power-imminent"
 	StateWaitingInhibitors librefsm.StateID = "waiting-inhibitors"
 	StateIssuingLowPower   librefsm.StateID = "issuing-low-power"
 	StateSuspended         librefsm.StateID = "suspended"
@@ -40,6 +40,11 @@ const (
 
 	// Inhibitor events
 	EvInhibitorsChanged librefsm.EventID = "inhibitors-changed"
+
+	// Last-ditch hibernate falling edge: the trigger condition cleared (e.g.
+	// a battery was inserted) after the trigger had fired. Reverts a plain
+	// hibernate target still buffered in Running back to the default.
+	EvLastDitchCleared librefsm.EventID = "last-ditch-cleared"
 
 	// Timer events
 	EvPreSuspendTimeout       librefsm.EventID = "pre-suspend-timeout"
@@ -130,6 +135,7 @@ type Actions interface {
 	IsBatteryNotActive(c *librefsm.Context) bool
 	IsTargetSuspend(c *librefsm.Context) bool
 	IsTargetHibernate(c *librefsm.Context) bool
+	IsTargetPlainHibernate(c *librefsm.Context) bool
 	IsPowerCommandHigherPriority(c *librefsm.Context) bool
 
 	// Transition actions
@@ -142,6 +148,7 @@ type Actions interface {
 	OnVehicleLeftLowPowerState(c *librefsm.Context) error
 	OnBatteryStateChanged(c *librefsm.Context) error
 	OnPowerCommand(c *librefsm.Context) error
+	OnLastDitchCleared(c *librefsm.Context) error
 
 	// Publishing
 	PublishState(state string) error
