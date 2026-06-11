@@ -122,6 +122,14 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 
+		// Runtime pm.default-state change: store the new target so the
+		// follow-up EvVehicleStateChanged (sent by the settings handler)
+		// re-evaluates the natural low-power path with it. Only handled in
+		// Running; mid-countdown the old intent finishes first.
+		Transition(StateRunning, EvDefaultStateChanged, StateRunning,
+			librefsm.WithAction(actions.OnDefaultStateChanged),
+		).
+
 		// Last-ditch hibernate check (level-triggered). The trigger is a
 		// guard evaluated at transition time, so an aborted or dropped
 		// attempt needs no latch reset: the next input update re-checks.

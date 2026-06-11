@@ -1095,7 +1095,7 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 		batteryPresent := s.battery0Present || s.battery1Present
 		s.lastDitchMu.Unlock()
 		if !suspendWhenOnline && online && batteryPresent {
-			s.logger.Printf("I would like to suspend now but the setting preventeth me! Oh woe!")
+			s.logger.Printf("Suspend blocked: online with a main battery present and pm.suspend-when-online disabled")
 			return false
 		}
 
@@ -1309,6 +1309,23 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 	return nil
 }
 
+// OnDefaultStateChanged applies a runtime pm.default-state change to the FSM
+// target. The settings handler follows up with EvVehicleStateChanged so the
+// natural low-power path re-evaluates with the new target immediately instead
+// of waiting for the next stand-by entry.
+func (s *Service) OnDefaultStateChanged(c *librefsm.Context) error {
+	p, ok := c.Event.Payload.(fsm.PowerCommandPayload)
+	if !ok {
+		return nil
+	}
+	if s.fsmData.TargetPowerState != p.TargetState {
+		s.logger.Printf("Target power state: %s -> %s (default-state change)", s.fsmData.TargetPowerState, p.TargetState)
+	}
+	s.fsmData.TargetPowerState = p.TargetState
+	s.fsmData.HibernateForWakeSeconds = 0
+	return nil
+}
+
 // Publishing methods
 
 func (s *Service) PublishState(state string) error {
@@ -1508,6 +1525,32 @@ func (s *Service) onDefaultStateSetting(value string) error {
 	}
 	s.logger.Printf("Default power state changed: %s -> %s", s.config.DefaultState, value)
 	s.config.DefaultState = value
+
+	// Apply immediately instead of waiting for the next stand-by entry. A
+	// change to run cancels a countdown already in flight; any other target
+	// is stored in the FSM and the natural low-power path re-evaluated. At
+	// startup the dedupe above swallows the hydration callback, so this only
+	// fires for genuine runtime changes.
+	if s.machine == nil {
+		return nil
+	}
+	if value == fsm.TargetRun {
+		s.machine.Send(librefsm.Event{
+			ID:      fsm.EvPowerRun,
+			Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
+		})
+		return nil
+	}
+	s.machine.Send(librefsm.Event{
+		ID:      fsm.EvDefaultStateChanged,
+		Payload: fsm.PowerCommandPayload{TargetState: value},
+	})
+	if vehicleState, err := s.redis.HGet("vehicle", "state"); err == nil && vehicleState != "" {
+		s.machine.Send(librefsm.Event{
+			ID:      fsm.EvVehicleStateChanged,
+			Payload: fsm.VehicleStatePayload{State: vehicleState},
+		})
+	}
 	return nil
 }
 

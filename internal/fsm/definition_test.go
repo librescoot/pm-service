@@ -68,6 +68,7 @@ func (m *mockActions) OnLastDitchWakeup(c *librefsm.Context) error {
 	m.onLastDitchWakeupCount++
 	return nil
 }
+func (m *mockActions) OnDefaultStateChanged(c *librefsm.Context) error { return nil }
 func (m *mockActions) PublishState(state string) error         { return nil }
 func (m *mockActions) PublishWakeupSource(reason string) error { return nil }
 

@@ -49,6 +49,13 @@ const (
 	// transition time, nothing is latched or buffered.
 	EvLastDitchCheck librefsm.EventID = "last-ditch-check"
 
+	// pm.default-state changed at runtime. Only handled in Running: the
+	// action stores the new target in fsmData so a follow-up
+	// EvVehicleStateChanged re-evaluates the natural low-power path with it.
+	// A change to "run" is sent as EvPowerRun instead, which also cancels a
+	// countdown already in flight.
+	EvDefaultStateChanged librefsm.EventID = "default-state-changed"
+
 	// Timer events
 	EvPreSuspendTimeout       librefsm.EventID = "pre-suspend-timeout"
 	EvSuspendImminentTimeout  librefsm.EventID = "suspend-imminent-timeout"
@@ -153,6 +160,7 @@ type Actions interface {
 	OnPowerCommand(c *librefsm.Context) error
 	OnLastDitchTriggered(c *librefsm.Context) error
 	OnLastDitchWakeup(c *librefsm.Context) error
+	OnDefaultStateChanged(c *librefsm.Context) error
 
 	// Publishing
 	PublishState(state string) error
