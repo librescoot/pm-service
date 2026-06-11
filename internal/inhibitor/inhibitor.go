@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"syscall"
 )
@@ -154,7 +155,7 @@ func (m *Manager) RemoveInhibitor(inhibitor *Inhibitor) {
 	} else {
 		for i, inh := range m.manualInhibitors {
 			if inh == inhibitor {
-				m.manualInhibitors = append(m.manualInhibitors[:i], m.manualInhibitors[i+1:]...)
+				m.manualInhibitors = slices.Delete(m.manualInhibitors, i, i+1)
 				break
 			}
 		}
