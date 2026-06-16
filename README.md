@@ -130,7 +130,7 @@ The service can be configured using command-line flags:
   -default-state string
         Default power state (run, suspend, hibernate, hibernate-manual, hibernate-timer, reboot) (default "suspend")
   -hibernation-timer duration
-        Duration of the hibernation timer (default 5d)
+        Duration of the hibernation timer (default 3d)
   -inhibitor-duration duration
         Duration the system is held active after suspend is issued (default 500ms)
   -pre-suspend-delay duration
