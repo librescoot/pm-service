@@ -1116,6 +1116,15 @@ func (s *Service) HasOnlyModemInhibitors(c *librefsm.Context) bool {
 	return s.hasOnlyModemBlockingInhibitors(target) && !s.fsmData.ModemDisabled
 }
 
+// CanProceedPastModemWait reports whether the bounded WaitingInhibitors timeout
+// may proceed with the transition. We already asked the modem to power off, so
+// on expiry we go ahead if nothing - or only the modem - still blocks. A genuine
+// block inhibitor (e.g. an OTA install) is NOT bypassed and keeps waiting.
+func (s *Service) CanProceedPastModemWait(c *librefsm.Context) bool {
+	target := s.fsmData.TargetPowerState
+	return !s.inhibitorManager.HasBlockingInhibitors(target) || s.hasOnlyModemBlockingInhibitors(target)
+}
+
 func (s *Service) IsVehicleNotInStandby(c *librefsm.Context) bool {
 	return s.vehicleStateFromContext(c) != "stand-by"
 }

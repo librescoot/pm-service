@@ -6,6 +6,12 @@ import (
 	"github.com/librescoot/librefsm"
 )
 
+// inhibitorWaitTimeout bounds how long WaitingInhibitors waits for the modem to
+// drop its block inhibitor after we asked it to power off. On expiry we proceed
+// with the transition if nothing but the modem still blocks; a genuine block
+// inhibitor (e.g. an OTA install) is not bypassed and keeps waiting.
+const inhibitorWaitTimeout = 15 * time.Second
+
 // NewDefinition creates the power management FSM definition.
 // The actions parameter provides the implementation for state entry/exit,
 // guards, and transition actions.
@@ -38,6 +44,7 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// Shared states
 		State(StateWaitingInhibitors,
 			librefsm.WithOnEnter(actions.EnterWaitingInhibitors),
+			librefsm.WithTimeout(inhibitorWaitTimeout, EvInhibitorWaitTimeout),
 		).
 		State(StateIssuingLowPower,
 			librefsm.WithOnEnter(actions.EnterIssuingLowPower),
@@ -323,6 +330,14 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		Transition(StateWaitingInhibitors, EvInhibitorsChanged, StateWaitingInhibitors,
 			librefsm.WithGuard(actions.HasOnlyModemInhibitors),
 			librefsm.WithAction(actions.OnDisableModem),
+		).
+
+		// Bounded modem-off wait: we already asked the modem to power off, so
+		// if it has not dropped its inhibitor within inhibitorWaitTimeout,
+		// proceed anyway rather than stalling the transition. Only force-proceeds
+		// past the modem (or nothing); a real block inhibitor keeps waiting.
+		Transition(StateWaitingInhibitors, EvInhibitorWaitTimeout, StateIssuingLowPower,
+			librefsm.WithGuard(actions.CanProceedPastModemWait),
 		).
 
 		// Cancel: target set to run

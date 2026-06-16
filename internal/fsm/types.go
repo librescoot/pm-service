@@ -40,6 +40,9 @@ const (
 
 	// Inhibitor events
 	EvInhibitorsChanged librefsm.EventID = "inhibitors-changed"
+	// EvInhibitorWaitTimeout fires when WaitingInhibitors has waited the bounded
+	// time for the modem to drop its inhibitor after being asked to power off.
+	EvInhibitorWaitTimeout librefsm.EventID = "inhibitor-wait-timeout"
 
 	// Last-ditch hibernate check: sent by the service whenever a trigger
 	// input (battery presence/charge, CBB charge, aux voltage, vehicle
@@ -140,6 +143,7 @@ type Actions interface {
 	CanEnterLowPowerState(c *librefsm.Context) bool
 	HasNoBlockingInhibitors(c *librefsm.Context) bool
 	HasOnlyModemInhibitors(c *librefsm.Context) bool
+	CanProceedPastModemWait(c *librefsm.Context) bool
 	IsVehicleNotInStandby(c *librefsm.Context) bool
 	IsTargetNotRun(c *librefsm.Context) bool
 	IsBatteryNotActive(c *librefsm.Context) bool

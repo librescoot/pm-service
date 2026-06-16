@@ -18,6 +18,7 @@ type mockActions struct {
 	lastDitchTriggered        bool
 	hasBlockingInhibitors     bool
 	hasOnlyModemInhibitors    bool
+	canProceedPastModemWait   bool
 	targetNotRun              bool
 	onPowerCommandCount       int
 	onLastDitchTriggeredCount int
@@ -36,6 +37,9 @@ func (m *mockActions) HasNoBlockingInhibitors(c *librefsm.Context) bool {
 }
 func (m *mockActions) HasOnlyModemInhibitors(c *librefsm.Context) bool {
 	return m.hasOnlyModemInhibitors
+}
+func (m *mockActions) CanProceedPastModemWait(c *librefsm.Context) bool {
+	return m.canProceedPastModemWait
 }
 func (m *mockActions) IsVehicleNotInStandby(c *librefsm.Context) bool {
 	return m.vehicleNotInStandby
@@ -975,5 +979,79 @@ func TestRegularWakeUnaffectedByLastDitchGuard(t *testing.T) {
 	}
 	if actions.onLastDitchWakeupCount != 0 {
 		t.Errorf("Expected no OnLastDitchWakeup, count=%d", actions.onLastDitchWakeupCount)
+	}
+}
+
+// TestModemWaitTimeoutProceeds: after the bounded WaitingInhibitors wait, if
+// only the modem (or nothing) still blocks, the FSM proceeds with the
+// transition rather than stalling on a modem that never dropped its inhibitor.
+func TestModemWaitTimeoutProceeds(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:        true,
+		targetSuspend:           true,
+		hasBlockingInhibitors:   true, // don't auto-proceed on EvInhibitorsChanged
+		canProceedPastModemWait: true, // only the modem still blocks
+	}
+
+	def := fsm.NewDefinition(actions, 1*time.Second, 1*time.Second)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvSuspendImminentTimeout})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateWaitingInhibitors) {
+		t.Fatalf("Expected StateWaitingInhibitors, got %v", machine.CurrentState())
+	}
+
+	// Modem never dropped its inhibitor; the bounded wait elapses.
+	machine.Send(librefsm.Event{ID: fsm.EvInhibitorWaitTimeout})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateIssuingLowPower) {
+		t.Errorf("Expected StateIssuingLowPower after modem-wait timeout, got %v", machine.CurrentState())
+	}
+}
+
+// TestModemWaitTimeoutHeldByRealInhibitor: the bounded wait does NOT bypass a
+// genuine block inhibitor (e.g. an OTA install); the FSM keeps waiting.
+func TestModemWaitTimeoutHeldByRealInhibitor(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:        true,
+		targetSuspend:           true,
+		hasBlockingInhibitors:   true,
+		canProceedPastModemWait: false, // a real block inhibitor remains
+	}
+
+	def := fsm.NewDefinition(actions, 1*time.Second, 1*time.Second)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvSuspendImminentTimeout})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateWaitingInhibitors) {
+		t.Fatalf("Expected StateWaitingInhibitors, got %v", machine.CurrentState())
+	}
+
+	machine.Send(librefsm.Event{ID: fsm.EvInhibitorWaitTimeout})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateWaitingInhibitors) {
+		t.Errorf("Expected to stay in StateWaitingInhibitors with a real block inhibitor, got %v", machine.CurrentState())
 	}
 }
