@@ -3,7 +3,6 @@ package systemd
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"time"
 
 	"github.com/godbus/dbus/v5"
@@ -25,8 +24,8 @@ func NewClient() (*Client, error) {
 
 	conn, err := dbus.SystemBus()
 	if err != nil {
-		// No system bus (dev environment): degrade to fire-and-forget
-		// commands. SuspendAndWaitResume then behaves like IssueCommand.
+		// No system bus (dev environment): the client still comes up, but
+		// every power command errors, since logind is the only issue path.
 		return c, nil
 	}
 
@@ -46,24 +45,45 @@ func NewClient() (*Client, error) {
 	return c, nil
 }
 
+// logind D-Bus addressing. We issue power transitions as login1 Manager
+// method calls rather than shelling out to systemctl: logind is the component
+// that actually writes /sys/power/state and emits the PrepareForSleep signal
+// we already wait on, so issuing through it keeps the descent and the wait on
+// the same actor.
+const (
+	login1Dest    = "org.freedesktop.login1"
+	login1Path    = "/org/freedesktop/login1"
+	login1Manager = "org.freedesktop.login1.Manager"
+)
+
+// callLogind invokes a login1 Manager method (Suspend/PowerOff/Reboot) with
+// interactive=false. pm-service runs as root, so logind authorizes these
+// without a polkit prompt. Errors if there is no system bus (dev environment).
+func (c *Client) callLogind(method string) error {
+	if c.conn == nil {
+		return fmt.Errorf("no system bus: cannot call logind %s", method)
+	}
+	obj := c.conn.Object(login1Dest, dbus.ObjectPath(login1Path))
+	if call := obj.Call(login1Manager+"."+method, 0, false); call.Err != nil {
+		return fmt.Errorf("logind %s failed: %w", method, call.Err)
+	}
+	return nil
+}
+
 func (c *Client) IssueCommand(command string) error {
-	var cmd *exec.Cmd
+	var method string
 	switch command {
 	case "suspend":
-		cmd = exec.Command("systemctl", "suspend")
+		method = "Suspend"
 	case "poweroff":
-		cmd = exec.Command("systemctl", "poweroff")
+		method = "PowerOff"
 	case "reboot":
-		cmd = exec.Command("systemctl", "reboot")
+		method = "Reboot"
 	default:
 		return fmt.Errorf("unsupported command: %s", command)
 	}
 
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to execute %s: %v", command, err)
-	}
-
-	return nil
+	return c.callLogind(method)
 }
 
 // SuspendAndWaitResume requests a suspend and blocks until the system has
@@ -73,8 +93,8 @@ func (c *Client) IssueCommand(command string) error {
 // for resume is bounded only by ctx: while suspended this process is frozen,
 // and on thaw the PrepareForSleep(false) broadcast is already queued.
 //
-// Without a logind signal subscription (no system bus), this degrades to the
-// plain IssueCommand behavior and returns once the job is enqueued.
+// Without a logind signal subscription (no system bus) there is nothing to
+// suspend through, so this returns IssueCommand's error.
 func (c *Client) SuspendAndWaitResume(ctx context.Context, enterTimeout time.Duration) error {
 	if c.signals == nil {
 		return c.IssueCommand("suspend")
