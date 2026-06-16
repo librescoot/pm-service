@@ -53,6 +53,11 @@ const (
 	// after requesting a suspend. logind emits it before honoring delay
 	// inhibitors, so this only expires if the suspend job failed outright.
 	suspendEnterTimeout = 15 * time.Second
+
+	// rtcWakeupIRQ is the /sys/power/pm_wakeup_irq value for the RTC/nRF52
+	// wake line. An RTC wake means a timer we armed fired, so we skip the
+	// pre-suspend delay and re-descend via the short imminent path.
+	rtcWakeupIRQ = "45"
 )
 
 type Service struct {
@@ -803,18 +808,6 @@ func (s *Service) targetPowerStateFromContext(c *librefsm.Context) string {
 	return s.fsmData.TargetPowerState
 }
 
-// batteryStateFromContext returns the battery state from the event payload if available,
-// otherwise falls back to fsmData. This ensures guards see the correct state during
-// EvBatteryBecame* transitions before the action has updated fsmData.
-func (s *Service) batteryStateFromContext(c *librefsm.Context) string {
-	if c.Event != nil {
-		if p, ok := c.Event.Payload.(fsm.BatteryStatePayload); ok {
-			return p.State
-		}
-	}
-	return s.fsmData.BatteryState
-}
-
 // Actions interface implementation
 
 func (s *Service) EnterPreSuspend(c *librefsm.Context) error {
@@ -1042,11 +1035,12 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 	}
 	s.delayInhibitorMu.Unlock()
 
-	// Use EvWakeupRTC for RTC wakeup (IRQ 45) to skip pre-suspend delay
+	// Use EvWakeupRTC for an RTC wakeup to skip the pre-suspend delay.
+	// wakeupReason is already TrimSpace'd above.
 	eventID := fsm.EvWakeup
-	if wakeupReason == "45" {
+	if wakeupReason == rtcWakeupIRQ {
 		eventID = fsm.EvWakeupRTC
-		s.logger.Printf("RTC wakeup detected, using fast path")
+		s.logger.Printf("RTC wakeup detected (IRQ %s), using fast path", rtcWakeupIRQ)
 	}
 
 	c.Send(librefsm.Event{
@@ -1099,9 +1093,12 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 			return false
 		}
 
-		// Don't suspend while a battery is actively delivering power.
-		if s.batteryStateFromContext(c) == "active" {
-			s.logger.Printf("Cannot enter suspend state: battery is active")
+		// Don't suspend while EITHER slot is actively delivering power. Read
+		// the OR-aggregate directly, not the per-event payload: an
+		// EvBatteryBecameInactive on one slot must not unblock suspend while
+		// the other slot is still active.
+		if s.fsmData.BatteryState == "active" {
+			s.logger.Printf("Cannot enter suspend state: a battery is active")
 			return false
 		}
 	}
@@ -1449,7 +1446,7 @@ func (s *Service) hasOnlyModemBlockingInhibitors(targetPowerState string) bool {
 			continue
 		}
 		if inh.Type == inhibitor.TypeBlock || inh.Type == inhibitor.TypeSuspendOnly {
-			if inh.Who == "modem-service" {
+			if inh.Who == "librescoot-modem" {
 				hasModemInhibitor = true
 			} else {
 				hasOtherInhibitors = true
