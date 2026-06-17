@@ -388,6 +388,17 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		Transition(StateIssuingLowPower, EvLowPowerIssued, StateSuspended).
 
+		// Abort: EnterIssuingLowPower backs out by sending EvPowerRun when a
+		// last-moment gate fails (the vehicle left stand-by during the blocking
+		// quiesce/suspend commit — when no queued EvVehicleStateChanged can be
+		// processed — or an nRF ACK timed out). Without this transition that
+		// abort would strand the FSM in issuing-low-power. Returning to Running
+		// republishes the "running" power state via the OnStateChange callback,
+		// undoing the "suspending" announce.
+		Transition(StateIssuingLowPower, EvPowerRun, StateRunning,
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+
 		// Last-ditch wake routing: if the trigger condition holds on resume
 		// (e.g. the CBB drained during suspend), go straight to hibernate
 		// instead of re-entering the suspend loop. Declared before the

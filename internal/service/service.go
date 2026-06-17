@@ -875,6 +875,22 @@ func (s *Service) targetPowerStateFromContext(c *librefsm.Context) string {
 	return s.fsmData.TargetPowerState
 }
 
+// liveVehicleInStandby reads vehicle.state straight from Redis instead of
+// fsmData. At the suspend commit point the single FSM goroutine has been
+// blocked since entering issuing-low-power (waiting for the nRF quiesce ACK,
+// then for SuspendAndWaitResume), so an EvVehicleStateChanged that fired in
+// that window is still queued and fsmData.VehicleState is stale. Redis is the
+// only source of ground truth there. On a read error we fall back to the last
+// known state so a transient Redis hiccup can't wedge a legitimate suspend.
+func (s *Service) liveVehicleInStandby() bool {
+	state, err := s.redis.HGet("vehicle", "state")
+	if err != nil {
+		s.logger.Printf("Could not read live vehicle state at suspend commit: %v; using last known %q", err, s.fsmData.VehicleState)
+		return s.fsmData.VehicleState == "stand-by"
+	}
+	return state == "stand-by"
+}
+
 // Actions interface implementation
 
 func (s *Service) EnterPreSuspend(c *librefsm.Context) error {
@@ -991,6 +1007,19 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	// reply drain; on timeout, bail back to running rather than suspend into
 	// the wake loop.
 	if target == "suspend" {
+		// Ground-truth gate before we announce and commit: only stand-by may
+		// suspend. The event loop has been blocked since we entered this state,
+		// so a vehicle that left stand-by (parked/drive/hop-on) still has its
+		// EvVehicleStateChanged queued and fsmData is stale — read Redis.
+		if !s.liveVehicleInStandby() {
+			s.logger.Printf("Aborting suspend before announce: vehicle no longer in stand-by")
+			s.fsmData.LowPowerStateIssued = false
+			c.Send(librefsm.Event{
+				ID:      fsm.EvPowerRun,
+				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
+			})
+			return nil
+		}
 		select {
 		case <-s.suspendQuiesceAcks:
 		default:
@@ -1016,6 +1045,19 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	s.logger.Printf("Issuing %s command", target)
 
 	if target == "suspend" {
+		// Re-check ground truth one last time: the quiesce-ACK wait above
+		// blocked the event loop, so a parked/drive/hop-on transition that
+		// raced the commit is still unprocessed. Abort rather than suspend out
+		// of a non-stand-by state.
+		if !s.liveVehicleInStandby() {
+			s.logger.Printf("Aborting suspend after quiesce: vehicle left stand-by")
+			s.fsmData.LowPowerStateIssued = false
+			c.Send(librefsm.Event{
+				ID:      fsm.EvPowerRun,
+				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
+			})
+			return nil
+		}
 		// Block on logind's PrepareForSleep cycle so the return only means
 		// "the system slept and resumed". `systemctl suspend` alone returns
 		// when the job is enqueued, which used to make the FSM read a stale

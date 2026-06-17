@@ -1055,3 +1055,49 @@ func TestModemWaitTimeoutHeldByRealInhibitor(t *testing.T) {
 		t.Errorf("Expected to stay in StateWaitingInhibitors with a real block inhibitor, got %v", machine.CurrentState())
 	}
 }
+
+// TestIssuingLowPowerAbortReturnsToRunning verifies that EnterIssuingLowPower's
+// last-moment abort (sending EvPowerRun when the vehicle left stand-by during
+// the blocking suspend commit) actually returns the FSM to Running instead of
+// stranding it in issuing-low-power.
+func TestIssuingLowPowerAbortReturnsToRunning(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: true,
+		targetSuspend:    true,
+	}
+
+	def := fsm.NewDefinition(actions, 100*time.Millisecond, 100*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	// Drive to IssuingLowPower: explicit suspend -> imminent -> waiting
+	// inhibitors (none blocking) -> issuing-low-power.
+	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvSuspendImminentTimeout})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvInhibitorsChanged})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateIssuingLowPower) {
+		t.Fatalf("Expected StateIssuingLowPower, got %v", machine.CurrentState())
+	}
+
+	// The abort path inside EnterIssuingLowPower sends EvPowerRun; it must
+	// return us to Running rather than no-op and strand the FSM.
+	machine.Send(librefsm.Event{
+		ID:      fsm.EvPowerRun,
+		Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
+	})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateRunning) {
+		t.Errorf("Expected StateRunning after EvPowerRun abort, got %v", machine.CurrentState())
+	}
+}
