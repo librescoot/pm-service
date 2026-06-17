@@ -42,6 +42,17 @@ const (
 	// still hibernates — just not within the first 5 minutes of boot.
 	lastDitchHibernateBootGrace = 5 * time.Minute
 
+	// lastDitchTelemetryWait bounds how long a wake that is about to re-suspend
+	// (no usable main battery) waits for post-resume aux/CBB telemetry before
+	// the last-ditch guard runs. The realtime stream is off during suspend, so
+	// the values latched before suspend are stale; the nRF's 4h re-check wake
+	// force-sends a fresh aux+CBB snapshot and we wait for it to land — detected
+	// as a change from the pre-suspend reading — so the hibernate decision uses
+	// post-resume data. Bounded so an unchanged reading (or a wake the nRF did
+	// not source telemetry for) still proceeds promptly.
+	lastDitchTelemetryWait = 3 * time.Second
+	lastDitchTelemetryPoll = 200 * time.Millisecond
+
 	// suspendQuiesceTimeout bounds the wait for bluetooth-service's confirm
 	// that the nRF52 was told we are suspending; on expiry the suspend is
 	// aborted (staying awake beats the suspend/wake loop).
@@ -534,10 +545,18 @@ func (s *Service) onCBBatteryChargeChanged(v string) error {
 func (s *Service) onAuxVoltageChanged(v string) error {
 	mv := parseNonNegativeInt(v)
 	s.lastDitchMu.Lock()
+	s.setAuxVoltageLocked(mv)
+	s.lastDitchMu.Unlock()
+	s.sendLastDitchCheck()
+	return nil
+}
+
+// setAuxVoltageLocked records the aux voltage and updates the Schmitt latch:
+// latch below the enter threshold, release above the exit threshold. Kept out
+// of the guard so the guard stays read-only no matter how often the FSM
+// evaluates it. Callers must hold lastDitchMu.
+func (s *Service) setAuxVoltageLocked(mv int) {
 	s.auxVoltageMv = mv
-	// Aux Schmitt trigger: latch below the enter threshold, release above
-	// the exit threshold. Updated here (not in the guard) so the guard
-	// stays read-only no matter how often the FSM evaluates it.
 	if mv >= 0 {
 		if s.auxLowLatched {
 			if mv >= lastDitchHibernateAuxExitMv {
@@ -547,9 +566,6 @@ func (s *Service) onAuxVoltageChanged(v string) error {
 			s.auxLowLatched = true
 		}
 	}
-	s.lastDitchMu.Unlock()
-	s.sendLastDitchCheck()
-	return nil
 }
 
 // lastDitchTriggeredLocked reports whether the last-ditch hibernate condition
@@ -612,6 +628,57 @@ func (s *Service) IsLastDitchTriggered(c *librefsm.Context) bool {
 	s.lastDitchMu.Lock()
 	defer s.lastDitchMu.Unlock()
 	return s.lastDitchTriggeredLocked()
+}
+
+// awaitFreshTelemetryForLastDitch waits, up to lastDitchTelemetryWait, for a
+// post-resume CB-battery or aux-voltage sample to land in Redis, then applies
+// the freshest readings to the last-ditch state. Called on a wake that is about
+// to re-suspend with no usable main battery, so IsLastDitchTriggered decides on
+// post-resume values rather than the ones latched before suspend (the realtime
+// stream is off while suspended, so the in-memory values are stale).
+//
+// Freshness is detected as a change from the pre-suspend reading: a drain during
+// suspend moves the value, which is exactly the case where deciding on stale
+// data would be wrong. If nothing changed within the window, the prior reading
+// was still representative and proceeding is safe. Re-reads Redis directly so it
+// does not depend on the field watcher firing for an unchanged value.
+func (s *Service) awaitFreshTelemetryForLastDitch() {
+	s.lastDitchMu.Lock()
+	preCBB := s.cbBatteryCharge
+	preAux := s.auxVoltageMv
+	s.lastDitchMu.Unlock()
+
+	deadline := time.Now().Add(lastDitchTelemetryWait)
+	for {
+		cbb := preCBB
+		if v, err := s.redis.HGet("cb-battery", "charge"); err == nil && v != "" {
+			cbb = parseChargeOrUnknown(v)
+		}
+		aux := preAux
+		if v, err := s.redis.HGet("aux-battery", "voltage"); err == nil && v != "" {
+			aux = parseNonNegativeInt(v)
+		}
+
+		changed := cbb != preCBB || aux != preAux
+		if changed || !time.Now().Before(deadline) {
+			s.lastDitchMu.Lock()
+			s.cbBatteryCharge = cbb
+			s.setAuxVoltageLocked(aux)
+			s.lastDitchMu.Unlock()
+			if changed {
+				s.logger.Printf("Fresh telemetry before last-ditch check: CBB %d%%->%d%%, aux %dmV->%dmV", preCBB, cbb, preAux, aux)
+			} else {
+				s.logger.Printf("No telemetry change within %v before last-ditch check; using CBB %d%%, aux %dmV", lastDitchTelemetryWait, cbb, aux)
+			}
+			return
+		}
+
+		select {
+		case <-time.After(lastDitchTelemetryPoll):
+		case <-s.ctx.Done():
+			return
+		}
+	}
 }
 
 // logLastDitchTrigger reports which reserve ran low when the trigger fires.
@@ -1018,6 +1085,22 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 	s.fsmData.ModemDisabled = false
 
 	s.logger.Printf("Wakeup detected with reason: %s", wakeupReason)
+
+	// If this wake is headed back into suspend with no usable main battery,
+	// the last-ditch hibernate guard must see post-resume aux/CBB rather than
+	// the values latched before suspend. The nRF's 4h re-check wake force-sends
+	// a fresh aux+CBB snapshot; wait briefly for it before routing the wake.
+	// Wakes with a battery present (or not targeting suspend) can't trip the
+	// last-ditch guard and skip the wait to stay responsive.
+	if s.fsmData.TargetPowerState == fsm.TargetSuspend {
+		s.lastDitchMu.Lock()
+		bothSlotsMissing := (!s.battery0Present || s.battery0Charge == 0) &&
+			(!s.battery1Present || s.battery1Charge == 0)
+		s.lastDitchMu.Unlock()
+		if bothSlotsMissing {
+			s.awaitFreshTelemetryForLastDitch()
+		}
+	}
 
 	// Cancel any pending delay inhibitor removal and re-add if needed
 	s.delayInhibitorMu.Lock()
