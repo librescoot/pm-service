@@ -891,6 +891,72 @@ func (s *Service) liveVehicleInStandby() bool {
 	return state == "stand-by"
 }
 
+// liveBatteryActive reads both main-battery slots' state straight from Redis
+// rather than trusting fsmData.BatteryState. fsmData is maintained purely from
+// battery:0/battery:1 pub/sub notifications, which are dropped while we are
+// suspended (the process is frozen and the Redis link drops). Redis pub/sub
+// does not replay missed messages and there is no re-sync on reconnect, so a
+// battery that went active during suspend leaves fsmData stale indefinitely —
+// and the stale value would let a still-active scooter suspend. Reading the
+// slots live closes that gap at every decision point. On a per-slot read error
+// we fall back to that slot's last-known fsmData value so a transient Redis
+// hiccup can't wedge a legitimate suspend.
+func (s *Service) liveBatteryActive() bool {
+	slot0 := s.fsmData.Battery0State
+	if v, err := s.redis.HGet("battery:0", "state"); err == nil {
+		slot0 = v
+	} else {
+		s.logger.Printf("Could not read live battery:0 state: %v; using last known %q", err, s.fsmData.Battery0State)
+	}
+	slot1 := s.fsmData.Battery1State
+	if v, err := s.redis.HGet("battery:1", "state"); err == nil {
+		slot1 = v
+	} else {
+		s.logger.Printf("Could not read live battery:1 state: %v; using last known %q", err, s.fsmData.Battery1State)
+	}
+	return slot0 == "active" || slot1 == "active"
+}
+
+// refreshBatteryStateFromRedis re-seeds the in-memory battery view (per-slot
+// state, presence, charge and the derived aggregate) from Redis, mirroring the
+// startup sync. Called on wake from suspend because the pub/sub watchers can
+// miss every battery update published while we were frozen, leaving fsmData
+// stale until the battery next happens to change state. Runs on the FSM
+// goroutine (from handleWakeupAfterSuspend), so writes to fsmData are safe;
+// the last-ditch inputs are taken under lastDitchMu.
+func (s *Service) refreshBatteryStateFromRedis() {
+	if v, err := s.redis.HGet("battery:0", "state"); err == nil && v != "" {
+		s.fsmData.Battery0State = v
+	}
+	if v, err := s.redis.HGet("battery:1", "state"); err == nil && v != "" {
+		s.fsmData.Battery1State = v
+	}
+	if s.fsmData.Battery0State == "active" || s.fsmData.Battery1State == "active" {
+		s.fsmData.BatteryState = "active"
+	} else if s.fsmData.BatteryState == "active" {
+		// Both slots now non-active; clear the stale aggregate.
+		s.fsmData.BatteryState = s.fsmData.Battery0State
+	}
+
+	s.lastDitchMu.Lock()
+	if v, err := s.redis.HGet("battery:0", "present"); err == nil && v != "" {
+		s.battery0Present = parseBool(v)
+	}
+	if v, err := s.redis.HGet("battery:1", "present"); err == nil && v != "" {
+		s.battery1Present = parseBool(v)
+	}
+	if v, err := s.redis.HGet("battery:0", "charge"); err == nil && v != "" {
+		s.battery0Charge = parseChargeOrUnknown(v)
+	}
+	if v, err := s.redis.HGet("battery:1", "charge"); err == nil && v != "" {
+		s.battery1Charge = parseChargeOrUnknown(v)
+	}
+	s.lastDitchMu.Unlock()
+
+	s.logger.Printf("Battery state re-synced after wake: slot0=%s slot1=%s (any active: %v)",
+		s.fsmData.Battery0State, s.fsmData.Battery1State, s.fsmData.BatteryState == "active")
+}
+
 // Actions interface implementation
 
 func (s *Service) EnterPreSuspend(c *librefsm.Context) error {
@@ -1058,6 +1124,19 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 			})
 			return nil
 		}
+		// Same ground-truth re-check for the batteries: a slot that went active
+		// while the FSM was blocked on the quiesce ACK would otherwise be
+		// suspended out from under an active scooter, and its EvBatteryBecameActive
+		// cancel is still queued behind this commit.
+		if s.liveBatteryActive() {
+			s.logger.Printf("Aborting suspend after quiesce: a battery is active")
+			s.fsmData.LowPowerStateIssued = false
+			c.Send(librefsm.Event{
+				ID:      fsm.EvPowerRun,
+				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
+			})
+			return nil
+		}
 		// Block on logind's PrepareForSleep cycle so the return only means
 		// "the system slept and resumed". `systemctl suspend` alone returns
 		// when the job is enqueued, which used to make the FSM read a stale
@@ -1127,6 +1206,13 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 	s.fsmData.ModemDisabled = false
 
 	s.logger.Printf("Wakeup detected with reason: %s", wakeupReason)
+
+	// Re-seed battery state from Redis: any battery:0/battery:1 notification
+	// published while we were frozen was dropped by the pub/sub watchers and
+	// will never be replayed, so fsmData is stale on wake. Without this a
+	// battery that went active during suspend would still read as inactive and
+	// the next stand-by would suspend an active scooter.
+	s.refreshBatteryStateFromRedis()
 
 	// If this wake is headed back into suspend with no usable main battery,
 	// the last-ditch hibernate guard must see post-resume aux/CBB rather than
@@ -1219,10 +1305,13 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 		}
 
 		// Don't suspend while EITHER slot is actively delivering power. Read
-		// the OR-aggregate directly, not the per-event payload: an
-		// EvBatteryBecameInactive on one slot must not unblock suspend while
-		// the other slot is still active.
-		if s.fsmData.BatteryState == "active" {
+		// the slots live from Redis rather than the fsmData aggregate: the
+		// aggregate is fed only by pub/sub, which is lost across a suspend
+		// freeze, so a battery that went active during suspend would otherwise
+		// read as inactive and let an active scooter suspend. The live read
+		// also covers the per-event case — an EvBatteryBecameInactive on one
+		// slot must not unblock suspend while the other slot is still active.
+		if s.liveBatteryActive() {
 			s.logger.Printf("Cannot enter suspend state: a battery is active")
 			return false
 		}
