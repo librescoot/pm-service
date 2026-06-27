@@ -118,9 +118,12 @@ type Service struct {
 	wakeTimerAckTimeoutOver time.Duration
 
 	// Setting A ("keep online scooters reachable"): suspendWhenOnline
-	// (pm.suspend-when-online) gates whether a locked scooter with a main
-	// battery inserted may suspend while online; online mirrors
-	// internet.status == "connected". Both guarded by settingsMu.
+	// (pm.suspend-when-online) only matters when no main battery is present.
+	// With a battery present/active we never suspend regardless. With no
+	// battery, the default (false) keeps an online scooter awake so cloud
+	// commands can still reach it; setting it true allows suspend without a
+	// main battery even while online. online mirrors internet.status ==
+	// "connected". Both guarded by settingsMu.
 	suspendWhenOnline bool
 	online            bool
 
@@ -917,6 +920,31 @@ func (s *Service) liveBatteryActive() bool {
 	return slot0 == "active" || slot1 == "active"
 }
 
+// liveBatteryPresent reads both main-battery slots' present flag straight from
+// Redis, mirroring liveBatteryActive. The cached battery0Present/battery1Present
+// flags are maintained purely from battery:0/battery:1 pub/sub, which is dropped
+// while we are suspended, so a pack inserted or removed during a freeze would
+// leave them stale. On a per-slot read error we fall back to that slot's
+// last-known cached value (which defaults to true before first sync, so an
+// unknown slot errs toward staying awake rather than suspending in-service).
+func (s *Service) liveBatteryPresent() bool {
+	s.lastDitchMu.Lock()
+	slot0 := s.battery0Present
+	slot1 := s.battery1Present
+	s.lastDitchMu.Unlock()
+	if v, err := s.redis.HGet("battery:0", "present"); err == nil && v != "" {
+		slot0 = parseBool(v)
+	} else if err != nil {
+		s.logger.Printf("Could not read live battery:0 present: %v; using last known %v", err, slot0)
+	}
+	if v, err := s.redis.HGet("battery:1", "present"); err == nil && v != "" {
+		slot1 = parseBool(v)
+	} else if err != nil {
+		s.logger.Printf("Could not read live battery:1 present: %v; using last known %v", err, slot1)
+	}
+	return slot0 || slot1
+}
+
 // refreshBatteryStateFromRedis re-seeds the in-memory battery view (per-slot
 // state, presence, charge and the derived aggregate) from Redis, mirroring the
 // startup sync. Called on wake from suspend because the pub/sub watchers can
@@ -1287,32 +1315,32 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 	}
 
 	if targetState == fsm.TargetSuspend {
-		// Setting A: keep online, in-service scooters reachable. If
-		// pm.suspend-when-online is off and a main battery is inserted while we
-		// have internet connectivity, stay awake so cloud commands can still
-		// reach us. Checked before the battery-active guard so the operator sees
-		// the connectivity reason.
+		// A main battery in either slot keeps us out of suspend by default:
+		// with a pack present (or actively delivering power) there is power to
+		// spare, so we stay reachable in stand-by and let the hibernation timer
+		// handle long-term power-down rather than suspending. Read both present
+		// and active live from Redis rather than the fsmData aggregate: it is
+		// fed only by pub/sub, which is lost across a suspend freeze, so a
+		// battery that appeared or went active while we were frozen would
+		// otherwise read stale and let an in-service scooter suspend. The live
+		// read also covers the per-event case — an EvBatteryBecameInactive on
+		// one slot must not unblock suspend while the other is still in use.
+		if s.liveBatteryPresent() || s.liveBatteryActive() {
+			s.logger.Printf("Cannot enter suspend state: a main battery is present or active")
+			return false
+		}
+
+		// No main battery present. Suspend to conserve, unless we want to keep
+		// an online scooter reachable: when pm.suspend-when-online is off (the
+		// default) and we still have a WWAN/internet connection, stay awake so
+		// cloud commands can reach us. Setting it true allows suspend without a
+		// main battery even while online.
 		s.settingsMu.Lock()
 		suspendWhenOnline := s.suspendWhenOnline
 		online := s.online
 		s.settingsMu.Unlock()
-		s.lastDitchMu.Lock()
-		batteryPresent := s.battery0Present || s.battery1Present
-		s.lastDitchMu.Unlock()
-		if !suspendWhenOnline && online && batteryPresent {
-			s.logger.Printf("Suspend blocked: online with a main battery present and pm.suspend-when-online disabled")
-			return false
-		}
-
-		// Don't suspend while EITHER slot is actively delivering power. Read
-		// the slots live from Redis rather than the fsmData aggregate: the
-		// aggregate is fed only by pub/sub, which is lost across a suspend
-		// freeze, so a battery that went active during suspend would otherwise
-		// read as inactive and let an active scooter suspend. The live read
-		// also covers the per-event case — an EvBatteryBecameInactive on one
-		// slot must not unblock suspend while the other slot is still active.
-		if s.liveBatteryActive() {
-			s.logger.Printf("Cannot enter suspend state: a battery is active")
+		if !suspendWhenOnline && online {
+			s.logger.Printf("Suspend blocked: no main battery but online and pm.suspend-when-online disabled")
 			return false
 		}
 	}
@@ -1847,9 +1875,11 @@ func (s *Service) onScheduledHibernateEnabledSetting(value string) error {
 	return nil
 }
 
-// onSuspendWhenOnlineSetting absorbs pm.suspend-when-online. When false (the
-// default), a locked scooter with a main battery inserted will not suspend
-// while it has internet connectivity, so it stays reachable.
+// onSuspendWhenOnlineSetting absorbs pm.suspend-when-online. It only matters
+// when no main battery is present (a present/active pack always blocks suspend).
+// When false (the default), a locked scooter with no main battery stays awake
+// while it has internet connectivity, so it remains reachable. When true, such
+// a scooter is allowed to suspend even while online.
 func (s *Service) onSuspendWhenOnlineSetting(value string) error {
 	s.settingsMu.Lock()
 	s.suspendWhenOnline = (value == "true")
