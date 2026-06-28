@@ -103,7 +103,10 @@ func (m *Manager) handleConnection(conn net.Conn) {
 	m.inhibitors[conn] = inhibitor
 	m.mutex.Unlock()
 
-	m.logger.Printf("New inhibitor connected: %s", conn.RemoteAddr())
+	// Connection-based inhibitors are anonymous and high-churn (e.g.
+	// battery-service opens one per NFC write), so we don't log each
+	// connect/disconnect. Their effect is still visible via onChange ->
+	// power-manager:busy-services. Named inhibitors log in Add/RemoveInhibitor.
 	if m.onChange != nil {
 		m.onChange()
 	}
@@ -120,7 +123,6 @@ func (m *Manager) handleConnection(conn net.Conn) {
 	delete(m.inhibitors, conn)
 	m.mutex.Unlock()
 
-	m.logger.Printf("Inhibitor disconnected: %s", conn.RemoteAddr())
 	if m.onChange != nil {
 		m.onChange()
 	}
