@@ -120,10 +120,9 @@ type Service struct {
 	// Setting A ("keep online scooters reachable"): suspendWhenOnline
 	// (pm.suspend-when-online) only matters when no main battery is present.
 	// With a battery present/active we never suspend regardless. With no
-	// battery, the default (false) keeps an online scooter awake so cloud
-	// commands can still reach it; setting it true allows suspend without a
-	// main battery even while online. online mirrors internet.status ==
-	// "connected". Both guarded by settingsMu.
+	// battery, the default (true) allows suspend even while online; setting it
+	// false keeps an online scooter awake so cloud commands can still reach it.
+	// online mirrors internet.status == "connected". Both guarded by settingsMu.
 	suspendWhenOnline bool
 	online            bool
 
@@ -173,6 +172,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		busyServicesPub:    redisClient.NewHashPublisher("power-manager:busy-services"),
 		wakeTimerAcks:      make(chan bool, 1),
 		suspendQuiesceAcks: make(chan struct{}, 1),
+		suspendWhenOnline:  true,
 		cbBatteryCharge:    -1,
 		battery0Present:    true,
 		battery1Present:    true,
@@ -1330,11 +1330,10 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 			return false
 		}
 
-		// No main battery present. Suspend to conserve, unless we want to keep
-		// an online scooter reachable: when pm.suspend-when-online is off (the
-		// default) and we still have a WWAN/internet connection, stay awake so
-		// cloud commands can reach us. Setting it true allows suspend without a
-		// main battery even while online.
+		// No main battery present. Suspend to conserve (the default) even while
+		// online. Only when pm.suspend-when-online is explicitly off and we
+		// still have a WWAN/internet connection do we stay awake so cloud
+		// commands can reach us.
 		s.settingsMu.Lock()
 		suspendWhenOnline := s.suspendWhenOnline
 		online := s.online
