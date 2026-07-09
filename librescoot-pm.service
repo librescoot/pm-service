@@ -1,10 +1,10 @@
 [Unit]
 Description=Librescoot Power Management Service
-After=redis.service
+After=valkey.service
 After=librescoot-vehicle.service
 After=librescoot-battery.service
 After=librescoot-settings.service
-Requires=redis.service
+Requires=valkey.service
 
 [Service]
 Type=simple
