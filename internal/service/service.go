@@ -451,7 +451,9 @@ func (s *Service) Run(ctx context.Context) error {
 	<-ctx.Done()
 
 	// Cleanup
-	s.machine.Stop()
+	if err := s.machine.Stop(); err != nil {
+		s.logger.Printf("Failed to stop state machine: %v", err)
+	}
 	s.hibernationTimer.Close()
 	if s.scheduler != nil {
 		s.scheduler.Close()
@@ -846,7 +848,9 @@ func (s *Service) onGovernorCommand(governor string) error {
 
 	switch governor {
 	case "ondemand", "powersave", "performance":
-		s.setGovernor(governor)
+		// setGovernor logs its own failure; there is no further action to
+		// take here beyond what it already reports.
+		_ = s.setGovernor(governor)
 	default:
 		s.logger.Printf("Invalid governor command: %s", governor)
 	}
@@ -1445,7 +1449,10 @@ func (s *Service) OnWakeup(c *librefsm.Context) error {
 	if payload, ok := c.Event.Payload.(fsm.WakeupPayload); ok {
 		s.publishWakeupSource(payload.Reason)
 	}
-	s.publishState("running")
+	// publishState logs its own failure. Returning it here would only reach
+	// the FSM's async event loop, which drops action errors silently, so
+	// the log line above is the only place this failure is ever visible.
+	_ = s.publishState("running")
 	return nil
 }
 

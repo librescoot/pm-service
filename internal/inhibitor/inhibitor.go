@@ -87,7 +87,9 @@ func (m *Manager) acceptConnections() {
 func (m *Manager) handleConnection(conn net.Conn) {
 	if _, err := conn.Write([]byte{0}); err != nil {
 		m.logger.Printf("Failed to send acknowledgment: %v", err)
-		conn.Close()
+		if closeErr := conn.Close(); closeErr != nil {
+			m.logger.Printf("Failed to close inhibitor connection: %v", closeErr)
+		}
 		return
 	}
 
@@ -127,7 +129,9 @@ func (m *Manager) handleConnection(conn net.Conn) {
 		m.onChange()
 	}
 
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		m.logger.Printf("Failed to close inhibitor connection: %v", err)
+	}
 }
 
 func (m *Manager) AddInhibitor(who, what, why string, inhibitType InhibitorType) *Inhibitor {
@@ -219,7 +223,9 @@ func (m *Manager) Close() error {
 
 	m.mutex.Lock()
 	for conn := range m.inhibitors {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			m.logger.Printf("Failed to close inhibitor connection: %v", err)
+		}
 	}
 	m.inhibitors = make(map[net.Conn]*Inhibitor)
 	m.mutex.Unlock()

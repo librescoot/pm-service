@@ -34,7 +34,10 @@ func NewClient() (*Client, error) {
 		dbus.WithMatchMember("PrepareForSleep"),
 		dbus.WithMatchObjectPath("/org/freedesktop/login1"),
 	); err != nil {
-		conn.Close()
+		// conn is being abandoned in favor of the degraded (no system bus)
+		// client below; a failure to close it has no effect on that outcome,
+		// and this constructor has no logger to report it through.
+		_ = conn.Close()
 		return c, nil
 	}
 
