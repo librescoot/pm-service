@@ -629,10 +629,67 @@ func (s *Service) sendLastDitchCheck() {
 
 // IsLastDitchTriggered is the FSM guard for EvLastDitchCheck transitions and
 // the last-ditch wake routing.
+//
+// Re-reads the inputs from Redis first. The in-memory copies are maintained by
+// hash watchers, which are driven by an explicit publish from the service that
+// owns each hash: a plain HSET notifies nobody, and a publisher that has died
+// or restarted stops refreshing them entirely. Deciding to cut power on values
+// no publisher has confirmed for an unknown length of time is not a decision
+// worth making from cache.
 func (s *Service) IsLastDitchTriggered(c *librefsm.Context) bool {
+	s.refreshLastDitchInputs()
+
 	s.lastDitchMu.Lock()
 	defer s.lastDitchMu.Unlock()
 	return s.lastDitchTriggeredLocked()
+}
+
+// refreshLastDitchInputs re-reads the battery and reserve values the last-ditch
+// decision rests on, and applies them to the in-memory state.
+//
+// Reads happen before the lock is taken: the point is to avoid holding
+// lastDitchMu across Redis round trips on a path the FSM calls synchronously.
+// A field that is missing or unreadable keeps its current value rather than
+// being treated as absent, so a Redis hiccup cannot manufacture the very
+// condition that cuts power.
+func (s *Service) refreshLastDitchInputs() {
+	type reading struct {
+		value string
+		ok    bool
+	}
+	read := func(hash, field string) reading {
+		v, err := s.redis.HGet(hash, field)
+		return reading{value: v, ok: err == nil && v != ""}
+	}
+
+	b0Present := read("battery:0", "present")
+	b1Present := read("battery:1", "present")
+	b0Charge := read("battery:0", "charge")
+	b1Charge := read("battery:1", "charge")
+	cbb := read("cb-battery", "charge")
+	aux := read("aux-battery", "voltage")
+
+	s.lastDitchMu.Lock()
+	defer s.lastDitchMu.Unlock()
+
+	if b0Present.ok {
+		s.battery0Present = parseBool(b0Present.value)
+	}
+	if b1Present.ok {
+		s.battery1Present = parseBool(b1Present.value)
+	}
+	if b0Charge.ok {
+		s.battery0Charge = parseChargeOrUnknown(b0Charge.value)
+	}
+	if b1Charge.ok {
+		s.battery1Charge = parseChargeOrUnknown(b1Charge.value)
+	}
+	if cbb.ok {
+		s.cbBatteryCharge = parseChargeOrUnknown(cbb.value)
+	}
+	if aux.ok {
+		s.setAuxVoltageLocked(parseNonNegativeInt(aux.value))
+	}
 }
 
 // awaitFreshTelemetryForLastDitch waits, up to lastDitchTelemetryWait, for a
