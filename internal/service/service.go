@@ -122,7 +122,10 @@ type Service struct {
 	// With a battery present/active we never suspend regardless. With no
 	// battery, the default (true) allows suspend even while online; setting it
 	// false keeps an online scooter awake so cloud commands can still reach it.
-	// online mirrors internet.status == "connected". Both guarded by settingsMu.
+	// online mirrors internet.connectivity == "connected", modem-service's view
+	// of the data session: an inbound command needs the session to be up, which
+	// is not the same question as modem-service's outbound reachability probe in
+	// internet.status. Both guarded by settingsMu.
 	suspendWhenOnline bool
 	online            bool
 
@@ -244,7 +247,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// Seed online state before the first low-power evaluation so the
 	// suspend-when-online guard takes effect immediately (the internet watcher
 	// only syncs later).
-	if v, err := s.redis.HGet("internet", "status"); err == nil && v != "" {
+	if v, err := s.redis.HGet("internet", "connectivity"); err == nil && v != "" {
 		s.online = (v == "connected")
 	}
 	if v, err := s.redis.HGet("battery:0", "charge"); err == nil && v != "" {
@@ -388,7 +391,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if err := s.redis.NewHashWatcher("internet").
-		OnField("status", s.onInternetStatusChanged).
+		OnField("connectivity", s.onInternetConnectivityChanged).
 		StartWithSync(); err != nil {
 		return fmt.Errorf("failed to start internet watcher: %v", err)
 	}
@@ -1335,14 +1338,10 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 		}
 
 		// No main battery present. Suspend to conserve (the default) even while
-		// online. Only when pm.suspend-when-online is explicitly off and we
-		// still have a WWAN/internet connection do we stay awake so cloud
-		// commands can reach us.
-		s.settingsMu.Lock()
-		suspendWhenOnline := s.suspendWhenOnline
-		online := s.online
-		s.settingsMu.Unlock()
-		if !suspendWhenOnline && online {
+		// online. Only when pm.suspend-when-online is explicitly off and the
+		// modem's data session is still up do we stay awake so cloud commands
+		// can reach us.
+		if s.suspendBlockedWhileOnline() {
 			s.logger.Printf("Suspend blocked: no main battery but online and pm.suspend-when-online disabled")
 			return false
 		}
@@ -1883,9 +1882,9 @@ func (s *Service) onScheduledHibernateEnabledSetting(value string) error {
 
 // onSuspendWhenOnlineSetting absorbs pm.suspend-when-online. It only matters
 // when no main battery is present (a present/active pack always blocks suspend).
-// When false (the default), a locked scooter with no main battery stays awake
-// while it has internet connectivity, so it remains reachable. When true, such
-// a scooter is allowed to suspend even while online.
+// When true (the default), a locked scooter with no main battery is allowed to
+// suspend even while online. When false it stays awake while the data session
+// is up, so it remains reachable.
 func (s *Service) onSuspendWhenOnlineSetting(value string) error {
 	s.settingsMu.Lock()
 	s.suspendWhenOnline = (value == "true")
@@ -1893,14 +1892,26 @@ func (s *Service) onSuspendWhenOnlineSetting(value string) error {
 	return nil
 }
 
-// onInternetStatusChanged tracks whether we currently have internet
-// connectivity (internet.status == "connected"), consumed by the
-// suspend-when-online guard.
-func (s *Service) onInternetStatusChanged(value string) error {
+// onInternetConnectivityChanged tracks whether the modem's data session is up
+// (internet.connectivity == "connected"), consumed by the suspend-when-online
+// guard. Only "connected" counts as online: every other classifier state, and
+// the empty value the field carries before modem-service's first
+// classification or when modem-service is not running at all, says we have no
+// evidence of a usable session, and holding a battery-less scooter awake on a
+// missing measurement drains the aux and CBB for nothing.
+func (s *Service) onInternetConnectivityChanged(value string) error {
 	s.settingsMu.Lock()
 	s.online = (value == "connected")
 	s.settingsMu.Unlock()
 	return nil
+}
+
+// suspendBlockedWhileOnline reports whether the pm.suspend-when-online guard
+// currently holds suspend off.
+func (s *Service) suspendBlockedWhileOnline() bool {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	return !s.suspendWhenOnline && s.online
 }
 
 // onScheduledHibernateCronSetting passes a new cron expression to the scheduler.
