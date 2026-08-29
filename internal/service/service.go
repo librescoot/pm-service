@@ -1150,6 +1150,13 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 		return fmt.Errorf("unsupported power state: %s", s.fsmData.TargetPowerState)
 	}
 
+	// Close the race between the initial inhibitor gate and the systemd call.
+	if s.inhibitorManager.HasBlockingInhibitors(s.fsmData.TargetPowerState) {
+		s.logger.Printf("Blocking inhibitor appeared before issuing %s; returning to inhibitor wait", target)
+		c.Send(librefsm.Event{ID: fsm.EvLateBlockingInhibitor})
+		return nil
+	}
+
 	s.fsmData.LowPowerStateIssued = true
 
 	// Before suspending, announce the suspending state and wait until

@@ -40,6 +40,8 @@ const (
 
 	// Inhibitor events
 	EvInhibitorsChanged librefsm.EventID = "inhibitors-changed"
+	// A block appeared after the initial inhibitor gate.
+	EvLateBlockingInhibitor librefsm.EventID = "late-blocking-inhibitor"
 	// EvInhibitorWaitTimeout fires when WaitingInhibitors has waited the bounded
 	// time for the modem to drop its inhibitor after being asked to power off.
 	EvInhibitorWaitTimeout librefsm.EventID = "inhibitor-wait-timeout"

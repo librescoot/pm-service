@@ -388,6 +388,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		Transition(StateIssuingLowPower, EvLowPowerIssued, StateSuspended).
 
+		// Retry the inhibitor gate without losing the requested target.
+		Transition(StateIssuingLowPower, EvLateBlockingInhibitor, StateWaitingInhibitors).
+
 		// Abort: EnterIssuingLowPower backs out by sending EvPowerRun when a
 		// last-moment gate fails (the vehicle left stand-by during the blocking
 		// quiesce/suspend commit — when no queued EvVehicleStateChanged can be

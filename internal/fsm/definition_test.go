@@ -73,8 +73,8 @@ func (m *mockActions) OnLastDitchWakeup(c *librefsm.Context) error {
 	return nil
 }
 func (m *mockActions) OnDefaultStateChanged(c *librefsm.Context) error { return nil }
-func (m *mockActions) PublishState(state string) error         { return nil }
-func (m *mockActions) PublishWakeupSource(reason string) error { return nil }
+func (m *mockActions) PublishState(state string) error                 { return nil }
+func (m *mockActions) PublishWakeupSource(reason string) error         { return nil }
 
 // TestExplicitSuspendSkipsPreDelay verifies that an explicit suspend command
 // goes directly to SuspendImminent (skipping the pre-suspend delay).
@@ -1060,6 +1060,51 @@ func TestModemWaitTimeoutHeldByRealInhibitor(t *testing.T) {
 // last-moment abort (sending EvPowerRun when the vehicle left stand-by during
 // the blocking suspend commit) actually returns the FSM to Running instead of
 // stranding it in issuing-low-power.
+func TestLateBlockingInhibitorReturnsToWaitAndResumes(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower: true,
+		targetSuspend:    true,
+	}
+
+	def := fsm.NewDefinition(actions, 100*time.Millisecond, 100*time.Millisecond)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	if err := machine.Start(context.Background()); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvPowerSuspend})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvSuspendImminentTimeout})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvInhibitorsChanged})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateIssuingLowPower) {
+		t.Fatalf("Expected StateIssuingLowPower, got %v", machine.CurrentState())
+	}
+
+	// Simulate EnterIssuingLowPower discovering a block after the earlier
+	// WaitingInhibitors check admitted the transition.
+	actions.hasBlockingInhibitors = true
+	machine.Send(librefsm.Event{ID: fsm.EvLateBlockingInhibitor})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateWaitingInhibitors) {
+		t.Fatalf("Expected StateWaitingInhibitors after late block, got %v", machine.CurrentState())
+	}
+
+	// Removing the block follows the normal wait-state path and resumes the
+	// original power target instead of cancelling it.
+	actions.hasBlockingInhibitors = false
+	machine.Send(librefsm.Event{ID: fsm.EvInhibitorsChanged})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateIssuingLowPower) {
+		t.Errorf("Expected StateIssuingLowPower after block removal, got %v", machine.CurrentState())
+	}
+}
+
 func TestIssuingLowPowerAbortReturnsToRunning(t *testing.T) {
 	actions := &mockActions{
 		canEnterLowPower: true,
