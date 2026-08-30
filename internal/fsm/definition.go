@@ -60,10 +60,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// vehicle is already in stand-by, and a self-transition fallback that
 		// records the target via OnPowerCommand when CanEnterLowPowerState
 		// rejects (e.g., vehicle still in parked/shutting-down). The natural
-		// EvVehicleStateChanged transitions below pick up the stored target
-		// when stand-by arrives, mirroring the OEM unu-pm setTargetMode +
-		// onVehicleState pattern. Without the fallback, lock-hibernate races
-		// with vehicle.state updates and gets dropped.
+		// EvVehicleStateChanged transitions pick up the stored target when
+		// stand-by arrives. Without this fallback, lock-hibernate can race with
+		// a vehicle.state update and be dropped.
 		Transition(StateRunning, EvPowerSuspend, StateSuspendImminent,
 			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnPowerCommand),

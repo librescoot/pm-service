@@ -13,7 +13,6 @@ const (
 	redisInhibitChannel = "power:inhibits"
 )
 
-// redisInhibitData mirrors the JSON structure written by update-service
 type redisInhibitData struct {
 	ID       string `json:"id"`
 	Who      string `json:"who"`
@@ -24,14 +23,10 @@ type redisInhibitData struct {
 	Created  int64  `json:"created"`
 }
 
-// StartRedisListener subscribes to the power:inhibits channel and syncs
-// inhibitors from the power:inhibits Redis hash into the Manager.
-// Must be called as a goroutine.
+// StartRedisListener mirrors the power:inhibits Redis hash before and after each notification.
 func (m *Manager) StartRedisListener(ctx context.Context, client *redis_ipc.Client, logger *log.Logger) {
-	// Initial sync: load any existing inhibitors from Redis hash
 	m.syncRedisInhibitors(client, logger)
 
-	// Subscribe to changes
 	sub, err := redis_ipc.Subscribe[string](client, redisInhibitChannel, func(_ string) error {
 		m.syncRedisInhibitors(client, logger)
 		return nil
@@ -45,8 +40,7 @@ func (m *Manager) StartRedisListener(ctx context.Context, client *redis_ipc.Clie
 	<-ctx.Done()
 }
 
-// syncRedisInhibitors reads the power:inhibits hash and updates
-// the manager's manual inhibitors to match.
+// syncRedisInhibitors makes Redis-owned manual inhibitors authoritative.
 func (m *Manager) syncRedisInhibitors(client *redis_ipc.Client, logger *log.Logger) {
 	entries, err := client.HGetAll(redisInhibitHash)
 	if err != nil {
@@ -54,7 +48,6 @@ func (m *Manager) syncRedisInhibitors(client *redis_ipc.Client, logger *log.Logg
 		return
 	}
 
-	// Build set of desired Redis inhibitor IDs
 	wantIDs := make(map[string]redisInhibitData)
 	for id, raw := range entries {
 		var data redisInhibitData
@@ -70,7 +63,6 @@ func (m *Manager) syncRedisInhibitors(client *redis_ipc.Client, logger *log.Logg
 
 	m.mutex.Lock()
 
-	// Remove manual inhibitors that are no longer in Redis
 	remaining := make([]*Inhibitor, 0, len(m.manualInhibitors))
 	for _, inh := range m.manualInhibitors {
 		if inh.redisID == "" {
@@ -87,7 +79,6 @@ func (m *Manager) syncRedisInhibitors(client *redis_ipc.Client, logger *log.Logg
 	}
 	m.manualInhibitors = remaining
 
-	// Add new inhibitors from Redis
 	for id, data := range wantIDs {
 		inhibType := TypeBlock
 		switch data.Type {

@@ -1,190 +1,93 @@
 # Librescoot Power Management Service
 
-The power management service is responsible for managing power states (run, suspend, hibernate, poweroff, reboot) on the scooter. It monitors vehicle and battery state via Redis, handles power state transitions, and manages inhibitors to prevent unwanted power state changes.
-
 Part of the [Librescoot](https://librescoot.org/) open-source platform.
 
-## Overview
+The Power Management Service coordinates the vehicle's low-power lifecycle. It observes vehicle, battery, reserve-power, connectivity, settings, and inhibitor state through Redis or Valkey; publishes its state through the same IPC bus; and asks systemd to suspend, power off, or reboot only after the relevant guards have passed.
+## Capabilities
 
-The service is designed to optimize power consumption by transitioning the scooter to appropriate power states based on its operational status. It communicates with other system components via Redis and uses systemd to execute power state changes.
+- Manages `run`, `suspend`, `hibernate`, `hibernate-manual`, `hibernate-timer`, `hibernate-for`, and `reboot` requests through a finite-state machine.
+- Watches vehicle and both main-battery slots, auxiliary and control-board battery telemetry, connectivity, settings, and power-manager acknowledgements.
+- Publishes current power-manager state and active-inhibitor information.
+- Implements a configurable hibernation timer and scheduled hibernation settings.
+- Coordinates `hibernate-for` with the nRF52 wake timer and aborts the power-off path if the timer is not acknowledged.
+- Uses systemd's D-Bus interfaces to issue power actions and observes suspend/resume.
+- Supports local Unix-socket inhibitors and Redis/Valkey-backed inhibitors.
+- Can apply `ondemand`, `powersave`, or `performance` CPU-governor requests.
 
-## Features
+## Operation and interfaces
 
-- Manages transitions between power states (run, suspend, hibernate, poweroff, reboot)
-- Monitors vehicle and battery state via Redis
-- Handles inhibitors to prevent unwanted power state changes
-- Provides a timer-based hibernation mechanism
-- Publishes power state changes to Redis
-- Supports delayed power state transitions with configurable timers
-- Manages modem power state during low-power transitions
-- Provides a Unix domain socket interface for inhibitor connections
+The service consumes list commands from `scooter:power`:
 
-## Architecture
+- `run`, `suspend`, `hibernate`, `hibernate-manual`, `hibernate-timer`, and `reboot`
+- `hibernate-for:<seconds>` to request a timed hibernation
+- `hibernate-cancel` to return to `run` and disarm the wake timer
 
-The service consists of several key components:
+It accepts `ondemand`, `powersave`, and `performance` from `scooter:governor`.
 
-- **Power Manager**: Handles power state transitions and systemd interactions
-- **Inhibitor Manager**: Manages inhibitors that can block or delay power state changes
-- **Service**: Coordinates between components and handles Redis communication
+Power state is published in the `power-manager` hash. The same hash carries the nRF52 wake-timer request/acknowledgement fields used for timed hibernation. Active inhibitor summaries are published under `power-manager:busy-services`.
 
-## Power States
+Redis/Valkey inhibitors are stored as JSON values in the `power:inhibits` hash and synchronized when the `power:inhibits` channel is published. Inhibitors may be `delay`, `suspend-only`, or the default blocking type. The local inhibitor listener uses the path selected by `--socket-path`.
 
-The service supports the following power states:
-
-- **run**: Normal operation mode
-- **suspend**: Suspend to RAM (low power state with quick resume)
-- **hibernate**: Power off the system
-- **hibernate-manual**: Power off initiated manually
-- **hibernate-timer**: Power off initiated by hibernation timer
-- **reboot**: System reboot
-
-### Power State Transitions
-
-Power state transitions follow these priority rules:
-1. run (highest priority)
-2. hibernate-manual
-3. hibernate
-4. hibernate-timer
-5. suspend/reboot (lowest priority)
-
-The service will not transition to a lower priority state if a higher priority state is requested.
-
-## Inhibitors
-
-Inhibitors can be used to prevent power state changes. There are two types of inhibitors:
-
-- **block**: Blocks power state changes completely
-- **delay**: Delays power state changes for a short period
-
-Inhibitors can be created by:
-1. Connecting to the Unix domain socket at the configured path
-2. Programmatically via the inhibitor manager API
-
-The service maintains a special inhibitor for the modem to ensure proper shutdown sequence.
-
-## Redis Communication
-
-### Subscriptions
-
-The service subscribes to the following Redis channels:
-
-- `vehicle` channel for vehicle state changes
-- `battery:0` channel for battery state changes
-
-### Publications
-
-The service publishes to the following Redis channels:
-
-- `power-manager` channel for power state changes
-- `power-manager:busy-services` for inhibitor status
-
-### Commands
-
-The service listens for commands on:
-
-- `scooter:power` list for power state commands (run, suspend, hibernate, hibernate-manual, hibernate-timer, reboot)
-
-The service issues commands on:
-
-- `scooter:modem` list for modem control (disable)
-
-## Dependencies
-
-- Redis server
-- D-Bus system bus
-- systemd
-
-## Building
-
-```bash
-# Build for ARM target (armv7eabi)
-make build
-
-# Build for local architecture
-make build-local
-
-# Install dependencies
-make deps
-```
-
-## Installation
-
-```bash
-# Install to /usr/bin and set up systemd service
-sudo make install
-
-# Deploy to development device
-make deploy-dev
-
-# Deploy to production device
-make deploy-prod
-```
+Low-power entry is guarded by live vehicle and battery state. In particular, suspend is restricted to stand-by and is not entered while a main battery is present or active. Hibernation and reboot are system-changing operations; their requests should be issued only by trusted services.
 
 ## Configuration
 
-The service can be configured using command-line flags:
+Command-line flags provide the service configuration:
 
-```
-  -dry-run
-        Dry run (don't actually issue power state changes)
-  -default-state string
-        Default power state (run, suspend, hibernate, hibernate-manual, hibernate-timer, reboot) (default "suspend")
-  -hibernation-timer duration
-        Duration of the hibernation timer (default 3d)
-  -inhibitor-duration duration
-        Duration the system is held active after suspend is issued (default 500ms)
-  -pre-suspend-delay duration
-        Delay between standby and low-power-state-imminent state (default 1m0s)
-  -redis-host string
-        Redis host (default "localhost")
-  -redis-port int
-        Redis port (default 6379)
-  -socket-path string
-        Path for the Unix domain socket for inhibitor connections (default "/tmp/suspend_inhibitor")
-  -suspend-imminent-delay duration
-        Duration for which low-power-state-imminent state is held (default 5s)
-```
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--redis-host` | `localhost` | Redis/Valkey host |
+| `--redis-port` | `6379` | Redis/Valkey port |
+| `--default-state` | `suspend` | Fallback low-power target |
+| `--hibernation-timer` | `72h` | Idle hibernation timer |
+| `--pre-suspend-delay` | `1m` | Delay before the suspend-imminent state |
+| `--suspend-imminent-delay` | `5s` | Duration of the suspend-imminent state |
+| `--inhibitor-duration` | `500ms` | Post-suspend delay-inhibitor duration |
+| `--socket-path` | `/tmp/suspend_inhibitor` | Unix socket for local inhibitors |
+| `--dry-run` | `false` | Log power actions instead of issuing them |
+| `--version` | — | Print the build version and exit |
 
-## Development
+The service also watches these fields in the `settings` hash: `pm.hibernation-timer`, `pm.default-state`, `pm.suspend-when-online`, `pm.wake-timer-max-seconds`, `pm.wake-timer-ack-timeout`, `pm.scheduled-hibernate-enabled`, `pm.scheduled-hibernate-cron`, and `pm.scheduled-hibernate-duration`. A valid `pm.default-state` overrides the command-line fallback.
 
-### Testing
+## Build and test
 
-```bash
-# Run tests
+A Go toolchain is required. The default target cross-compiles a Linux ARMv7 executable.
+
+```sh
+make build       # bin/pm-service for ARMv7
+make build-host  # bin/pm-service for the current host
 make test
 ```
 
-### Debugging
+`make lint` and `make clean` are also available.
 
-When debugging, you can use the `-dry-run` flag to prevent actual power state changes:
+## Deployment and runtime dependencies
 
-```bash
-./librescoot-pm -dry-run
-```
+The image recipe installs `/usr/bin/pm-service` and `librescoot-pm.service`. The unit runs as `root`, requires `valkey.service`, starts after the vehicle, battery, settings, and Valkey services, and restarts on failure.
 
-## Troubleshooting
+Production operation requires:
 
-### Common Issues
+- Redis or Valkey and the vehicle/battery publishers that supply state;
+- a system D-Bus and systemd/logind capable of the requested power actions;
+- permission to access the configured Unix socket and power-management sysfs interfaces; and
+- the Bluetooth/nRF52 path for timed hibernation wake-timer handshakes.
 
-- **Service fails to start**: Check Redis connectivity and D-Bus permissions
-- **Power state changes not occurring**: Check for active inhibitors using Redis (`power-manager:busy-services`)
-- **Unexpected power state changes**: Check vehicle and battery state in Redis
+Use `--dry-run` for integration checks that must not change the machine power state.
 
-### Logs
-
-The service logs to standard output, which is captured by systemd when running as a service. View logs with:
-
-```bash
+```sh
+systemctl status librescoot-pm.service
 journalctl -u librescoot-pm.service
 ```
 
+## Operational and security notes
+
+- This process can suspend, power off, reboot, and change CPU governor settings. Limit its systemd and Redis/Valkey command surfaces to trusted principals.
+- Treat access to `scooter:power`, `scooter:governor`, `power:inhibits`, and the inhibitor socket as privileged.
+- Preserve the nRF52 wake-timer path before using `hibernate-for`; the service deliberately abandons that transition when it cannot confirm the timer was armed.
+- Review inhibitors and `power-manager` state before diagnosing a deferred transition. Send `SIGTERM` or `SIGINT` for graceful shutdown.
+
 ## License
 
-This project is dual-licensed. The source code is available under the
-[GNU Affero General Public License v3.0][agpl-3.0].
-The maintainers reserve the right to grant separate licenses for commercial distribution; please contact the maintainers to discuss commercial licensing.
+This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
 
-[![AGPL v3][agpl-image]][agpl-3.0]
-
-[agpl-3.0]: https://www.gnu.org/licenses/agpl-3.0.en.html
-[agpl-image]: https://www.gnu.org/graphics/agplv3-88x31.png
+Made with ❤️ by the Librescoot community
