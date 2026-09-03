@@ -132,6 +132,14 @@ type Service struct {
 	// before each wait.
 	wakeTimerAcks chan bool
 
+	// wakeTimerArmed latches the ACK for the current hibernate-for round.
+	// EnterIssuingLowPower can be entered more than once per round (a late
+	// blocking inhibitor sends the FSM back to waiting-inhibitors), and the ACK
+	// is consumed from wakeTimerAcks on the first pass. Without the latch the
+	// retry waits for an ACK that will never come again, times out and aborts
+	// the hibernate-for. Only the FSM goroutine touches it.
+	wakeTimerArmed bool
+
 	// suspendQuiesceAcks receives bluetooth-service's confirmation (the
 	// power-state-sent field) that it forwarded "suspending" to the nRF52.
 	// Same buffered-size-1 discipline as wakeTimerAcks.
@@ -781,6 +789,7 @@ func (s *Service) OnLastDitchWakeup(c *librefsm.Context) error {
 	s.logLastDitchTrigger()
 	s.fsmData.TargetPowerState = fsm.TargetHibernate
 	s.fsmData.HibernateForWakeSeconds = 0
+	s.wakeTimerArmed = false
 	return nil
 }
 
@@ -1064,6 +1073,7 @@ func (s *Service) EnterLowPowerImminent(c *librefsm.Context) error {
 	// arrive before we hit EnterIssuingLowPower. Drain stale ACKs first so the
 	// wait there sees only this round's response.
 	if s.fsmData.TargetPowerState == fsm.TargetHibernateFor && s.fsmData.HibernateForWakeSeconds > 0 {
+		s.wakeTimerArmed = false
 		select {
 		case <-s.wakeTimerAcks:
 		default:
@@ -1099,7 +1109,8 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	// hibernate-for must not poweroff without a confirmed wake source on the
 	// nRF52. We wait for the wake-timer-armed ACK that bluetooth-service writes
 	// when the nRF52 echoes our SET. On timeout, bail out to running.
-	if s.fsmData.TargetPowerState == fsm.TargetHibernateFor && s.fsmData.HibernateForWakeSeconds > 0 {
+	if s.fsmData.TargetPowerState == fsm.TargetHibernateFor && s.fsmData.HibernateForWakeSeconds > 0 &&
+		!s.wakeTimerArmed {
 		timeout := s.wakeTimerAckTimeout()
 		s.logger.Printf("Waiting up to %v for nRF wake-timer ACK", timeout)
 		select {
@@ -1112,6 +1123,7 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 				})
 				return nil
 			}
+			s.wakeTimerArmed = true
 			s.logger.Printf("nRF wake timer armed; proceeding to poweroff")
 		case <-time.After(timeout):
 			s.logger.Printf("Timed out waiting for nRF wake-timer ACK; aborting hibernate-for")
@@ -1623,6 +1635,8 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 		} else {
 			s.fsmData.HibernateForWakeSeconds = 0
 		}
+		// A new target invalidates any latched ACK from the previous round.
+		s.wakeTimerArmed = false
 	}
 	return nil
 }
@@ -1641,6 +1655,7 @@ func (s *Service) OnDefaultStateChanged(c *librefsm.Context) error {
 	}
 	s.fsmData.TargetPowerState = p.TargetState
 	s.fsmData.HibernateForWakeSeconds = 0
+	s.wakeTimerArmed = false
 	return nil
 }
 
