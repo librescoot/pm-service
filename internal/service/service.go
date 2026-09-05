@@ -87,6 +87,8 @@ type Service struct {
 	ctx                context.Context
 	ctxCancel          context.CancelFunc
 
+	modemCmdFn func(string) error
+
 	// Last-ditch hibernate inputs. Updated from Redis hash watchers under
 	// lastDitchMu; read by lastDitchTriggeredLocked (callers hold the mutex).
 	// The trigger itself is level-triggered and lives in the FSM: watchers
@@ -1188,6 +1190,7 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 		if !s.liveVehicleInStandby() {
 			s.logger.Printf("Aborting suspend before announce: vehicle no longer in stand-by")
 			s.fsmData.LowPowerStateIssued = false
+			s.enableModem()
 			c.Send(librefsm.Event{
 				ID:      fsm.EvPowerRun,
 				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
@@ -1208,6 +1211,7 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 			time.Sleep(suspendQuiesceMargin)
 		case <-time.After(suspendQuiesceTimeout):
 			s.logger.Printf("No confirmation that the nRF was told; aborting suspend to avoid the wake loop")
+			s.enableModem()
 			c.Send(librefsm.Event{
 				ID:      fsm.EvPowerRun,
 				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
@@ -1226,6 +1230,7 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 		if !s.liveVehicleInStandby() {
 			s.logger.Printf("Aborting suspend after quiesce: vehicle left stand-by")
 			s.fsmData.LowPowerStateIssued = false
+			s.enableModem()
 			c.Send(librefsm.Event{
 				ID:      fsm.EvPowerRun,
 				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
@@ -1239,6 +1244,7 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 		if s.liveBatteryActive() {
 			s.logger.Printf("Aborting suspend after quiesce: a battery is active")
 			s.fsmData.LowPowerStateIssued = false
+			s.enableModem()
 			c.Send(librefsm.Event{
 				ID:      fsm.EvPowerRun,
 				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
@@ -1256,6 +1262,7 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 				return nil
 			}
 			s.logger.Printf("Suspend did not complete: %v; returning to running", err)
+			s.enableModem()
 			c.Send(librefsm.Event{
 				ID:      fsm.EvPowerRun,
 				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
@@ -1311,6 +1318,7 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 
 	s.fsmData.WakeupReason = wakeupReason
 	s.fsmData.LowPowerStateIssued = false
+	// A completed suspend leaves the modem off until the vehicle leaves stand-by.
 	s.fsmData.ModemDisabled = false
 
 	s.logger.Printf("Wakeup detected with reason: %s", wakeupReason)
@@ -1573,7 +1581,7 @@ func (s *Service) OnVehicleStateChanged(c *librefsm.Context) error {
 	//     during the 5s shutting-down window, then drove off).
 	if (oldState == "stand-by" && newState != "stand-by") || newState == "ready-to-drive" {
 		s.fsmData.TargetPowerState = s.config.DefaultState
-		s.fsmData.ModemDisabled = false
+		s.enableModem()
 	}
 
 	return nil
@@ -1597,7 +1605,7 @@ func (s *Service) OnVehicleLeftLowPowerState(c *librefsm.Context) error {
 	}
 
 	s.fsmData.TargetPowerState = s.config.DefaultState
-	s.fsmData.ModemDisabled = false
+	s.enableModem()
 	return nil
 }
 
@@ -1627,6 +1635,9 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 			s.logger.Printf("Target power state: %s -> %s", s.fsmData.TargetPowerState, p.TargetState)
 		}
 		s.fsmData.TargetPowerState = p.TargetState
+		if p.TargetState == fsm.TargetRun {
+			s.enableModem()
+		}
 		// hibernate-for carries a wake duration; every other command clears it
 		// so a cancelled hibernate-for doesn't leak its timer into the next
 		// power request.
@@ -1799,12 +1810,35 @@ func (s *Service) disableModem() {
 	}
 
 	s.logger.Printf("Issuing modem to turn off")
-	if _, err := s.redis.LPush("scooter:modem", "disable"); err != nil {
+	if err := s.pushModemCommand("disable"); err != nil {
 		s.logger.Printf("Failed to disable modem: %v", err)
 		return
 	}
 
 	s.fsmData.ModemDisabled = true
+}
+
+// enableModem restores the modem after an aborted low-power transition.
+func (s *Service) enableModem() {
+	if !s.fsmData.ModemDisabled {
+		return
+	}
+
+	s.logger.Printf("Issuing modem to turn back on")
+	if err := s.pushModemCommand("enable"); err != nil {
+		s.logger.Printf("Failed to enable modem: %v", err)
+		return
+	}
+
+	s.fsmData.ModemDisabled = false
+}
+
+func (s *Service) pushModemCommand(cmd string) error {
+	if s.modemCmdFn != nil {
+		return s.modemCmdFn(cmd)
+	}
+	_, err := s.redis.LPush("scooter:modem", cmd)
+	return err
 }
 
 func (s *Service) setGovernor(governor string) error {
