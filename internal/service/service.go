@@ -53,6 +53,12 @@ const (
 	lastDitchTelemetryWait = 3 * time.Second
 	lastDitchTelemetryPoll = 200 * time.Millisecond
 
+	// remoteAccessConnectGrace gives providers time to restore their transport
+	// after boot and every resume. It matches uplink-service's maximum retry
+	// backoff; after it expires, disconnected or absent providers no longer hold
+	// a battery-less scooter awake.
+	remoteAccessConnectGrace = 5 * time.Minute
+
 	// suspendQuiesceTimeout bounds the wait for bluetooth-service's confirm
 	// that the nRF52 was told we are suspending; on expiry the suspend is
 	// aborted (staying awake beats the suspend/wake loop).
@@ -119,17 +125,14 @@ type Service struct {
 	wakeTimerMaxSecondsOver uint32
 	wakeTimerAckTimeoutOver time.Duration
 
-	// Setting A ("keep online scooters reachable"): suspendWhenOnline
-	// (pm.suspend-when-online) only matters when no main battery is present.
-	// With a battery present/active we never suspend regardless. With no
-	// battery, the default (true) allows suspend even while online; setting it
-	// false keeps an online scooter awake so cloud commands can still reach it.
-	// online mirrors internet.connectivity == "connected", modem-service's view
-	// of the data session: an inbound command needs the session to be up, which
-	// is not the same question as modem-service's outbound reachability probe in
-	// internet.status. Both guarded by settingsMu.
-	suspendWhenOnline bool
-	online            bool
+	// Setting A ("keep remotely reachable scooters awake"):
+	// pm.suspend-when-online only matters when no main battery is present. The
+	// default true allows suspend even while reachable; false reads
+	// remote-access.status live at the decision point and blocks while any
+	// provider is connected. A bounded grace after boot/resume lets providers
+	// reconnect before a disconnected value is acted on. Guarded by settingsMu.
+	suspendWhenOnline      bool
+	remoteAccessGraceUntil time.Time
 
 	// wakeTimerAcks receives the nRF52's wake-timer-set acknowledgement: true
 	// when the timer is armed, false when it was disarmed. Buffered with size 1
@@ -254,12 +257,10 @@ func (s *Service) Run(ctx context.Context) error {
 	if v, err := s.redis.HGet("battery:1", "present"); err == nil && v != "" {
 		s.battery1Present = parseBool(v)
 	}
-	// Seed online state before the first low-power evaluation so the
-	// suspend-when-online guard takes effect immediately (the internet watcher
-	// only syncs later).
-	if v, err := s.redis.HGet("internet", "connectivity"); err == nil && v != "" {
-		s.online = (v == "connected")
-	}
+	// Give remote-access providers a bounded opportunity to connect before the
+	// first suspend decision. time.Time retains a monotonic component, so wall
+	// clock corrections cannot shorten the grace.
+	s.remoteAccessGraceUntil = time.Now().Add(remoteAccessConnectGrace)
 	if v, err := s.redis.HGet("battery:0", "charge"); err == nil && v != "" {
 		s.battery0Charge = parseChargeOrUnknown(v)
 	}
@@ -398,12 +399,6 @@ func (s *Service) Run(ctx context.Context) error {
 		OnField("voltage", s.onAuxVoltageChanged).
 		StartWithSync(); err != nil {
 		return fmt.Errorf("failed to start aux-battery watcher: %v", err)
-	}
-
-	if err := s.redis.NewHashWatcher("internet").
-		OnField("connectivity", s.onInternetConnectivityChanged).
-		StartWithSync(); err != nil {
-		return fmt.Errorf("failed to start internet watcher: %v", err)
 	}
 
 	redis_ipc.HandleRequests(s.redis, "scooter:power", s.onPowerCommand)
@@ -1313,6 +1308,12 @@ func (s *Service) ExitIssuingLowPower(c *librefsm.Context) error {
 }
 
 func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
+	// The modem and reachability providers reconnect after every resume. Start a
+	// fresh bounded grace before any wake routing can request suspend again.
+	s.settingsMu.Lock()
+	s.remoteAccessGraceUntil = time.Now().Add(remoteAccessConnectGrace)
+	s.settingsMu.Unlock()
+
 	// Read wakeup reason
 	wakeupReason := "unknown"
 	if data, err := os.ReadFile("/sys/power/pm_wakeup_irq"); err == nil {
@@ -1422,11 +1423,11 @@ func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 		}
 
 		// No main battery present. Suspend to conserve (the default) even while
-		// online. Only when pm.suspend-when-online is explicitly off and the
-		// modem's data session is still up do we stay awake so cloud commands
-		// can reach us.
+		// reachable. Only when pm.suspend-when-online is explicitly off and a
+		// remote-access provider is connected (or still within reconnect grace)
+		// do we stay awake so remote commands can reach us.
 		if s.suspendBlockedWhileOnline() {
-			s.logger.Printf("Suspend blocked: no main battery but online and pm.suspend-when-online disabled")
+			s.logger.Printf("Suspend blocked: remote access connected or reconnecting and pm.suspend-when-online disabled")
 			return false
 		}
 	}
@@ -1996,8 +1997,8 @@ func (s *Service) onScheduledHibernateEnabledSetting(value string) error {
 // onSuspendWhenOnlineSetting absorbs pm.suspend-when-online. It only matters
 // when no main battery is present (a present/active pack always blocks suspend).
 // When true (the default), a locked scooter with no main battery is allowed to
-// suspend even while online. When false it stays awake while the data session
-// is up, so it remains reachable.
+// suspend even while remotely reachable. When false it stays awake while the
+// converged remote-access status is connected (plus bounded reconnect grace).
 func (s *Service) onSuspendWhenOnlineSetting(value string) error {
 	s.settingsMu.Lock()
 	s.suspendWhenOnline = (value == "true")
@@ -2005,26 +2006,33 @@ func (s *Service) onSuspendWhenOnlineSetting(value string) error {
 	return nil
 }
 
-// onInternetConnectivityChanged tracks whether the modem's data session is up
-// (internet.connectivity == "connected"), consumed by the suspend-when-online
-// guard. Only "connected" counts as online: every other classifier state, and
-// the empty value the field carries before modem-service's first
-// classification or when modem-service is not running at all, says we have no
-// evidence of a usable session, and holding a battery-less scooter awake on a
-// missing measurement drains the aux and CBB for nothing.
-func (s *Service) onInternetConnectivityChanged(value string) error {
-	s.settingsMu.Lock()
-	s.online = (value == "connected")
-	s.settingsMu.Unlock()
-	return nil
+func shouldBlockSuspendForRemoteAccess(suspendWhenOnline bool, status string, statusKnown, withinGrace bool) bool {
+	if suspendWhenOnline {
+		return false
+	}
+	return withinGrace || !statusKnown || status == "connected"
 }
 
-// suspendBlockedWhileOnline reports whether the pm.suspend-when-online guard
-// currently holds suspend off.
+// suspendBlockedWhileOnline reads the converged reachability verdict live at
+// the suspend decision point. Pub/sub notifications are lost while the process
+// is frozen, so a watcher-fed cache would be stale after resume. A missing hash
+// means no provider and does not block after grace; a Redis read failure errs
+// toward staying awake.
 func (s *Service) suspendBlockedWhileOnline() bool {
 	s.settingsMu.Lock()
-	defer s.settingsMu.Unlock()
-	return !s.suspendWhenOnline && s.online
+	suspendWhenOnline := s.suspendWhenOnline
+	withinGrace := time.Now().Before(s.remoteAccessGraceUntil)
+	s.settingsMu.Unlock()
+	if suspendWhenOnline {
+		return false
+	}
+
+	status, err := s.redis.HGet("remote-access", "status")
+	statusKnown := err == nil || err == redis_ipc.ErrNil
+	if err != nil && err != redis_ipc.ErrNil {
+		s.logger.Printf("Could not read remote-access status: %v; keeping scooter awake", err)
+	}
+	return shouldBlockSuspendForRemoteAccess(suspendWhenOnline, status, statusKnown, withinGrace)
 }
 
 // onScheduledHibernateCronSetting passes a new cron expression to the scheduler.
