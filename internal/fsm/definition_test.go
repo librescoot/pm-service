@@ -16,6 +16,8 @@ type mockActions struct {
 	targetSuspend             bool
 	targetHibernate           bool
 	lastDitchTriggered        bool
+	automaticLastDitch        bool
+	lastDitchFallbackSuspend  bool
 	hasBlockingInhibitors     bool
 	hasOnlyModemInhibitors    bool
 	canProceedPastModemWait   bool
@@ -51,6 +53,13 @@ func (m *mockActions) IsTargetHibernate(c *librefsm.Context) bool  { return m.ta
 func (m *mockActions) IsLastDitchTriggered(c *librefsm.Context) bool {
 	return m.lastDitchTriggered
 }
+func (m *mockActions) IsLastDitchApplicableTarget(c *librefsm.Context) bool { return true }
+func (m *mockActions) IsAutomaticLastDitch(c *librefsm.Context) bool {
+	return m.automaticLastDitch
+}
+func (m *mockActions) IsLastDitchFallbackSuspend(c *librefsm.Context) bool {
+	return m.lastDitchFallbackSuspend
+}
 func (m *mockActions) IsPowerCommandHigherPriority(c *librefsm.Context) bool { return true }
 func (m *mockActions) OnPreSuspendTimeout(c *librefsm.Context) error         { return nil }
 func (m *mockActions) OnSuspendImminentTimeout(c *librefsm.Context) error    { return nil }
@@ -62,14 +71,21 @@ func (m *mockActions) OnVehicleLeftLowPowerState(c *librefsm.Context) error  { r
 func (m *mockActions) OnBatteryStateChanged(c *librefsm.Context) error       { return nil }
 func (m *mockActions) OnPowerCommand(c *librefsm.Context) error {
 	m.onPowerCommandCount++
+	m.automaticLastDitch = false
 	return nil
 }
 func (m *mockActions) OnLastDitchTriggered(c *librefsm.Context) error {
 	m.onLastDitchTriggeredCount++
+	m.automaticLastDitch = true
 	return nil
 }
 func (m *mockActions) OnLastDitchWakeup(c *librefsm.Context) error {
 	m.onLastDitchWakeupCount++
+	m.automaticLastDitch = true
+	return nil
+}
+func (m *mockActions) OnLastDitchDisabled(c *librefsm.Context) error {
+	m.automaticLastDitch = false
 	return nil
 }
 func (m *mockActions) OnDefaultStateChanged(c *librefsm.Context) error { return nil }
@@ -851,6 +867,98 @@ func TestLastDitchCheckUpgradesPendingSuspend(t *testing.T) {
 	}
 }
 
+func TestDisablingPendingLastDitchRestoresSuspend(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:         true,
+		lastDitchTriggered:       true,
+		lastDitchFallbackSuspend: true,
+	}
+
+	def := fsm.NewDefinition(actions, time.Second, time.Second)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCheck})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StateSuspendImminent) {
+		t.Errorf("Expected suspended path to resume, got %v", machine.CurrentState())
+	}
+}
+
+func TestDisablingLastDitchDoesNotCancelExplicitHibernate(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:   true,
+		lastDitchTriggered: true,
+	}
+
+	def := fsm.NewDefinition(actions, time.Second, time.Second)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCheck})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvPowerHibernateManual})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Errorf("Explicit hibernate was cancelled, state=%v", machine.CurrentState())
+	}
+	if actions.automaticLastDitch {
+		t.Fatal("explicit command did not clear automatic provenance")
+	}
+}
+
+func TestDisablingLastDitchWhileWaitingReturnsToRunning(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:   true,
+		lastDitchTriggered: true,
+	}
+
+	def := fsm.NewDefinition(actions, time.Second, time.Second)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCheck})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvSuspendImminentTimeout})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateWaitingInhibitors) {
+		t.Fatalf("Expected StateWaitingInhibitors, got %v", machine.CurrentState())
+	}
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StateRunning) {
+		t.Errorf("Expected StateRunning, got %v", machine.CurrentState())
+	}
+}
+
 // TestLastDitchCheckDoesNotRestartImminentSequence: once the hibernate
 // sequence is executing, further check events must not re-enter
 // LowPowerImminent (that would restart the imminent timer on every input
@@ -979,6 +1087,41 @@ func TestRegularWakeUnaffectedByLastDitchGuard(t *testing.T) {
 	}
 	if actions.onLastDitchWakeupCount != 0 {
 		t.Errorf("Expected no OnLastDitchWakeup, count=%d", actions.onLastDitchWakeupCount)
+	}
+}
+
+func TestLastDitchHeldByBlockingCriticalSection(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:        true,
+		lastDitchTriggered:      true,
+		hasBlockingInhibitors:   true,
+		canProceedPastModemWait: false,
+	}
+
+	def := fsm.NewDefinition(actions, time.Second, time.Second)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCheck})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvSuspendImminentTimeout})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateWaitingInhibitors) {
+		t.Fatalf("Expected StateWaitingInhibitors, got %v", machine.CurrentState())
+	}
+
+	// The bounded modem exception must not bypass an OTA/boot critical section.
+	machine.Send(librefsm.Event{ID: fsm.EvInhibitorWaitTimeout})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateWaitingInhibitors) {
+		t.Errorf("Last-ditch bypassed a blocking critical section, state=%v", machine.CurrentState())
 	}
 }
 

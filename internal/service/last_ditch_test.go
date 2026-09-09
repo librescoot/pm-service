@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"io"
 	"log"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,6 +16,7 @@ func newLastDitchService(t *testing.T) *Service {
 	t.Helper()
 	return &Service{
 		logger:              log.New(io.Discard, "", 0),
+		lastDitchEnabled:    defaultLastDitchHibernateEnabled,
 		lastDitchGraceUntil: time.Now().Add(-time.Minute),
 	}
 }
@@ -109,5 +112,73 @@ func TestLastDitchDoesNotFireOnStartupDefaults(t *testing.T) {
 	defer s.lastDitchMu.Unlock()
 	if s.lastDitchTriggeredLocked() {
 		t.Fatal("triggered on startup defaults")
+	}
+}
+
+func TestLastDitchSettingDefaultsEnabled(t *testing.T) {
+	if !defaultLastDitchHibernateEnabled {
+		t.Fatal("missing setting must preserve production-enabled behavior")
+	}
+}
+
+func TestLastDitchSettingFalseSuppressesTrigger(t *testing.T) {
+	s := newLastDitchService(t)
+	s.battery0Present, s.battery1Present = false, false
+	s.battery0Charge, s.battery1Charge = 0, 0
+	s.cbBatteryCharge = 0
+
+	if err := s.onLastDitchHibernateEnabledSetting("false"); err != nil {
+		t.Fatal(err)
+	}
+	s.lastDitchMu.Lock()
+	triggered := s.lastDitchTriggeredLocked()
+	s.lastDitchMu.Unlock()
+	if triggered {
+		t.Fatal("disabled setting did not suppress automatic last-ditch trigger")
+	}
+}
+
+func TestLastDitchSettingInvalidFailsEnabledAndLogs(t *testing.T) {
+	s := newLastDitchService(t)
+	if err := s.onLastDitchHibernateEnabledSetting("false"); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	s.logger = log.New(&logs, "", 0)
+
+	if err := s.onLastDitchHibernateEnabledSetting("definitely"); err != nil {
+		t.Fatal(err)
+	}
+	s.lastDitchMu.Lock()
+	enabled := s.lastDitchEnabled
+	s.lastDitchMu.Unlock()
+	if !enabled {
+		t.Fatal("invalid setting did not fail safe to enabled")
+	}
+	if !strings.Contains(logs.String(), "Invalid pm.last-ditch-hibernate-enabled") {
+		t.Fatalf("invalid setting was not logged: %q", logs.String())
+	}
+}
+
+func TestLastDitchSettingRuntimeToggles(t *testing.T) {
+	s := newLastDitchService(t)
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "false", want: false},
+		{value: "true", want: true},
+		{value: " false ", want: false},
+		{value: " true ", want: true},
+	} {
+		if err := s.onLastDitchHibernateEnabledSetting(test.value); err != nil {
+			t.Fatalf("setting %q: %v", test.value, err)
+		}
+		s.lastDitchMu.Lock()
+		got := s.lastDitchEnabled
+		s.lastDitchMu.Unlock()
+		if got != test.want {
+			t.Errorf("setting %q produced %t, want %t", test.value, got, test.want)
+		}
 	}
 }

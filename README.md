@@ -26,7 +26,7 @@ It accepts `ondemand`, `powersave`, and `performance` from `scooter:governor`.
 
 Power state is published in the `power-manager` hash. The same hash carries the nRF52 wake-timer request/acknowledgement fields used for timed hibernation. Active inhibitor summaries are published under `power-manager:busy-services`.
 
-Redis/Valkey inhibitors are stored as JSON values in the `power:inhibits` hash and synchronized when the `power:inhibits` channel is published. Inhibitors may be `delay`, `suspend-only`, or the default blocking type. The local inhibitor listener uses the path selected by `--socket-path`.
+Redis/Valkey inhibitors are stored as JSON values in the `power:inhibits` hash and synchronized when the `power:inhibits` channel is published. Inhibitors may be `delay`, `suspend-only`, or the default blocking type. Blocking inhibitors are honored by automatic last-ditch hibernation as well as explicit transitions. A `suspend-only` inhibitor does not block any hibernation/poweroff path, including last-ditch; services performing an OTA install, boot-region write, activation, or commit that cannot tolerate power loss must hold a blocking inhibitor for the whole critical section. The current inhibitor protocol does not communicate update phase, resumability, or reserve-power deadlines. The local inhibitor listener uses the path selected by `--socket-path`.
 
 Low-power entry is guarded by live vehicle and battery state. In particular, suspend is restricted to stand-by and is not entered while a main battery is present or active. Hibernation and reboot are system-changing operations; their requests should be issued only by trusted services.
 
@@ -47,7 +47,21 @@ Command-line flags provide the service configuration:
 | `--dry-run` | `false` | Log power actions instead of issuing them |
 | `--version` | — | Print the build version and exit |
 
-The service also watches these fields in the `settings` hash: `pm.hibernation-timer`, `pm.default-state`, `pm.suspend-when-online`, `pm.wake-timer-max-seconds`, `pm.wake-timer-ack-timeout`, `pm.scheduled-hibernate-enabled`, `pm.scheduled-hibernate-cron`, and `pm.scheduled-hibernate-duration`. A valid `pm.default-state` overrides the command-line fallback.
+The service also watches these fields in the `settings` hash:
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `pm.last-ditch-hibernate-enabled` | `true` | Enables automatic reserve-power last-ditch hibernation. `false` suppresses only this trigger; explicit/manual hibernate, hibernate-for, timers, suspend, reboot, and default-state handling are unchanged. Invalid values are logged and fail safe to enabled. |
+| `pm.hibernation-timer` | command-line value | Idle hibernation timer in seconds. |
+| `pm.default-state` | command-line value | Default low-power target. |
+| `pm.suspend-when-online` | `true` | Allows suspend while remotely reachable. |
+| `pm.wake-timer-max-seconds` | configured cap | Maximum hibernate-for wake interval. |
+| `pm.wake-timer-ack-timeout` | configured timeout | nRF wake-timer acknowledgement timeout. |
+| `pm.scheduled-hibernate-enabled` | `false` | Enables cron-based hibernation. |
+| `pm.scheduled-hibernate-cron` | empty | Scheduled hibernation cron expression. |
+| `pm.scheduled-hibernate-duration` | empty | Scheduled hibernation duration. |
+
+A valid `pm.default-state` overrides the command-line fallback. Boolean settings use the lowercase `true`/`false` form.
 
 ## Build and test
 

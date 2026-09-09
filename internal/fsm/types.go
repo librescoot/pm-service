@@ -54,6 +54,11 @@ const (
 	// transition time, nothing is latched or buffered.
 	EvLastDitchCheck librefsm.EventID = "last-ditch-check"
 
+	// EvLastDitchDisabled cancels only a transition whose provenance is an
+	// automatic last-ditch check. Explicit power commands clear that provenance
+	// before this event can act, so a runtime setting change cannot cancel them.
+	EvLastDitchDisabled librefsm.EventID = "last-ditch-disabled"
+
 	// pm.default-state changed at runtime. Only handled in Running: the
 	// action stores the new target in fsmData so a follow-up
 	// EvVehicleStateChanged re-evaluates the natural low-power path with it.
@@ -128,6 +133,11 @@ type FSMData struct {
 	// armed on the nRF52 when EnterLowPowerImminent runs. Set by OnPowerCommand
 	// from the EvPowerHibernateFor payload and cleared on return to Running.
 	HibernateForWakeSeconds uint32
+	// AutomaticLastDitch records the provenance of the current hibernate target.
+	// LastDitchFallbackTarget is restored if the runtime setting disables an
+	// automatic transition before the poweroff command is committed.
+	AutomaticLastDitch      bool
+	LastDitchFallbackTarget string
 }
 
 // Actions defines the callbacks for the pm-service FSM.
@@ -152,6 +162,9 @@ type Actions interface {
 	IsTargetSuspend(c *librefsm.Context) bool
 	IsTargetHibernate(c *librefsm.Context) bool
 	IsLastDitchTriggered(c *librefsm.Context) bool
+	IsLastDitchApplicableTarget(c *librefsm.Context) bool
+	IsAutomaticLastDitch(c *librefsm.Context) bool
+	IsLastDitchFallbackSuspend(c *librefsm.Context) bool
 	IsPowerCommandHigherPriority(c *librefsm.Context) bool
 
 	// Transition actions
@@ -166,6 +179,7 @@ type Actions interface {
 	OnPowerCommand(c *librefsm.Context) error
 	OnLastDitchTriggered(c *librefsm.Context) error
 	OnLastDitchWakeup(c *librefsm.Context) error
+	OnLastDitchDisabled(c *librefsm.Context) error
 	OnDefaultStateChanged(c *librefsm.Context) error
 
 	// Publishing

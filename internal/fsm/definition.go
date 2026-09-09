@@ -145,7 +145,7 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// carries TargetHibernate) prevents downgrading a buffered
 		// hibernate-manual/-for.
 		Transition(StateRunning, EvLastDitchCheck, StateLowPowerImminent,
-			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsLastDitchApplicableTarget, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnLastDitchTriggered),
 		).
 
@@ -227,7 +227,7 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// WaitingInhibitors: a self-restart there would reset the imminent
 		// sequence on every aux/CBB update and could stall the poweroff.
 		Transition(StatePreSuspend, EvLastDitchCheck, StateLowPowerImminent,
-			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsLastDitchApplicableTarget, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnLastDitchTriggered),
 		).
 
@@ -280,7 +280,7 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
 		Transition(StateSuspendImminent, EvLastDitchCheck, StateLowPowerImminent,
-			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsLastDitchApplicableTarget, actions.IsPowerCommandHigherPriority, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnLastDitchTriggered),
 		).
 
@@ -288,6 +288,19 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		Transition(StateLowPowerImminent, EvSuspendImminentTimeout, StateWaitingInhibitors,
 			librefsm.WithAction(actions.OnSuspendImminentTimeout),
+		).
+
+		// A runtime setting change cancels only an automatic last-ditch
+		// transition. If it upgraded the normal suspend path, resume that path;
+		// otherwise return to Running. Explicit commands clear the provenance and
+		// therefore do not satisfy these guards.
+		Transition(StateLowPowerImminent, EvLastDitchDisabled, StateSuspendImminent,
+			librefsm.WithGuards(actions.IsAutomaticLastDitch, actions.IsLastDitchFallbackSuspend),
+			librefsm.WithAction(actions.OnLastDitchDisabled),
+		).
+		Transition(StateLowPowerImminent, EvLastDitchDisabled, StateRunning,
+			librefsm.WithGuard(actions.IsAutomaticLastDitch),
+			librefsm.WithAction(actions.OnLastDitchDisabled),
 		).
 
 		// Cancel: target set to run
@@ -337,6 +350,17 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// past the modem (or nothing); a real block inhibitor keeps waiting.
 		Transition(StateWaitingInhibitors, EvInhibitorWaitTimeout, StateIssuingLowPower,
 			librefsm.WithGuard(actions.CanProceedPastModemWait),
+		).
+
+		// Cancel an automatic last-ditch transition when its setting is disabled,
+		// preserving the path it upgraded where possible.
+		Transition(StateWaitingInhibitors, EvLastDitchDisabled, StateSuspendImminent,
+			librefsm.WithGuards(actions.IsAutomaticLastDitch, actions.IsLastDitchFallbackSuspend),
+			librefsm.WithAction(actions.OnLastDitchDisabled),
+		).
+		Transition(StateWaitingInhibitors, EvLastDitchDisabled, StateRunning,
+			librefsm.WithGuard(actions.IsAutomaticLastDitch),
+			librefsm.WithAction(actions.OnLastDitchDisabled),
 		).
 
 		// Cancel: target set to run
@@ -390,6 +414,17 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// Retry the inhibitor gate without losing the requested target.
 		Transition(StateIssuingLowPower, EvLateBlockingInhibitor, StateWaitingInhibitors).
 
+		// The setting callback can race with entry to this state. The entry action
+		// re-checks the setting before poweroff and sends this event to back out.
+		Transition(StateIssuingLowPower, EvLastDitchDisabled, StateSuspendImminent,
+			librefsm.WithGuards(actions.IsAutomaticLastDitch, actions.IsLastDitchFallbackSuspend),
+			librefsm.WithAction(actions.OnLastDitchDisabled),
+		).
+		Transition(StateIssuingLowPower, EvLastDitchDisabled, StateRunning,
+			librefsm.WithGuard(actions.IsAutomaticLastDitch),
+			librefsm.WithAction(actions.OnLastDitchDisabled),
+		).
+
 		// Abort: EnterIssuingLowPower backs out by sending EvPowerRun when a
 		// last-moment gate fails (the vehicle left stand-by during the blocking
 		// quiesce/suspend commit — when no queued EvVehicleStateChanged can be
@@ -406,11 +441,11 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		// instead of re-entering the suspend loop. Declared before the
 		// regular wake transitions — guards are tried in declaration order.
 		Transition(StateIssuingLowPower, EvWakeup, StateLowPowerImminent,
-			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsLastDitchApplicableTarget, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnLastDitchWakeup),
 		).
 		Transition(StateIssuingLowPower, EvWakeupRTC, StateLowPowerImminent,
-			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsLastDitchApplicableTarget, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnLastDitchWakeup),
 		).
 
@@ -444,11 +479,11 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 
 		// Last-ditch wake routing (see IssuingLowPower note above)
 		Transition(StateSuspended, EvWakeup, StateLowPowerImminent,
-			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsLastDitchApplicableTarget, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnLastDitchWakeup),
 		).
 		Transition(StateSuspended, EvWakeupRTC, StateLowPowerImminent,
-			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.CanEnterLowPowerState),
+			librefsm.WithGuards(actions.IsLastDitchTriggered, actions.IsLastDitchApplicableTarget, actions.CanEnterLowPowerState),
 			librefsm.WithAction(actions.OnLastDitchWakeup),
 		).
 

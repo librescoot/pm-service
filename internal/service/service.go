@@ -28,9 +28,10 @@ import (
 // recovery margin to avoid event thrash near the threshold, mirroring
 // battery-service's aux-low keep-active logic.
 const (
-	lastDitchHibernateCBBThreshold = 50
-	lastDitchHibernateAuxEnterMv   = 11500
-	lastDitchHibernateAuxExitMv    = 11700
+	defaultLastDitchHibernateEnabled = true
+	lastDitchHibernateCBBThreshold   = 50
+	lastDitchHibernateAuxEnterMv     = 11500
+	lastDitchHibernateAuxExitMv      = 11700
 
 	// lastDitchHibernateBootGrace suppresses the last-ditch trigger for the
 	// first minutes after pm-service starts. After waking from a last-ditch
@@ -102,14 +103,15 @@ type Service struct {
 	// transition time, so no edge latch is needed.
 	// cbBatteryCharge==-1 / auxVoltageMv==-1 mean "unknown" (no reading yet)
 	// and suppress their respective sub-conditions.
-	lastDitchMu     sync.Mutex
-	cbBatteryCharge int  // 0..100, -1 if unknown
-	battery0Present bool // defaults to true so we don't trigger before first sync
-	battery1Present bool
-	battery0Charge  int // 0..100, -1 if unknown
-	battery1Charge  int
-	auxVoltageMv    int  // millivolts, -1 if unknown
-	auxLowLatched   bool // Schmitt latch: true once below enter, until above exit
+	lastDitchMu      sync.Mutex
+	lastDitchEnabled bool // pm.last-ditch-hibernate-enabled; production default is true
+	cbBatteryCharge  int  // 0..100, -1 if unknown
+	battery0Present  bool // defaults to true so we don't trigger before first sync
+	battery1Present  bool
+	battery0Charge   int // 0..100, -1 if unknown
+	battery1Charge   int
+	auxVoltageMv     int  // millivolts, -1 if unknown
+	auxLowLatched    bool // Schmitt latch: true once below enter, until above exit
 	// lastDitchVehicleStandby mirrors vehicle.state == "stand-by" for the
 	// sendLastDitchCheck pre-filter only; CanEnterLowPowerState remains the
 	// authoritative vehicle-state guard inside the FSM.
@@ -189,6 +191,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		wakeTimerAcks:      make(chan bool, 1),
 		suspendQuiesceAcks: make(chan struct{}, 1),
 		suspendWhenOnline:  true,
+		lastDitchEnabled:   defaultLastDitchHibernateEnabled,
 		cbBatteryCharge:    -1,
 		battery0Present:    true,
 		battery1Present:    true,
@@ -272,6 +275,13 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	if v, err := s.redis.HGet("aux-battery", "voltage"); err == nil && v != "" {
 		s.auxVoltageMv = parseNonNegativeInt(v)
+	}
+
+	// The setting is production-default enabled. Hydrate it before the FSM or
+	// telemetry watchers can evaluate the automatic trigger; a missing value
+	// deliberately leaves the constructor default in place.
+	if value, err := s.redis.HGet("settings", "pm.last-ditch-hibernate-enabled"); err == nil && value != "" {
+		s.setLastDitchHibernateEnabled(value)
 	}
 
 	// Read default power state from settings; CLI arg is the fallback
@@ -412,6 +422,7 @@ func (s *Service) Run(ctx context.Context) error {
 		OnField("pm.hibernation-timer", s.onHibernationTimerSetting).
 		OnField("pm.default-state", s.onDefaultStateSetting).
 		OnField("pm.suspend-when-online", s.onSuspendWhenOnlineSetting).
+		OnField("pm.last-ditch-hibernate-enabled", s.onLastDitchHibernateEnabledSetting).
 		OnField("pm.wake-timer-max-seconds", s.onWakeTimerMaxSecondsSetting).
 		OnField("pm.wake-timer-ack-timeout", s.onWakeTimerAckTimeoutSetting).
 		OnField("pm.scheduled-hibernate-enabled", s.onScheduledHibernateEnabledSetting).
@@ -593,6 +604,10 @@ func (s *Service) setAuxVoltageLocked(mv int) {
 // constant's comment for the wake-race rationale); the grace suppression is
 // logged once per boot. Callers must hold lastDitchMu.
 func (s *Service) lastDitchTriggeredLocked() bool {
+	if !s.lastDitchEnabled {
+		return false
+	}
+
 	cbb := s.cbBatteryCharge
 	slot0Missing := !s.battery0Present || s.battery0Charge == 0
 	slot1Missing := !s.battery1Present || s.battery1Charge == 0
@@ -650,6 +665,33 @@ func (s *Service) IsLastDitchTriggered(c *librefsm.Context) bool {
 	s.lastDitchMu.Lock()
 	defer s.lastDitchMu.Unlock()
 	return s.lastDitchTriggeredLocked()
+}
+
+func (s *Service) IsLastDitchApplicableTarget(_ *librefsm.Context) bool {
+	switch s.fsmData.TargetPowerState {
+	case fsm.TargetRun, fsm.TargetSuspend:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) IsAutomaticLastDitch(c *librefsm.Context) bool {
+	return s.fsmData.AutomaticLastDitch
+}
+
+func (s *Service) IsLastDitchFallbackSuspend(c *librefsm.Context) bool {
+	return s.fsmData.LastDitchFallbackTarget == fsm.TargetSuspend
+}
+
+func (s *Service) automaticLastDitchDisabled() bool {
+	if !s.fsmData.AutomaticLastDitch {
+		return false
+	}
+	s.lastDitchMu.Lock()
+	enabled := s.lastDitchEnabled
+	s.lastDitchMu.Unlock()
+	return !enabled
 }
 
 // refreshLastDitchInputs re-reads the battery and reserve values the last-ditch
@@ -772,11 +814,14 @@ func (s *Service) logLastDitchTrigger() {
 	s.logger.Printf("Last-ditch hibernate: no main battery, %s — hibernating", reserve)
 }
 
-// OnLastDitchTriggered logs the trigger and records the hibernate target from
-// the event payload (delegates to OnPowerCommand).
+// OnLastDitchTriggered logs the trigger and records both the automatic
+// provenance and the target it replaced. Keeping provenance separate from the
+// plain hibernate target lets a runtime setting change cancel this transition
+// without touching a concurrent explicit command.
 func (s *Service) OnLastDitchTriggered(c *librefsm.Context) error {
 	s.logLastDitchTrigger()
-	return s.OnPowerCommand(c)
+	s.beginAutomaticLastDitch()
+	return nil
 }
 
 // OnLastDitchWakeup handles a wake from suspend that routes straight to
@@ -787,10 +832,18 @@ func (s *Service) OnLastDitchWakeup(c *librefsm.Context) error {
 		return err
 	}
 	s.logLastDitchTrigger()
+	s.beginAutomaticLastDitch()
+	return nil
+}
+
+func (s *Service) beginAutomaticLastDitch() {
+	if !s.fsmData.AutomaticLastDitch {
+		s.fsmData.LastDitchFallbackTarget = s.fsmData.TargetPowerState
+	}
+	s.fsmData.AutomaticLastDitch = true
 	s.fsmData.TargetPowerState = fsm.TargetHibernate
 	s.fsmData.HibernateForWakeSeconds = 0
 	s.wakeTimerArmed = false
-	return nil
 }
 
 // parseBool accepts the "true"/"false" form battery-service publishes.
@@ -1106,6 +1159,14 @@ func (s *Service) EnterWaitingInhibitors(c *librefsm.Context) error {
 func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	s.logger.Printf("Entering issuing-low-power state")
 
+	// A runtime disable can race with the transition into this state. Re-check
+	// immediately and again at the final poweroff commit below. The event keeps
+	// all FSM data mutation on the FSM goroutine.
+	if s.automaticLastDitchDisabled() {
+		c.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+		return nil
+	}
+
 	// hibernate-for must not poweroff without a confirmed wake source on the
 	// nRF52. We wait for the wake-timer-armed ACK that bluetooth-service writes
 	// when the nRF52 echoes our SET. On timeout, bail out to running.
@@ -1268,6 +1329,14 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 			return nil
 		}
 		s.handleWakeupAfterSuspend(c)
+		return nil
+	}
+
+	// This is the last point where a runtime disable can be honored before the
+	// irreversible systemd poweroff request. A setting update after this check
+	// may already be too late to cancel.
+	if target == "poweroff" && s.automaticLastDitchDisabled() {
+		c.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
 		return nil
 	}
 
@@ -1581,6 +1650,7 @@ func (s *Service) OnVehicleStateChanged(c *librefsm.Context) error {
 	//     during the 5s shutting-down window, then drove off).
 	if (oldState == "stand-by" && newState != "stand-by") || newState == "ready-to-drive" {
 		s.fsmData.TargetPowerState = s.config.DefaultState
+		s.clearAutomaticLastDitch()
 		s.enableModem()
 	}
 
@@ -1605,6 +1675,7 @@ func (s *Service) OnVehicleLeftLowPowerState(c *librefsm.Context) error {
 	}
 
 	s.fsmData.TargetPowerState = s.config.DefaultState
+	s.clearAutomaticLastDitch()
 	s.enableModem()
 	return nil
 }
@@ -1635,6 +1706,7 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 			s.logger.Printf("Target power state: %s -> %s", s.fsmData.TargetPowerState, p.TargetState)
 		}
 		s.fsmData.TargetPowerState = p.TargetState
+		s.clearAutomaticLastDitch()
 		if p.TargetState == fsm.TargetRun {
 			s.enableModem()
 		}
@@ -1652,6 +1724,29 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 	return nil
 }
 
+// OnLastDitchDisabled restores the target that an automatic last-ditch
+// transition replaced.
+func (s *Service) OnLastDitchDisabled(c *librefsm.Context) error {
+	fallback := s.fsmData.LastDitchFallbackTarget
+	if fallback == "" {
+		fallback = s.config.DefaultState
+	}
+	s.logger.Printf("Automatic last-ditch hibernate disabled while pending; restoring target %s", fallback)
+	s.fsmData.TargetPowerState = fallback
+	s.fsmData.HibernateForWakeSeconds = 0
+	s.wakeTimerArmed = false
+	s.clearAutomaticLastDitch()
+	if fallback == fsm.TargetRun {
+		s.enableModem()
+	}
+	return nil
+}
+
+func (s *Service) clearAutomaticLastDitch() {
+	s.fsmData.AutomaticLastDitch = false
+	s.fsmData.LastDitchFallbackTarget = ""
+}
+
 // OnDefaultStateChanged applies a runtime pm.default-state change to the FSM
 // target. The settings handler follows up with EvVehicleStateChanged so the
 // natural low-power path re-evaluates with the new target immediately instead
@@ -1665,6 +1760,7 @@ func (s *Service) OnDefaultStateChanged(c *librefsm.Context) error {
 		s.logger.Printf("Target power state: %s -> %s (default-state change)", s.fsmData.TargetPowerState, p.TargetState)
 	}
 	s.fsmData.TargetPowerState = p.TargetState
+	s.clearAutomaticLastDitch()
 	s.fsmData.HibernateForWakeSeconds = 0
 	s.wakeTimerArmed = false
 	return nil
@@ -1992,6 +2088,55 @@ func (s *Service) onScheduledHibernateEnabledSetting(value string) error {
 	}
 	s.scheduler.SetEnabled(value == "true")
 	return nil
+}
+
+// onLastDitchHibernateEnabledSetting controls only telemetry-triggered
+// last-ditch hibernation. Explicit power commands and other automatic policies
+// have separate FSM events and are not gated here.
+func (s *Service) onLastDitchHibernateEnabledSetting(value string) error {
+	changed, enabled := s.setLastDitchHibernateEnabled(value)
+	if !changed || s.machine == nil {
+		return nil
+	}
+	if enabled {
+		// Re-evaluate immediately so enabling while the reserve condition already
+		// holds does not wait for another telemetry update.
+		s.sendLastDitchCheck()
+	} else {
+		// FSM provenance guards make this a no-op for explicit/manual requests.
+		s.machine.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	}
+	return nil
+}
+
+func (s *Service) setLastDitchHibernateEnabled(value string) (changed, enabled bool) {
+	enabled, valid := parseSettingBool(value)
+	if !valid {
+		enabled = true
+		s.logger.Printf("Invalid pm.last-ditch-hibernate-enabled setting %q; failing safe to enabled", value)
+	}
+
+	s.lastDitchMu.Lock()
+	changed = s.lastDitchEnabled != enabled
+	s.lastDitchEnabled = enabled
+	s.lastDitchMu.Unlock()
+	if valid && changed {
+		s.logger.Printf("pm.last-ditch-hibernate-enabled set to %t", enabled)
+	}
+	return changed, enabled
+}
+
+// parseSettingBool follows the lowercase true/false form used by the existing
+// settings callbacks while distinguishing invalid input from false.
+func parseSettingBool(value string) (bool, bool) {
+	switch strings.TrimSpace(value) {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // onSuspendWhenOnlineSetting absorbs pm.suspend-when-online. It only matters
