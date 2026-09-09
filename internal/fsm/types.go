@@ -59,11 +59,11 @@ const (
 	// before this event can act, so a runtime setting change cannot cancel them.
 	EvLastDitchDisabled librefsm.EventID = "last-ditch-disabled"
 
-	// pm.default-state changed at runtime. Only handled in Running: the
-	// action stores the new target in fsmData so a follow-up
-	// EvVehicleStateChanged re-evaluates the natural low-power path with it.
-	// A change to "run" is sent as EvPowerRun instead, which also cancels a
-	// countdown already in flight.
+	// pm.default-state changed at runtime. In Running, the action stores the new
+	// target so a follow-up EvVehicleStateChanged re-evaluates the natural
+	// low-power path. During automatic last-ditch, it updates the cancellation
+	// fallback without replacing the emergency transition. A change to "run" is
+	// sent as EvPowerRun instead, which also cancels a countdown already in flight.
 	EvDefaultStateChanged librefsm.EventID = "default-state-changed"
 
 	// Timer events
@@ -164,7 +164,6 @@ type Actions interface {
 	IsLastDitchTriggered(c *librefsm.Context) bool
 	IsLastDitchApplicableTarget(c *librefsm.Context) bool
 	IsAutomaticLastDitch(c *librefsm.Context) bool
-	IsLastDitchFallbackSuspend(c *librefsm.Context) bool
 	IsPowerCommandHigherPriority(c *librefsm.Context) bool
 
 	// Transition actions
@@ -180,6 +179,7 @@ type Actions interface {
 	OnLastDitchTriggered(c *librefsm.Context) error
 	OnLastDitchWakeup(c *librefsm.Context) error
 	OnLastDitchDisabled(c *librefsm.Context) error
+	OnLastDitchDefaultStateChanged(c *librefsm.Context) error
 	OnDefaultStateChanged(c *librefsm.Context) error
 
 	// Publishing

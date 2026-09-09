@@ -25,15 +25,23 @@ type mockActions struct {
 	onPowerCommandCount       int
 	onLastDitchTriggeredCount int
 	onLastDitchWakeupCount    int
+	enterIssuingStarted       chan struct{}
+	releaseEnterIssuing       chan struct{}
 }
 
 func (m *mockActions) EnterPreSuspend(c *librefsm.Context) error        { return nil }
 func (m *mockActions) EnterSuspendImminent(c *librefsm.Context) error   { return nil }
 func (m *mockActions) EnterLowPowerImminent(c *librefsm.Context) error  { return nil }
 func (m *mockActions) EnterWaitingInhibitors(c *librefsm.Context) error { return nil }
-func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error   { return nil }
-func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error    { return nil }
-func (m *mockActions) CanEnterLowPowerState(c *librefsm.Context) bool   { return m.canEnterLowPower }
+func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error {
+	if m.enterIssuingStarted != nil {
+		m.enterIssuingStarted <- struct{}{}
+		<-m.releaseEnterIssuing
+	}
+	return nil
+}
+func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error  { return nil }
+func (m *mockActions) CanEnterLowPowerState(c *librefsm.Context) bool { return m.canEnterLowPower }
 func (m *mockActions) HasNoBlockingInhibitors(c *librefsm.Context) bool {
 	return !m.hasBlockingInhibitors
 }
@@ -56,9 +64,6 @@ func (m *mockActions) IsLastDitchTriggered(c *librefsm.Context) bool {
 func (m *mockActions) IsLastDitchApplicableTarget(c *librefsm.Context) bool { return true }
 func (m *mockActions) IsAutomaticLastDitch(c *librefsm.Context) bool {
 	return m.automaticLastDitch
-}
-func (m *mockActions) IsLastDitchFallbackSuspend(c *librefsm.Context) bool {
-	return m.lastDitchFallbackSuspend
 }
 func (m *mockActions) IsPowerCommandHigherPriority(c *librefsm.Context) bool { return true }
 func (m *mockActions) OnPreSuspendTimeout(c *librefsm.Context) error         { return nil }
@@ -86,6 +91,14 @@ func (m *mockActions) OnLastDitchWakeup(c *librefsm.Context) error {
 }
 func (m *mockActions) OnLastDitchDisabled(c *librefsm.Context) error {
 	m.automaticLastDitch = false
+	m.targetSuspend = m.lastDitchFallbackSuspend
+	c.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged})
+	return nil
+}
+func (m *mockActions) OnLastDitchDefaultStateChanged(c *librefsm.Context) error {
+	if p, ok := c.Event.Payload.(fsm.PowerCommandPayload); ok {
+		m.lastDitchFallbackSuspend = p.TargetState == fsm.TargetSuspend
+	}
 	return nil
 }
 func (m *mockActions) OnDefaultStateChanged(c *librefsm.Context) error { return nil }
@@ -890,8 +903,43 @@ func TestDisablingPendingLastDitchRestoresSuspend(t *testing.T) {
 	machine.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
 	time.Sleep(10 * time.Millisecond)
 
-	if !machine.IsInState(fsm.StateSuspendImminent) {
-		t.Errorf("Expected suspended path to resume, got %v", machine.CurrentState())
+	if !machine.IsInState(fsm.StatePreSuspend) {
+		t.Errorf("Expected normal suspend evaluation to enter pre-suspend, got %v", machine.CurrentState())
+	}
+}
+
+func TestDisablingPendingLastDitchRechecksSuspendEligibility(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:         true,
+		lastDitchTriggered:       true,
+		lastDitchFallbackSuspend: true,
+	}
+
+	def := fsm.NewDefinition(actions, time.Second, time.Second)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCheck})
+	time.Sleep(10 * time.Millisecond)
+	if !machine.IsInState(fsm.StateLowPowerImminent) {
+		t.Fatalf("Expected StateLowPowerImminent, got %v", machine.CurrentState())
+	}
+	// Model a present battery or connected remote-access provider appearing
+	// while automatic hibernate was pending. CurrentState's lock synchronizes
+	// with the guard evaluation that admitted the transition above.
+	actions.canEnterLowPower = false
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StateRunning) {
+		t.Errorf("Suspend fallback bypassed normal eligibility, state=%v", machine.CurrentState())
 	}
 }
 
@@ -924,6 +972,97 @@ func TestDisablingLastDitchDoesNotCancelExplicitHibernate(t *testing.T) {
 	}
 	if actions.automaticLastDitch {
 		t.Fatal("explicit command did not clear automatic provenance")
+	}
+}
+
+func TestExplicitHibernateTakesOverIssuingLastDitchBeforeDisable(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		event librefsm.EventID
+	}{
+		{name: "hibernate", event: fsm.EvPowerHibernate},
+		{name: "hibernate-manual", event: fsm.EvPowerHibernateManual},
+		{name: "hibernate-for", event: fsm.EvPowerHibernateFor},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			started := make(chan struct{}, 1)
+			release := make(chan struct{})
+			actions := &mockActions{
+				canEnterLowPower:      true,
+				lastDitchTriggered:    true,
+				enterIssuingStarted:   started,
+				releaseEnterIssuing:   release,
+				hasBlockingInhibitors: false,
+			}
+
+			def := fsm.NewDefinition(actions, time.Second, time.Second)
+			machine, err := def.Build()
+			if err != nil {
+				t.Fatalf("Failed to build FSM: %v", err)
+			}
+			ctx := context.Background()
+			if err := machine.Start(ctx); err != nil {
+				t.Fatalf("Failed to start FSM: %v", err)
+			}
+			defer machine.Stop()
+
+			machine.Send(librefsm.Event{ID: fsm.EvLastDitchCheck})
+			time.Sleep(10 * time.Millisecond)
+			machine.Send(librefsm.Event{ID: fsm.EvSuspendImminentTimeout})
+			time.Sleep(10 * time.Millisecond)
+			machine.Send(librefsm.Event{ID: fsm.EvInhibitorsChanged})
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("issuing entry did not start")
+			}
+
+			// These events queue while issuing entry is blocked. Explicit intent must
+			// clear automatic provenance before the later setting-disable event acts.
+			machine.Send(librefsm.Event{ID: test.event})
+			machine.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+			close(release)
+			time.Sleep(20 * time.Millisecond)
+
+			if !machine.IsInState(fsm.StateLowPowerImminent) {
+				t.Errorf("Explicit hibernate was discarded or cancelled, state=%v", machine.CurrentState())
+			}
+			if actions.automaticLastDitch {
+				t.Fatal("explicit issuing-state takeover did not clear automatic provenance")
+			}
+		})
+	}
+}
+
+func TestDefaultStateUpdateChangesLastDitchCancellationFallback(t *testing.T) {
+	actions := &mockActions{
+		canEnterLowPower:   true,
+		lastDitchTriggered: true,
+	}
+
+	def := fsm.NewDefinition(actions, time.Second, time.Second)
+	machine, err := def.Build()
+	if err != nil {
+		t.Fatalf("Failed to build FSM: %v", err)
+	}
+	ctx := context.Background()
+	if err := machine.Start(ctx); err != nil {
+		t.Fatalf("Failed to start FSM: %v", err)
+	}
+	defer machine.Stop()
+
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchCheck})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{
+		ID:      fsm.EvDefaultStateChanged,
+		Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetSuspend},
+	})
+	time.Sleep(10 * time.Millisecond)
+	machine.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	time.Sleep(10 * time.Millisecond)
+
+	if !machine.IsInState(fsm.StatePreSuspend) {
+		t.Errorf("Updated suspend default was not normally re-evaluated, state=%v", machine.CurrentState())
 	}
 }
 

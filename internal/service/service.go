@@ -680,10 +680,6 @@ func (s *Service) IsAutomaticLastDitch(c *librefsm.Context) bool {
 	return s.fsmData.AutomaticLastDitch
 }
 
-func (s *Service) IsLastDitchFallbackSuspend(c *librefsm.Context) bool {
-	return s.fsmData.LastDitchFallbackTarget == fsm.TargetSuspend
-}
-
 func (s *Service) automaticLastDitchDisabled() bool {
 	if !s.fsmData.AutomaticLastDitch {
 		return false
@@ -1725,7 +1721,9 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 }
 
 // OnLastDitchDisabled restores the target that an automatic last-ditch
-// transition replaced.
+// transition replaced, then queues the same vehicle-state event used for normal
+// target evaluation. The FSM transition first returns to Running, so a suspend
+// fallback must pass CanEnterLowPowerState's live eligibility checks again.
 func (s *Service) OnLastDitchDisabled(c *librefsm.Context) error {
 	fallback := s.fsmData.LastDitchFallbackTarget
 	if fallback == "" {
@@ -1739,6 +1737,30 @@ func (s *Service) OnLastDitchDisabled(c *librefsm.Context) error {
 	if fallback == fsm.TargetRun {
 		s.enableModem()
 	}
+
+	vehicleState := s.fsmData.VehicleState
+	if liveState, err := s.redis.HGet("vehicle", "state"); err == nil && liveState != "" {
+		vehicleState = liveState
+	}
+	c.Send(librefsm.Event{
+		ID:      fsm.EvVehicleStateChanged,
+		Payload: fsm.VehicleStatePayload{State: vehicleState},
+	})
+	return nil
+}
+
+// OnLastDitchDefaultStateChanged updates only the cancellation fallback. The
+// automatic emergency transition remains in progress until explicitly disabled;
+// handling this event on the FSM goroutine prevents a stale captured fallback.
+func (s *Service) OnLastDitchDefaultStateChanged(c *librefsm.Context) error {
+	p, ok := c.Event.Payload.(fsm.PowerCommandPayload)
+	if !ok {
+		return nil
+	}
+	if s.fsmData.LastDitchFallbackTarget != p.TargetState {
+		s.logger.Printf("Automatic last-ditch fallback changed: %s -> %s", s.fsmData.LastDitchFallbackTarget, p.TargetState)
+	}
+	s.fsmData.LastDitchFallbackTarget = p.TargetState
 	return nil
 }
 
