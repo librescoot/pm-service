@@ -2,6 +2,7 @@ package hibernation
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -11,10 +12,18 @@ import (
 )
 
 // FireCooldown is the minimum wall-clock gap enforced between two scheduled
-// hibernation fires. It both deduplicates same-minute cron ticks and guards
-// against runaway expressions like "* * * * *" or "*/5 * * * *" putting the
-// scooter into a hibernate loop after each wake.
+// hibernation fires in the same process. It both deduplicates same-minute cron
+// ticks and suppresses runaway expressions like "* * * * *" or "*/5 * * * *"
+// while the scooter is awake. It does not survive a hibernation: the process is
+// powered off, so lastFired resets on the next boot.
 const FireCooldown = 15 * time.Minute
+
+// MinScheduleInterval is the shortest gap allowed between consecutive
+// occurrences of a scheduled hibernation cron expression. Because FireCooldown
+// only survives within one process, a schedule that fires more often than this
+// cannot be told apart from a hibernate/wake loop across poweroffs, so it is
+// rejected at configuration time instead.
+const MinScheduleInterval = FireCooldown
 
 // Scheduler runs a single cron-style hibernation schedule.
 //
@@ -44,6 +53,7 @@ type Scheduler struct {
 	vehicleStandby bool
 	pendingWake    *time.Time // wall-clock target if a fire is deferred to next standby
 	lastFired      time.Time  // cooldown guard: suppress fires within FireCooldown of the last one
+	suppressUntil  time.Time  // monotonic instant before which scheduled fires are held off
 
 	cronEngine *cron.Cron
 	cronEntry  cron.EntryID
@@ -55,6 +65,8 @@ type Scheduler struct {
 	monitorCancel context.CancelFunc
 	lastWall      time.Time
 	lastMono      time.Time
+	startedWall   time.Time // wall reading (monotonic stripped) at Start
+	startedMono   time.Time
 }
 
 // NewScheduler constructs a scheduler. The onFire callback dispatches
@@ -79,8 +91,11 @@ func (s *Scheduler) Start(ctx context.Context) {
 
 	s.mu.Lock()
 	s.monitorCtx, s.monitorCancel = context.WithCancel(ctx)
-	s.lastWall = time.Now()
-	s.lastMono = s.lastWall
+	now := time.Now()
+	s.lastWall = now.Round(0) // strip monotonic so Sub compares wall time
+	s.lastMono = now
+	s.startedWall = now.Round(0)
+	s.startedMono = now
 	monitorCtx := s.monitorCtx
 	s.mu.Unlock()
 
@@ -111,9 +126,17 @@ func (s *Scheduler) SetEnabled(enabled bool) {
 	s.rebuild()
 }
 
-// SetCron updates the cron expression. An empty or invalid expression
-// effectively disables the schedule.
+// SetCron updates the cron expression. An empty expression disables the
+// schedule. Expressions whose consecutive occurrences are closer than
+// MinScheduleInterval are rejected (the previous expression stays in effect),
+// as are invalid expressions.
 func (s *Scheduler) SetCron(expr string) {
+	if expr != "" {
+		if err := validateCronSchedule(expr); err != nil {
+			s.logger.Printf("Ignoring pm.scheduled-hibernate-cron=%q: %v", expr, err)
+			return
+		}
+	}
 	s.mu.Lock()
 	if s.cronExpr == expr {
 		s.mu.Unlock()
@@ -123,6 +146,47 @@ func (s *Scheduler) SetCron(expr string) {
 	s.mu.Unlock()
 	s.logger.Printf("Scheduled hibernation cron expression set to %q", expr)
 	s.rebuild()
+}
+
+// SuppressScheduledFiresFor holds off scheduled fires for d of process uptime.
+// It is called after waking from a scheduled hibernation so a schedule that
+// fires again immediately cannot put the scooter into a hibernate/wake loop.
+// The guard is deliberately monotonic: the wall clock is not trustworthy until
+// the time-sync gate opens, but CLOCK_MONOTONIC always is.
+func (s *Scheduler) SuppressScheduledFiresFor(d time.Duration) {
+	s.mu.Lock()
+	base := s.startedMono
+	if base.IsZero() {
+		base = time.Now()
+	}
+	s.suppressUntil = base.Add(d)
+	s.mu.Unlock()
+	s.logger.Printf("Scheduled hibernation suppressed for %v of uptime after a scheduled wake", d)
+}
+
+// validateCronSchedule parses expr and rejects any two consecutive occurrences
+// that are closer together than MinScheduleInterval. A bounded sample is
+// enough: low-frequency expressions (yearly included) are caught by their
+// widest gap, and a frequent expression trips on its first pair.
+func validateCronSchedule(expr string) error {
+	sched, err := cron.ParseStandard(expr)
+	if err != nil {
+		return err
+	}
+	const samples = 1000
+	prev := sched.Next(time.Now())
+	for i := 0; i < samples; i++ {
+		next := sched.Next(prev)
+		if next.IsZero() {
+			break
+		}
+		if gap := next.Sub(prev); gap < MinScheduleInterval {
+			return fmt.Errorf("consecutive occurrences %s and %s are only %v apart (minimum %v)",
+				prev.Format(time.RFC3339), next.Format(time.RFC3339), gap, MinScheduleInterval)
+		}
+		prev = next
+	}
+	return nil
 }
 
 // SetDuration updates the wake-by duration applied at fire time.
@@ -168,6 +232,10 @@ func (s *Scheduler) SetTimeSynced(synced bool) {
 		s.pendingWake = nil
 		s.mu.Unlock()
 	}
+	// Honor an occurrence that elapsed while the gate was closed, as long as
+	// the process was already running past it and the wake-by target is still
+	// in the future.
+	s.catchUpMissed()
 }
 
 // OnVehicleStateChanged tells the scheduler the current vehicle state. When
@@ -184,26 +252,37 @@ func (s *Scheduler) OnVehicleStateChanged(state string) {
 	s.mu.Lock()
 	prev := s.vehicleStandby
 	s.vehicleStandby = standby
-	pending := s.pendingWake
-	enabled := s.enabled && s.timeSynced
+
+	var pending time.Time
+	havePending := false
+	if standby && !prev && s.pendingWake != nil {
+		if !s.enabled || !s.timeSynced {
+			// Entering standby while the schedule is inactive cancels the
+			// deferred intent. Without this a stale target would fire on the
+			// next standby transition, long after the schedule that armed it
+			// was turned off.
+			s.logger.Printf("Vehicle entered standby while scheduled hibernation is inactive; dropping pending wake")
+			s.pendingWake = nil
+		} else {
+			// Consume under the same lock as the read so a concurrent fire()
+			// cannot dispatch the same target twice.
+			pending = *s.pendingWake
+			havePending = true
+			s.pendingWake = nil
+		}
+	}
 	maxSec := s.maxSecondsLocked()
 	s.mu.Unlock()
 
-	if !standby || prev == standby || pending == nil || !enabled {
+	if !standby || prev == standby || !havePending {
 		return
 	}
-	wakeSec := pendingWakeSeconds(*pending, time.Now(), maxSec)
+	wakeSec := pendingWakeSeconds(pending, time.Now(), maxSec)
 	if wakeSec == 0 {
 		s.logger.Printf("Pending wake target already in the past on standby; dropping")
-		s.mu.Lock()
-		s.pendingWake = nil
-		s.mu.Unlock()
 		return
 	}
 	s.logger.Printf("Vehicle entered standby with pending wake; firing hibernate-for %d seconds", wakeSec)
-	s.mu.Lock()
-	s.pendingWake = nil
-	s.mu.Unlock()
 	if s.onFire != nil {
 		s.onFire(wakeSec)
 	}
@@ -228,6 +307,11 @@ func (s *Scheduler) fire() {
 		return
 	}
 	now := time.Now()
+	if !s.suppressUntil.IsZero() && now.Before(s.suppressUntil) {
+		s.mu.Unlock()
+		s.logger.Printf("Scheduled hibernation fire suppressed: within startup cooldown after a scheduled wake")
+		return
+	}
 	// Cooldown: suppress fires that come within FireCooldown of the previous
 	// one. This both dedupes same-minute cron ticks and prevents pathological
 	// expressions (e.g. "* * * * *") from re-hibernating the scooter the
@@ -240,9 +324,16 @@ func (s *Scheduler) fire() {
 	s.lastFired = now
 	target := now.Add(s.duration)
 	if s.vehicleStandby {
+		// An immediate fire supersedes any deferred target.
+		s.pendingWake = nil
 		s.mu.Unlock()
 		wakeSec := uint32(s.duration / time.Second)
-		if cap := s.maxSeconds(); wakeSec > cap {
+		if wakeSec == 0 {
+			// Sub-second duration: arm the nRF for at least one second rather
+			// than sending a 0 that the service drops.
+			wakeSec = 1
+		}
+		if cap := s.maxSeconds(); cap > 0 && wakeSec > cap {
 			wakeSec = cap
 		}
 		s.logger.Printf("Scheduled hibernation firing immediately: wake in %d s", wakeSec)
@@ -260,26 +351,37 @@ func (s *Scheduler) fire() {
 // whenever cron/enabled/timeSynced change.
 func (s *Scheduler) rebuild() {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.cronEntry != 0 {
 		s.cronEngine.Remove(s.cronEntry)
 		s.cronEntry = 0
 	}
 	if !s.enabled || s.cronExpr == "" {
-		s.mu.Unlock()
 		return
 	}
-	expr := s.cronExpr
-	s.mu.Unlock()
-
-	id, err := s.cronEngine.AddFunc(expr, s.fire)
+	id, err := s.cronEngine.AddFunc(s.cronExpr, s.fire)
 	if err != nil {
-		s.logger.Printf("Invalid cron expression %q: %v", expr, err)
+		s.logger.Printf("Invalid cron expression %q: %v", s.cronExpr, err)
 		return
 	}
-	s.mu.Lock()
 	s.cronEntry = id
-	s.mu.Unlock()
-	s.logger.Printf("Scheduled hibernation cron entry installed: %q", expr)
+	s.logger.Printf("Scheduled hibernation cron entry installed: %q", s.cronExpr)
+}
+
+// wallJumpThreshold is the wall/monotonic divergence that counts as a clock
+// step warranting a schedule rebuild.
+const wallJumpThreshold = 60 * time.Second
+
+// detectWallJump reports how far the wall clock has drifted from where it would
+// be if only the monotonic clock had advanced. Both wall readings are stripped
+// of their monotonic readings before subtraction: when two time.Time values
+// carry monotonic readings, Time.Sub returns the monotonic difference, which
+// makes an external CLOCK_REALTIME step invisible.
+func detectWallJump(lastWall, lastMono, wallNow, monoNow time.Time) time.Duration {
+	wallElapsed := wallNow.Round(0).Sub(lastWall.Round(0))
+	monoElapsed := monoNow.Sub(lastMono)
+	return wallElapsed - monoElapsed
 }
 
 // monitorLoop watches for wall-clock jumps (typically GPS sync) and rebuilds
@@ -292,28 +394,130 @@ func (s *Scheduler) monitorLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			wallNow := time.Now()
-			s.mu.Lock()
-			monoElapsed := time.Since(s.lastMono)
-			wallElapsed := wallNow.Sub(s.lastWall)
-			s.lastWall = wallNow
-			s.lastMono = time.Now()
-			pending := s.pendingWake
-			s.mu.Unlock()
-
-			jump := wallElapsed - monoElapsed
-			if jump < -60*time.Second || jump > 60*time.Second {
-				s.logger.Printf("Detected wall-clock jump (delta=%v); rebuilding schedule", jump)
-				s.rebuild()
-				if pending != nil && wallNow.After(*pending) {
-					s.logger.Printf("Pending wake target is now in the past after clock jump; dropping")
-					s.mu.Lock()
-					s.pendingWake = nil
-					s.mu.Unlock()
-				}
-			}
+			s.checkClockJump()
 		}
 	}
+}
+
+// checkClockJump compares the wall clock against the monotonic clock since the
+// previous tick and rebuilds the schedule if it moved by more than
+// wallJumpThreshold.
+func (s *Scheduler) checkClockJump() {
+	wallNow := time.Now()
+	monoNow := time.Now()
+
+	s.mu.Lock()
+	lastWall := s.lastWall
+	lastMono := s.lastMono
+	s.lastWall = wallNow.Round(0)
+	s.lastMono = monoNow
+	s.mu.Unlock()
+
+	jump := detectWallJump(lastWall, lastMono, wallNow, monoNow)
+	if jump >= -wallJumpThreshold && jump <= wallJumpThreshold {
+		return
+	}
+	s.logger.Printf("Detected wall-clock jump (delta=%v); rebuilding schedule", jump)
+	s.rebuild()
+
+	s.mu.Lock()
+	pending := s.pendingWake
+	s.mu.Unlock()
+	if pending != nil && wallNow.After(*pending) {
+		s.logger.Printf("Pending wake target is now in the past after clock jump; dropping")
+		s.mu.Lock()
+		if s.pendingWake != nil && !s.pendingWake.After(wallNow) {
+			s.pendingWake = nil
+		}
+		s.mu.Unlock()
+	}
+}
+
+// catchUpWindow bounds how far back catchUpMissed looks for a missed
+// occurrence.
+const catchUpWindow = 48 * time.Hour
+
+// catchUpMissed honors a scheduled occurrence that elapsed during this
+// process's lifetime while timeSynced was still false, provided the resulting
+// wake-by target is still in the future. It is called when the clock first
+// becomes valid.
+//
+// Occurrences older than the process start are ignored. The fake-hwclock can
+// restore a stale wall clock at boot and then step it forward on sync, so an
+// occurrence that appears to be "in the past" after the step did not belong to
+// this run and must not trigger a hibernate.
+func (s *Scheduler) catchUpMissed() {
+	s.mu.Lock()
+	if !s.enabled || !s.timeSynced || s.cronExpr == "" || s.duration <= 0 ||
+		(!s.suppressUntil.IsZero() && time.Now().Before(s.suppressUntil)) {
+		s.mu.Unlock()
+		return
+	}
+	expr := s.cronExpr
+	duration := s.duration
+	startedWall := s.startedWall
+	maxSec := s.maxSecondsLocked()
+	standby := s.vehicleStandby
+	s.mu.Unlock()
+
+	sched, err := cron.ParseStandard(expr)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	prev, ok := previousOccurrence(sched, now, catchUpWindow)
+	if !ok || !prev.After(startedWall) {
+		return
+	}
+	target := prev.Add(duration)
+	if !target.After(now) {
+		// The wake-by target has already passed; hibernating now would defeat
+		// the schedule.
+		return
+	}
+
+	if standby {
+		wakeSec := pendingWakeSeconds(target, now, maxSec)
+		if wakeSec == 0 {
+			return
+		}
+		s.logger.Printf("Catching up missed scheduled hibernation (fired %s); firing immediately: wake in %d s",
+			prev.Format(time.RFC3339), wakeSec)
+		s.mu.Lock()
+		s.lastFired = now
+		s.pendingWake = nil
+		s.mu.Unlock()
+		if s.onFire != nil {
+			s.onFire(wakeSec)
+		}
+		return
+	}
+
+	s.mu.Lock()
+	if !s.enabled || !s.timeSynced || s.cronExpr != expr {
+		s.mu.Unlock()
+		return
+	}
+	s.pendingWake = &target
+	s.mu.Unlock()
+	s.logger.Printf("Catching up missed scheduled hibernation (fired %s); deferred until standby, target wake %s",
+		prev.Format(time.RFC3339), target.Format(time.RFC3339))
+}
+
+// previousOccurrence returns the latest schedule activation at or before now
+// that is no older than now-lookback.
+func previousOccurrence(sched cron.Schedule, now time.Time, lookback time.Duration) (time.Time, bool) {
+	start := now.Add(-lookback).Add(-time.Second)
+	var last time.Time
+	next := sched.Next(start)
+	for i := 0; i < 100000 && !next.IsZero() && !next.After(now); i++ {
+		last = next
+		next = sched.Next(next)
+	}
+	if last.IsZero() {
+		return time.Time{}, false
+	}
+	return last, true
 }
 
 func (s *Scheduler) maxSecondsLocked() uint32 {
