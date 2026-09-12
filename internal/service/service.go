@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -127,6 +128,20 @@ type Service struct {
 	wakeTimerMaxSecondsOver uint32
 	wakeTimerAckTimeoutOver time.Duration
 
+	// clockFloor is the earliest wall-clock reading that can be considered
+	// correct: the newest of the image build time (/etc/build-timestamp) and the
+	// fake-hwclock saved time (/data or /etc fake-hwclock.data). The clock can
+	// never predate the image build, and fake-hwclock only ever advances the
+	// clock on load, so a reading before this floor has not been synced. Set once
+	// in Run().
+	clockFloor time.Time
+	// scheduledMarkerPath records that the last shutdown was a scheduled
+	// hibernation (see writeScheduledHibernateMarker). Injectable for tests.
+	scheduledMarkerPath string
+	// clockImplausibleLogged debounces the one-shot warning in the time-sync
+	// poller; only that goroutine touches it.
+	clockImplausibleLogged bool
+
 	// Setting A ("keep remotely reachable scooters awake"):
 	// pm.suspend-when-online only matters when no main battery is present. The
 	// default true allows suspend even while reachable; false reads
@@ -181,23 +196,24 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 	}
 
 	service := &Service{
-		config:             cfg,
-		logger:             logger,
-		redis:              redisClient,
-		systemdClient:      systemdClient,
-		powerManagerPub:    redisClient.NewHashPublisher("power-manager"),
-		systemPub:          redisClient.NewHashPublisher("system"),
-		busyServicesPub:    redisClient.NewHashPublisher("power-manager:busy-services"),
-		wakeTimerAcks:      make(chan bool, 1),
-		suspendQuiesceAcks: make(chan struct{}, 1),
-		suspendWhenOnline:  true,
-		lastDitchEnabled:   defaultLastDitchHibernateEnabled,
-		cbBatteryCharge:    -1,
-		battery0Present:    true,
-		battery1Present:    true,
-		battery0Charge:     -1,
-		battery1Charge:     -1,
-		auxVoltageMv:       -1,
+		config:              cfg,
+		logger:              logger,
+		redis:               redisClient,
+		systemdClient:       systemdClient,
+		powerManagerPub:     redisClient.NewHashPublisher("power-manager"),
+		systemPub:           redisClient.NewHashPublisher("system"),
+		busyServicesPub:     redisClient.NewHashPublisher("power-manager:busy-services"),
+		scheduledMarkerPath: scheduledHibernateMarkerPath,
+		wakeTimerAcks:       make(chan bool, 1),
+		suspendQuiesceAcks:  make(chan struct{}, 1),
+		suspendWhenOnline:   true,
+		lastDitchEnabled:    defaultLastDitchHibernateEnabled,
+		cbBatteryCharge:     -1,
+		battery0Present:     true,
+		battery1Present:     true,
+		battery0Charge:      -1,
+		battery1Charge:      -1,
+		auxVoltageMv:        -1,
 		fsmData: &fsm.FSMData{
 			TargetPowerState: cfg.DefaultState,
 			VehicleState:     "",
@@ -234,6 +250,11 @@ func (s *Service) Run(ctx context.Context) error {
 	// Read initial states directly before starting any goroutines.
 	// This populates fsmData for startup decisions (hibernation timer, initial trigger)
 	// without racing against FSM action writers.
+	buildTs := loadBuildTimestamp(buildTimestampPath)
+	hwClock := loadHWClock(hwClockPersistPath, hwClockSeedPath)
+	s.clockFloor = laterOf(buildTs, hwClock)
+	s.logger.Printf("Clock plausibility floor: build=%s hwclock=%s -> %s",
+		formatOptionalTime(buildTs), formatOptionalTime(hwClock), formatOptionalTime(s.clockFloor))
 	if vehicleState, err := s.redis.HGet("vehicle", "state"); err == nil && vehicleState != "" {
 		s.fsmData.VehicleState = vehicleState
 		s.lastDitchVehicleStandby = (vehicleState == "stand-by")
@@ -320,6 +341,13 @@ func (s *Service) Run(ctx context.Context) error {
 			if s.machine == nil || wakeSeconds == 0 {
 				return
 			}
+			// Record that this shutdown is a scheduled hibernation. The next
+			// boot uses it to hold off scheduled fires for a while (see
+			// SuppressScheduledFiresFor); a persisted wall time would be
+			// useless because the clock is untrusted across the poweroff.
+			if err := writeScheduledHibernateMarker(s.scheduledMarkerPath); err != nil {
+				s.logger.Printf("Failed to record scheduled-hibernate marker: %v", err)
+			}
 			s.machine.Send(librefsm.Event{
 				ID: fsm.EvPowerHibernateFor,
 				Payload: fsm.PowerCommandPayload{
@@ -330,6 +358,15 @@ func (s *Service) Run(ctx context.Context) error {
 		},
 	)
 	s.scheduler.Start(ctx)
+
+	// If the previous shutdown was a scheduled hibernation, hold off scheduled
+	// fires for the first bit of uptime. This is monotonic, so it works even
+	// though the wall clock is wrong until the time-sync gate opens.
+	if present, err := readAndClearScheduledHibernateMarker(s.scheduledMarkerPath); err != nil {
+		s.logger.Printf("Failed to clear scheduled-hibernate marker: %v", err)
+	} else if present {
+		s.scheduler.SuppressScheduledFiresFor(hibernation.FireCooldown)
+	}
 
 	// Enable wakeup on configured serial ports
 	s.enableWakeupSources()
@@ -432,19 +469,16 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start settings watcher: %v", err)
 	}
 
-	// Poll gps.active as the proxy for "the wall clock has been bootstrapped
-	// from GPS". modem-service calls chronyc settime in the same loop
-	// iteration that flips gps.active to true on a valid fix, so once it's
-	// true, chrony has the time.
+	// Wait until the wall clock is trustworthy before the scheduler may fire.
+	// Two independent signals are accepted: a confirmed GPS `chronyc settime`
+	// or chronyd syncing to a real external source. Both require the reading to
+	// be past the clock plausibility floor.
 	//
-	// We poll instead of pub/sub-watching: modem-service writes the gps hash
-	// either via SetMany(NoPublish) (offline scooters, always) or
-	// SetManyPublishOne(data, "timestamp") (online recovery only) — neither
-	// path fires an OnField("active") subscription. The poller does an
-	// immediate first check, then every 30 s; once it sees "true" the
-	// scheduler is latched and the poller exits. NTP-only scooters without a
-	// GPS receiver would never flip this; documented v1 limitation.
-	go s.pollGPSActiveForTimeSync(ctx)
+	// We poll instead of pub/sub-watching: modem-service writes the clock hash
+	// with SetMany(NoPublish), which does not fire an OnField subscription. The
+	// poller does an immediate first check, then every 30 s; once the clock is
+	// validated the scheduler is latched and the poller exits.
+	go s.pollForTimeSync(ctx)
 
 	// Re-check the last-ditch condition once the boot grace expires, so a
 	// trigger suppressed during the grace still fires even if no further
@@ -2228,24 +2262,57 @@ func (s *Service) onScheduledHibernateDurationSetting(value string) error {
 		s.logger.Printf("Ignoring invalid pm.scheduled-hibernate-duration=%q: %v", value, err)
 		return nil
 	}
+	if d > 0 && d < time.Second {
+		// A sub-second duration truncates to a 0-second wake request, which the
+		// scheduler drops silently. Reject it instead of doing nothing at fire
+		// time. (0 still disables the schedule.)
+		s.logger.Printf("Ignoring pm.scheduled-hibernate-duration=%q: below 1s", value)
+		return nil
+	}
 	s.scheduler.SetDuration(d)
 	return nil
 }
 
-// pollGPSActiveForTimeSync polls Redis until gps.active becomes "true", then
-// latches the scheduler's time-synced gate and exits. See the wiring comment
-// in Run() for why a poller is used instead of a hash watcher.
-func (s *Service) pollGPSActiveForTimeSync(ctx context.Context) {
+// pollForTimeSync polls until the wall clock is trustworthy, then latches the
+// scheduler's time-synced gate and exits.
+//
+// Two independent signals are accepted, because the two time paths behave
+// differently on the MDB: NTP reaches chronyd directly, while GPS arrives via
+// `chronyc settime`, which steps the clock without creating a chrony reference
+// (so chronyc tracking stays "Not synchronised" on a GPS-only scooter).
+//
+//   - GPS: modem-service confirmed a successful `chronyc settime` (the clock
+//     hash). This is deliberately not `gps.active`: a fix can exist while the
+//     settime fails, which leaves the wall clock unset.
+//   - NTP: chronyd reports a real external reference (see ntpSynced).
+//
+// Both require the clock to be past the plausibility floor.
+func (s *Service) pollForTimeSync(ctx context.Context) {
 	check := func() bool {
-		val, err := s.redis.HGet("gps", "active")
-		if err != nil {
-			return false
-		}
-		if val == "true" && s.scheduler != nil {
-			s.scheduler.SetTimeSynced(true)
+		if s.scheduler == nil {
 			return true
 		}
-		return false
+		now := time.Now()
+		gpsSynced := s.gpsClockSynced()
+		ntpOK := false
+		if !gpsSynced {
+			ntpOK = ntpSynced()
+		}
+		if !timeSyncEvidence(gpsSynced, ntpOK, now, s.clockFloor) {
+			if !s.clockImplausibleLogged && !clockPlausible(now, s.clockFloor) {
+				s.logger.Printf("Wall clock %s predates the plausibility floor %s; waiting for time sync",
+					now.UTC().Format(time.RFC3339), formatOptionalTime(s.clockFloor))
+				s.clockImplausibleLogged = true
+			}
+			return false
+		}
+		if gpsSynced {
+			s.logger.Printf("Wall clock validated by GPS (chronyc settime confirmed)")
+		} else {
+			s.logger.Printf("Wall clock validated by NTP")
+		}
+		s.scheduler.SetTimeSynced(true)
+		return true
 	}
 	if check() {
 		return
@@ -2262,6 +2329,178 @@ func (s *Service) pollGPSActiveForTimeSync(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// gpsClockSynced reports whether modem-service confirmed that chronyc accepted
+// a GPS time sample this boot. modem-service writes the clock hash only after a
+// successful `chronyc settime`; Redis is not persistent, so the field cannot be
+// stale from a previous boot.
+func (s *Service) gpsClockSynced() bool {
+	val, err := s.redis.HGet("clock", "synced-at")
+	return err == nil && val != ""
+}
+
+// timeSyncEvidence reports whether the clock can be trusted given the two
+// independent signals. The plausibility floor is required for both: a
+// "synchronised" clock can be wrong if it is pinned to a local pseudo-source.
+func timeSyncEvidence(gpsSettime, ntp bool, now, floor time.Time) bool {
+	return clockPlausible(now, floor) && (gpsSettime || ntp)
+}
+
+const (
+	// buildTimestampPath is written by librescoot-hwclock-seed.inc so userspace
+	// can tell a merely plausible clock from a synced one.
+	buildTimestampPath = "/etc/build-timestamp"
+	// fake-hwclock keeps a persistent copy under /data and a build-time seed
+	// under /etc; either is a valid clock lower bound.
+	hwClockPersistPath = "/data/fake-hwclock.data"
+	hwClockSeedPath    = "/etc/fake-hwclock.data"
+	// scheduledHibernateMarkerPath records that the last shutdown was a
+	// scheduled hibernation. It is a flag, not a timestamp: the clock cannot be
+	// trusted across the poweroff, so the guard it feeds is uptime based.
+	scheduledHibernateMarkerPath = "/data/pm-scheduled-hibernate"
+)
+
+// clockPlausible reports whether the wall clock is at least as new as floor.
+// A zero floor disables the check.
+func clockPlausible(now, floor time.Time) bool {
+	if floor.IsZero() {
+		return true
+	}
+	return !now.Before(floor)
+}
+
+// loadBuildTimestamp reads the image build time (epoch seconds). A missing or
+// malformed file yields the zero time, which disables that contribution to the
+// floor.
+func loadBuildTimestamp(path string) time.Time {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}
+	}
+	secs, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || secs <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(secs, 0)
+}
+
+// loadHWClock returns the newest timestamp across the fake-hwclock files. The
+// files hold UTC "YYYY-MM-DD HH:MM:SS" strings (see the fake-hwclock script);
+// missing or malformed entries are skipped. fake-hwclock only advances the
+// clock on load, so the newest entry is a valid lower bound for the booted
+// system clock.
+func loadHWClock(paths ...string) time.Time {
+	var newest time.Time
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		ts, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(string(data)), time.UTC)
+		if err != nil {
+			continue
+		}
+		newest = laterOf(newest, ts)
+	}
+	return newest
+}
+
+func laterOf(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+func formatOptionalTime(t time.Time) string {
+	if t.IsZero() {
+		return "none"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// chronycBinary is overridable for tests.
+var chronycBinary = "chronyc"
+
+// ntpSynced reports whether chronyd has converged on a real external source.
+//
+// Leap status alone is not sufficient: with the `local stratum N` directive and
+// no reachable source, chronyd serves its own clock to clients and tracking
+// reports "Leap status: Normal" with Reference ID 7F7F0101 (127.127.1.1). Any
+// 127.0.0.0/8 reference is therefore rejected.
+func ntpSynced() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, chronycBinary, "tracking").Output()
+	if err != nil {
+		return false
+	}
+	refid, leap := parseChronyTracking(string(out))
+	return leap == "Normal" && !isPseudoRefID(refid)
+}
+
+// parseChronyTracking extracts the Reference ID and Leap status fields from
+// `chronyc tracking` output.
+func parseChronyTracking(out string) (refid, leap string) {
+	for _, line := range strings.Split(out, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "Reference ID":
+			if fields := strings.Fields(strings.TrimSpace(value)); len(fields) > 0 {
+				refid = fields[0]
+			}
+		case "Leap status":
+			leap = strings.TrimSpace(value)
+		}
+	}
+	return refid, leap
+}
+
+// isPseudoRefID reports whether a chrony reference ID denotes a local
+// pseudo-reference (local or manual mode) rather than a real source. chrony
+// prints IPv4 reference IDs as hex; the dotted form is accepted for older
+// versions. A bare hostname is treated as real.
+func isPseudoRefID(refid string) bool {
+	refid = strings.TrimSpace(refid)
+	if refid == "" {
+		return true
+	}
+	var ip net.IP
+	if strings.Contains(refid, ".") {
+		ip = net.ParseIP(refid)
+	} else if v, err := strconv.ParseUint(refid, 16, 32); err == nil {
+		ip = net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
+	}
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsUnspecified()
+}
+
+// writeScheduledHibernateMarker records that the last shutdown was a scheduled
+// hibernation. A persisted timestamp would be useless because the clock is
+// untrusted across the poweroff; this is only a flag.
+func writeScheduledHibernateMarker(path string) error {
+	return os.WriteFile(path, []byte("1\n"), 0o644)
+}
+
+// readAndClearScheduledHibernateMarker reports whether the marker was present
+// and removes it, so the uptime cooldown applies to exactly one boot.
+func readAndClearScheduledHibernateMarker(path string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := os.Remove(path); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // onPowerStateSent is invoked when bluetooth-service confirms it forwarded a
