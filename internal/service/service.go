@@ -106,6 +106,7 @@ type Service struct {
 	// and suppress their respective sub-conditions.
 	lastDitchMu      sync.Mutex
 	lastDitchEnabled bool // pm.last-ditch-hibernate-enabled; production default is true
+	cbBatteryPresent bool // defaults to true so we don't suppress before first sync
 	cbBatteryCharge  int  // 0..100, -1 if unknown
 	battery0Present  bool // defaults to true so we don't trigger before first sync
 	battery1Present  bool
@@ -215,6 +216,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		suspendQuiesceAcks:  make(chan struct{}, 1),
 		suspendWhenOnline:   true,
 		lastDitchEnabled:    defaultLastDitchHibernateEnabled,
+		cbBatteryPresent:    true,
 		cbBatteryCharge:     -1,
 		battery0Present:     true,
 		battery1Present:     true,
@@ -297,6 +299,9 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	if v, err := s.redis.HGet("battery:1", "charge"); err == nil && v != "" {
 		s.battery1Charge = parseChargeOrUnknown(v)
+	}
+	if v, err := s.redis.HGet("cb-battery", "present"); err == nil && v != "" {
+		s.cbBatteryPresent = parseBool(v)
 	}
 	if v, err := s.redis.HGet("cb-battery", "charge"); err == nil && v != "" {
 		s.cbBatteryCharge = parseChargeOrUnknown(v)
@@ -445,6 +450,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if err := s.redis.NewHashWatcher("cb-battery").
+		OnField("present", s.onCBBatteryPresentChanged).
 		OnField("charge", s.onCBBatteryChargeChanged).
 		StartWithSync(); err != nil {
 		return fmt.Errorf("failed to start cb-battery watcher: %v", err)
@@ -599,6 +605,14 @@ func (s *Service) onBatteryChargeChanged(slot, v string) error {
 	return nil
 }
 
+func (s *Service) onCBBatteryPresentChanged(v string) error {
+	s.lastDitchMu.Lock()
+	s.cbBatteryPresent = parseBool(v)
+	s.lastDitchMu.Unlock()
+	s.sendLastDitchCheck()
+	return nil
+}
+
 func (s *Service) onCBBatteryChargeChanged(v string) error {
 	charge := parseChargeOrUnknown(v)
 	s.lastDitchMu.Lock()
@@ -639,8 +653,8 @@ func (s *Service) setAuxVoltageLocked(mv int) {
 //
 //	(both main slots missing — present=false OR charge==0)
 //	AND
-//	(CBB charge < lastDitchHibernateCBBThreshold OR aux below the Schmitt
-//	 threshold).
+//	(CBB present and charge < lastDitchHibernateCBBThreshold OR aux below the
+//	 Schmitt threshold).
 //
 // Within lastDitchHibernateBootGrace of startup it reports false (see the
 // constant's comment for the wake-race rationale); the grace suppression is
@@ -654,7 +668,7 @@ func (s *Service) lastDitchTriggeredLocked() bool {
 	slot0Missing := !s.battery0Present || s.battery0Charge == 0
 	slot1Missing := !s.battery1Present || s.battery1Charge == 0
 	bothMissing := slot0Missing && slot1Missing
-	cbbLow := cbb >= 0 && cbb < lastDitchHibernateCBBThreshold
+	cbbLow := s.cbBatteryPresent && cbb >= 0 && cbb < lastDitchHibernateCBBThreshold
 
 	if !(bothMissing && (cbbLow || s.auxLowLatched)) {
 		return false
@@ -754,6 +768,7 @@ func (s *Service) refreshLastDitchInputs() {
 	b1Present := read("battery:1", "present")
 	b0Charge := read("battery:0", "charge")
 	b1Charge := read("battery:1", "charge")
+	cbbPresent := read("cb-battery", "present")
 	cbb := read("cb-battery", "charge")
 	aux := read("aux-battery", "voltage")
 
@@ -771,6 +786,9 @@ func (s *Service) refreshLastDitchInputs() {
 	}
 	if b1Charge.ok {
 		s.battery1Charge = parseChargeOrUnknown(b1Charge.value)
+	}
+	if cbbPresent.ok {
+		s.cbBatteryPresent = parseBool(cbbPresent.value)
 	}
 	if cbb.ok {
 		s.cbBatteryCharge = parseChargeOrUnknown(cbb.value)
@@ -835,7 +853,7 @@ func (s *Service) awaitFreshTelemetryForLastDitch() {
 func (s *Service) logLastDitchTrigger() {
 	s.lastDitchMu.Lock()
 	cbb := s.cbBatteryCharge
-	cbbLow := cbb >= 0 && cbb < lastDitchHibernateCBBThreshold
+	cbbLow := s.cbBatteryPresent && cbb >= 0 && cbb < lastDitchHibernateCBBThreshold
 	auxLow := s.auxLowLatched
 	auxMv := s.auxVoltageMv
 	s.lastDitchMu.Unlock()

@@ -17,6 +17,7 @@ func newLastDitchService(t *testing.T) *Service {
 	return &Service{
 		logger:              log.New(io.Discard, "", 0),
 		lastDitchEnabled:    defaultLastDitchHibernateEnabled,
+		cbBatteryPresent:    true,
 		lastDitchGraceUntil: time.Now().Add(-time.Minute),
 	}
 }
@@ -26,31 +27,34 @@ func TestLastDitchTriggered(t *testing.T) {
 		name                 string
 		b0Present, b1Present bool
 		b0Charge, b1Charge   int
+		cbbPresent           bool
 		cbb                  int
 		auxLow               bool
 		want                 bool
 	}{
 		// A usable main battery is the whole reason not to hibernate.
-		{"main battery present and charged", true, false, 80, -1, 0, true, false},
-		{"second slot carries it", false, true, -1, 80, 0, true, false},
+		{"main battery present and charged", true, false, 80, -1, true, 0, true, false},
+		{"second slot carries it", false, true, -1, 80, true, 0, true, false},
 
 		// Both slots gone is necessary but never sufficient on its own.
-		{"both slots gone, reserves fine", false, false, 0, 0, 90, false, false},
-		{"both slots gone, CBB low", false, false, 0, 0, 10, false, true},
-		{"both slots gone, aux low", false, false, 0, 0, 90, true, true},
-		{"both slots gone, both reserves low", false, false, 0, 0, 10, true, true},
+		{"both slots gone, reserves fine", false, false, 0, 0, true, 90, false, false},
+		{"both slots gone, CBB low", false, false, 0, 0, true, 10, false, true},
+		{"absent CBB does not count as empty", false, false, 0, 0, false, 0, false, false},
+		{"absent CBB but aux latched still fires", false, false, 0, 0, false, 0, true, true},
+		{"both slots gone, aux low", false, false, 0, 0, true, 90, true, true},
+		{"both slots gone, both reserves low", false, false, 0, 0, true, 10, true, true},
 
 		// Present but flat counts as missing: a 0% pack cannot move the scooter.
-		{"present but flat", true, true, 0, 0, 10, false, true},
+		{"present but flat", true, true, 0, 0, true, 10, false, true},
 
 		// Unknown must not be read as empty, or a scooter hibernates because a
 		// reading has not arrived yet.
-		{"CBB unknown suppresses its arm", false, false, 0, 0, -1, false, false},
-		{"CBB unknown but aux latched still fires", false, false, 0, 0, -1, true, true},
+		{"CBB unknown suppresses its arm", false, false, 0, 0, true, -1, false, false},
+		{"CBB unknown but aux latched still fires", false, false, 0, 0, true, -1, true, true},
 
 		// Exactly at the threshold is not below it.
-		{"CBB exactly at threshold", false, false, 0, 0, lastDitchHibernateCBBThreshold, false, false},
-		{"CBB one under threshold", false, false, 0, 0, lastDitchHibernateCBBThreshold - 1, false, true},
+		{"CBB exactly at threshold", false, false, 0, 0, true, lastDitchHibernateCBBThreshold, false, false},
+		{"CBB one under threshold", false, false, 0, 0, true, lastDitchHibernateCBBThreshold - 1, false, true},
 	}
 
 	for _, tt := range tests {
@@ -58,6 +62,7 @@ func TestLastDitchTriggered(t *testing.T) {
 			s := newLastDitchService(t)
 			s.battery0Present, s.battery1Present = tt.b0Present, tt.b1Present
 			s.battery0Charge, s.battery1Charge = tt.b0Charge, tt.b1Charge
+			s.cbBatteryPresent = tt.cbbPresent
 			s.cbBatteryCharge = tt.cbb
 			s.auxLowLatched = tt.auxLow
 
