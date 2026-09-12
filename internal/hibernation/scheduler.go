@@ -60,6 +60,7 @@ type Scheduler struct {
 
 	maxSeconds func() uint32
 	onFire     func(wakeSeconds uint32)
+	clockValid func() bool // optional; nil means "always valid"
 
 	monitorCtx    context.Context
 	monitorCancel context.CancelFunc
@@ -111,6 +112,26 @@ func (s *Scheduler) Close() {
 	}
 	s.mu.Unlock()
 	s.cronEngine.Stop()
+}
+
+// SetClockValidator installs a predicate consulted before any scheduled
+// hibernation is dispatched. It catches a wall clock that has not kept pace
+// with CLOCK_BOOTTIME (e.g. a resume from suspend on which the clock froze),
+// which the wall-clock jump monitor cannot see because it compares against
+// CLOCK_MONOTONIC. A nil validator means "always valid".
+func (s *Scheduler) SetClockValidator(f func() bool) {
+	s.mu.Lock()
+	s.clockValid = f
+	s.mu.Unlock()
+}
+
+// clockOK reports whether the injected clock validator (if any) accepts the
+// current clock.
+func (s *Scheduler) clockOK() bool {
+	if s.clockValid == nil {
+		return true
+	}
+	return s.clockValid()
 }
 
 // SetEnabled toggles whether the schedule is allowed to fire.
@@ -263,6 +284,11 @@ func (s *Scheduler) OnVehicleStateChanged(state string) {
 			// was turned off.
 			s.logger.Printf("Vehicle entered standby while scheduled hibernation is inactive; dropping pending wake")
 			s.pendingWake = nil
+		} else if !s.clockOK() {
+			// Retain the pending target: the clock is implausible (e.g. a
+			// resume on which the wall clock did not keep pace with
+			// CLOCK_BOOTTIME). dispatchPending retries after a correction.
+			s.logger.Printf("Pending wake retained: wall clock has not kept pace with elapsed boot time")
 		} else {
 			// Consume under the same lock as the read so a concurrent fire()
 			// cannot dispatch the same target twice.
@@ -304,6 +330,11 @@ func (s *Scheduler) fire() {
 		}
 		s.mu.Unlock()
 		s.logger.Printf("Scheduled hibernation fire suppressed: %s", strings.Join(reasons, ", "))
+		return
+	}
+	if !s.clockOK() {
+		s.mu.Unlock()
+		s.logger.Printf("Scheduled hibernation fire suppressed: wall clock has not kept pace with elapsed boot time")
 		return
 	}
 	now := time.Now()
@@ -431,6 +462,15 @@ func (s *Scheduler) checkClockJump() {
 		}
 		s.mu.Unlock()
 	}
+
+	if jump > wallJumpThreshold {
+		// A forward step is a correction (typically chrony or GPS catching up
+		// after a resume on which the clock froze). Reconsider occurrences
+		// missed while the clock was implausible, then any retained pending
+		// wake.
+		s.catchUpMissed()
+		s.dispatchPending()
+	}
 }
 
 // catchUpWindow bounds how far back catchUpMissed looks for a missed
@@ -449,13 +489,14 @@ const catchUpWindow = 48 * time.Hour
 func (s *Scheduler) catchUpMissed() {
 	s.mu.Lock()
 	if !s.enabled || !s.timeSynced || s.cronExpr == "" || s.duration <= 0 ||
-		(!s.suppressUntil.IsZero() && time.Now().Before(s.suppressUntil)) {
+		(!s.suppressUntil.IsZero() && time.Now().Before(s.suppressUntil)) || !s.clockOK() {
 		s.mu.Unlock()
 		return
 	}
 	expr := s.cronExpr
 	duration := s.duration
 	startedWall := s.startedWall
+	lastFired := s.lastFired
 	maxSec := s.maxSecondsLocked()
 	standby := s.vehicleStandby
 	s.mu.Unlock()
@@ -467,6 +508,10 @@ func (s *Scheduler) catchUpMissed() {
 	now := time.Now()
 	prev, ok := previousOccurrence(sched, now, catchUpWindow)
 	if !ok || !prev.After(startedWall) {
+		return
+	}
+	if !lastFired.IsZero() && !prev.After(lastFired) {
+		// Already handled: this occurrence is not one that was missed.
 		return
 	}
 	target := prev.Add(duration)
@@ -502,6 +547,31 @@ func (s *Scheduler) catchUpMissed() {
 	s.mu.Unlock()
 	s.logger.Printf("Catching up missed scheduled hibernation (fired %s); deferred until standby, target wake %s",
 		prev.Format(time.RFC3339), target.Format(time.RFC3339))
+}
+
+// dispatchPending fires a retained pending wake once the vehicle is in standby
+// and the clock is plausible again. It is the retry path after a clock
+// correction and a no-op otherwise.
+func (s *Scheduler) dispatchPending() {
+	s.mu.Lock()
+	if !s.enabled || !s.timeSynced || !s.vehicleStandby || s.pendingWake == nil || !s.clockOK() {
+		s.mu.Unlock()
+		return
+	}
+	pending := *s.pendingWake
+	maxSec := s.maxSecondsLocked()
+	s.pendingWake = nil
+	s.mu.Unlock()
+
+	wakeSec := pendingWakeSeconds(pending, time.Now(), maxSec)
+	if wakeSec == 0 {
+		s.logger.Printf("Pending wake target already in the past after clock correction; dropping")
+		return
+	}
+	s.logger.Printf("Dispatching retained pending wake after clock correction: %d seconds", wakeSec)
+	if s.onFire != nil {
+		s.onFire(wakeSec)
+	}
 }
 
 // previousOccurrence returns the latest schedule activation at or before now

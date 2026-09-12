@@ -135,6 +135,12 @@ type Service struct {
 	// clock on load, so a reading before this floor has not been synced. Set once
 	// in Run().
 	clockFloor time.Time
+	// clockGuard anchors the validated wall clock to CLOCK_BOOTTIME so a suspend
+	// that froze the clock is detected even though the time-sync gate stays
+	// latched and chrony keeps reporting its pre-suspend reference.
+	clockGuard clockGuard
+	// bootElapsedFn reads CLOCK_BOOTTIME (see bootElapsed); injectable for tests.
+	bootElapsedFn func() (time.Duration, error)
 	// scheduledMarkerPath records that the last shutdown was a scheduled
 	// hibernation (see writeScheduledHibernateMarker). Injectable for tests.
 	scheduledMarkerPath string
@@ -204,6 +210,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		systemPub:           redisClient.NewHashPublisher("system"),
 		busyServicesPub:     redisClient.NewHashPublisher("power-manager:busy-services"),
 		scheduledMarkerPath: scheduledHibernateMarkerPath,
+		bootElapsedFn:       bootElapsed,
 		wakeTimerAcks:       make(chan bool, 1),
 		suspendQuiesceAcks:  make(chan struct{}, 1),
 		suspendWhenOnline:   true,
@@ -357,6 +364,7 @@ func (s *Service) Run(ctx context.Context) error {
 			})
 		},
 	)
+	s.scheduler.SetClockValidator(s.clockValid)
 	s.scheduler.Start(ctx)
 
 	// If the previous shutdown was a scheduled hibernation, hold off scheduled
@@ -2311,6 +2319,11 @@ func (s *Service) pollForTimeSync(ctx context.Context) {
 		} else {
 			s.logger.Printf("Wall clock validated by NTP")
 		}
+		if boot, err := s.bootElapsed(); err != nil {
+			s.logger.Printf("Wall clock validated but boot time unreadable (%v); clock guard not anchored", err)
+		} else {
+			s.clockGuard.mark(now, boot)
+		}
 		s.scheduler.SetTimeSynced(true)
 		return true
 	}
@@ -2418,6 +2431,85 @@ func formatOptionalTime(t time.Time) string {
 		return "none"
 	}
 	return t.UTC().Format(time.RFC3339)
+}
+
+// clockGuardSlack absorbs NTP slew and the offset applied when the guard is
+// anchored, so a correctly-disciplined clock is never rejected. It also sets
+// the shortest suspend the guard can detect.
+const clockGuardSlack = 2 * time.Minute
+
+// clockGuard anchors a wall-clock reading that has been validated against an
+// external source together with the CLOCK_BOOTTIME reading at that moment.
+//
+// CLOCK_BOOTTIME advances through suspend while CLOCK_REALTIME may not, so the
+// comparison detects a resume on which the clock went stale even though chrony
+// still reports a valid reference. The wall-clock jump monitor cannot see this
+// because it compares against CLOCK_MONOTONIC, which freezes alongside the wall
+// clock.
+type clockGuard struct {
+	mu      sync.Mutex
+	trusted bool
+	wall    time.Time
+	boot    time.Duration
+}
+
+func (g *clockGuard) mark(wall time.Time, bootElapsed time.Duration) {
+	g.mu.Lock()
+	g.trusted = true
+	g.wall = wall.Round(0) // strip monotonic: the comparison must be wall-only
+	g.boot = bootElapsed
+	g.mu.Unlock()
+}
+
+// valid reports whether the wall clock has kept pace with CLOCK_BOOTTIME since
+// the last mark. It is false until the guard has been marked.
+func (g *clockGuard) valid(wall time.Time, bootElapsed time.Duration) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.trusted {
+		return false
+	}
+	expected := g.wall.Add(bootElapsed - g.boot)
+	return !wall.Round(0).Add(clockGuardSlack).Before(expected)
+}
+
+// bootElapsed returns time since boot including suspend (CLOCK_BOOTTIME), as
+// reported by /proc/uptime. time.Since uses CLOCK_MONOTONIC, which excludes
+// suspend, so the clock guard needs this instead.
+func bootElapsed() (time.Duration, error) {
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("/proc/uptime: empty")
+	}
+	secs, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, fmt.Errorf("/proc/uptime: %w", err)
+	}
+	return time.Duration(secs * float64(time.Second)), nil
+}
+
+// bootElapsed reads CLOCK_BOOTTIME through the injectable reader.
+func (s *Service) bootElapsed() (time.Duration, error) {
+	if s.bootElapsedFn == nil {
+		return bootElapsed()
+	}
+	return s.bootElapsedFn()
+}
+
+// clockValid reports whether the wall clock is still consistent with elapsed
+// boot time. A read failure is treated as invalid so a scheduled hibernation is
+// not dispatched on an unverified clock.
+func (s *Service) clockValid() bool {
+	boot, err := s.bootElapsed()
+	if err != nil {
+		s.logger.Printf("Cannot read boot time for clock guard: %v; suppressing scheduled hibernation", err)
+		return false
+	}
+	return s.clockGuard.valid(time.Now(), boot)
 }
 
 // chronycBinary is overridable for tests.

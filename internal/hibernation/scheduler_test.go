@@ -348,3 +348,111 @@ func TestSuppressScheduledFiresFor(t *testing.T) {
 		t.Fatalf("fire suppressed after the startup cooldown expired: %d", fired)
 	}
 }
+
+// TestFireSuppressedWhenClockInvalid: the injected clock validator gates a fire
+// even though the time-sync latch is still set, which is how a resume that
+// froze the wall clock is caught.
+func TestFireSuppressedWhenClockInvalid(t *testing.T) {
+	fired := 0
+	s := newTestScheduler(func(uint32) { fired++ })
+	s.SetEnabled(true)
+	s.SetCron("0 22 * * *")
+	s.SetDuration(8 * time.Hour)
+	s.SetTimeSynced(true)
+	s.SetClockValidator(func() bool { return false })
+	s.mu.Lock()
+	s.vehicleStandby = true
+	s.mu.Unlock()
+
+	s.fire()
+
+	if fired != 0 {
+		t.Fatalf("fire ran with an implausible clock: %d", fired)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.lastFired.IsZero() {
+		t.Fatal("suppressed fire consumed the cooldown")
+	}
+}
+
+func TestFireAllowedWhenClockValid(t *testing.T) {
+	fired := 0
+	s := newTestScheduler(func(uint32) { fired++ })
+	s.SetEnabled(true)
+	s.SetCron("0 22 * * *")
+	s.SetDuration(8 * time.Hour)
+	s.SetTimeSynced(true)
+	s.SetClockValidator(func() bool { return true })
+	s.mu.Lock()
+	s.vehicleStandby = true
+	s.mu.Unlock()
+
+	s.fire()
+
+	if fired != 1 {
+		t.Fatalf("fire suppressed with a valid clock: %d", fired)
+	}
+}
+
+// TestStandbyRetainsPendingWhenClockInvalid: a deferred wake must survive a
+// standby entry on an implausible clock and dispatch after the correction.
+func TestStandbyRetainsPendingWhenClockInvalid(t *testing.T) {
+	fired := 0
+	s := newTestScheduler(func(uint32) { fired++ })
+	s.SetEnabled(true)
+	s.SetCron("0 22 * * *")
+	s.SetDuration(8 * time.Hour)
+	s.SetTimeSynced(true)
+	valid := false
+	s.SetClockValidator(func() bool { return valid })
+
+	target := time.Now().Add(time.Hour)
+	s.mu.Lock()
+	s.pendingWake = &target
+	s.mu.Unlock()
+
+	s.OnVehicleStateChanged("stand-by")
+	if fired != 0 {
+		t.Fatalf("standby dispatch fired with an implausible clock: %d", fired)
+	}
+	s.mu.Lock()
+	if s.pendingWake == nil {
+		s.mu.Unlock()
+		t.Fatal("pending wake dropped while the clock was implausible")
+	}
+	s.mu.Unlock()
+
+	valid = true
+	s.dispatchPending()
+	if fired != 1 {
+		t.Fatalf("retained pending wake not dispatched after correction: %d", fired)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingWake != nil {
+		t.Fatal("pending wake not consumed after dispatch")
+	}
+}
+
+func TestCatchUpMissedSkippedWhenClockInvalid(t *testing.T) {
+	fired := 0
+	s := newTestScheduler(func(uint32) { fired++ })
+	s.SetEnabled(true)
+	s.SetCron("*/15 * * * *")
+	s.SetDuration(time.Hour)
+	s.SetClockValidator(func() bool { return false })
+
+	quarterStart := time.Now().Round(0).Truncate(15 * time.Minute)
+	s.mu.Lock()
+	s.timeSynced = true
+	s.startedWall = quarterStart.Add(-time.Minute)
+	s.vehicleStandby = true
+	s.mu.Unlock()
+
+	s.catchUpMissed()
+
+	if fired != 0 {
+		t.Fatalf("catch-up fired with an implausible clock: %d", fired)
+	}
+}

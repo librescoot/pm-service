@@ -1,6 +1,9 @@
 package service
 
 import (
+	"errors"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
@@ -249,5 +252,73 @@ func TestScheduledHibernateMarker(t *testing.T) {
 	}
 	if present, _ := readAndClearScheduledHibernateMarker(path); present {
 		t.Error("marker not cleared by the first read")
+	}
+}
+
+func TestClockGuard(t *testing.T) {
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	boot0 := 5 * time.Minute
+
+	t.Run("untrusted is invalid", func(t *testing.T) {
+		var g clockGuard
+		if g.valid(base, boot0) {
+			t.Fatal("untrusted guard reported the clock valid")
+		}
+	})
+	t.Run("normal progress is valid", func(t *testing.T) {
+		var g clockGuard
+		g.mark(base, boot0)
+		if !g.valid(base.Add(10*time.Minute), boot0+10*time.Minute) {
+			t.Fatal("guard rejected a clock that kept pace")
+		}
+	})
+	t.Run("frozen across suspend is invalid", func(t *testing.T) {
+		var g clockGuard
+		g.mark(base, boot0)
+		if g.valid(base, boot0+2*time.Hour) {
+			t.Fatal("guard accepted a clock frozen across a 2h suspend")
+		}
+	})
+	t.Run("drift within slack is valid", func(t *testing.T) {
+		var g clockGuard
+		g.mark(base, boot0)
+		if !g.valid(base.Add(time.Hour-clockGuardSlack/2), boot0+time.Hour) {
+			t.Fatal("guard rejected drift within slack")
+		}
+	})
+	t.Run("behind beyond slack is invalid", func(t *testing.T) {
+		var g clockGuard
+		g.mark(base, boot0)
+		if g.valid(base.Add(time.Hour-2*clockGuardSlack), boot0+time.Hour) {
+			t.Fatal("guard accepted a clock behind by more than slack")
+		}
+	})
+	t.Run("monotonic readings do not hide a freeze", func(t *testing.T) {
+		var g clockGuard
+		now := time.Now()
+		g.mark(now, boot0)
+		if g.valid(now, boot0+2*time.Hour) {
+			t.Fatal("guard accepted a frozen clock because monotonic readings were compared")
+		}
+	})
+}
+
+func TestBootElapsed(t *testing.T) {
+	d, err := bootElapsed()
+	if err != nil {
+		t.Skipf("/proc/uptime unavailable: %v", err)
+	}
+	if d <= 0 {
+		t.Fatalf("bootElapsed() = %v, want > 0", d)
+	}
+}
+
+func TestClockValidUnreadableBootTime(t *testing.T) {
+	s := &Service{
+		logger:        log.New(io.Discard, "", 0),
+		bootElapsedFn: func() (time.Duration, error) { return 0, errors.New("boom") },
+	}
+	if s.clockValid() {
+		t.Fatal("clockValid() = true with an unreadable boot time")
 	}
 }
