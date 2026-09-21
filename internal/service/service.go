@@ -151,10 +151,10 @@ type Service struct {
 
 	// Setting A ("keep remotely reachable scooters awake"):
 	// pm.suspend-when-online only matters when no main battery is present. The
-	// default true allows suspend even while reachable; false reads
-	// remote-access.status live at the decision point and blocks while any
-	// provider is connected. A bounded grace after boot/resume lets providers
-	// reconnect before a disconnected value is acted on. Guarded by settingsMu.
+	// default true allows suspend even while reachable; false reads all
+	// remote-access provider fields live at the decision point and blocks while
+	// any provider is connected. A bounded grace after boot/resume lets providers
+	// reconnect before disconnected fields are acted on. Guarded by settingsMu.
 	suspendWhenOnline      bool
 	remoteAccessGraceUntil time.Time
 
@@ -2224,8 +2224,8 @@ func parseSettingBool(value string) (bool, bool) {
 // onSuspendWhenOnlineSetting absorbs pm.suspend-when-online. It only matters
 // when no main battery is present (a present/active pack always blocks suspend).
 // When true (the default), a locked scooter with no main battery is allowed to
-// suspend even while remotely reachable. When false it stays awake while the
-// converged remote-access status is connected (plus bounded reconnect grace).
+// suspend even while remotely reachable. When false it stays awake while any
+// remote-access provider is connected (plus bounded reconnect grace).
 func (s *Service) onSuspendWhenOnlineSetting(value string) error {
 	s.settingsMu.Lock()
 	s.suspendWhenOnline = (value == "true")
@@ -2233,18 +2233,28 @@ func (s *Service) onSuspendWhenOnlineSetting(value string) error {
 	return nil
 }
 
-func shouldBlockSuspendForRemoteAccess(suspendWhenOnline bool, status string, statusKnown, withinGrace bool) bool {
+func hasConnectedRemoteAccessProvider(providers map[string]string) bool {
+	for provider, status := range providers {
+		// Ignore the aggregate field written by pre-1.4 providers during upgrades.
+		if provider != "status" && status == "connected" {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldBlockSuspendForRemoteAccess(suspendWhenOnline bool, providers map[string]string, readOK, withinGrace bool) bool {
 	if suspendWhenOnline {
 		return false
 	}
-	return withinGrace || !statusKnown || status == "connected"
+	return withinGrace || !readOK || hasConnectedRemoteAccessProvider(providers)
 }
 
-// suspendBlockedWhileOnline reads the converged reachability verdict live at
-// the suspend decision point. Pub/sub notifications are lost while the process
-// is frozen, so a watcher-fed cache would be stale after resume. A missing hash
-// means no provider and does not block after grace; a Redis read failure errs
-// toward staying awake.
+// suspendBlockedWhileOnline reads every provider live at the suspend decision
+// point. Pub/sub notifications are lost while the process is frozen, so a
+// watcher-fed cache would be stale after resume. A missing hash means no
+// provider and does not block after grace; a Redis read failure errs toward
+// staying awake.
 func (s *Service) suspendBlockedWhileOnline() bool {
 	s.settingsMu.Lock()
 	suspendWhenOnline := s.suspendWhenOnline
@@ -2254,12 +2264,12 @@ func (s *Service) suspendBlockedWhileOnline() bool {
 		return false
 	}
 
-	status, err := s.redis.HGet("remote-access", "status")
-	statusKnown := err == nil || err == redis_ipc.ErrNil
-	if err != nil && err != redis_ipc.ErrNil {
-		s.logger.Printf("Could not read remote-access status: %v; keeping scooter awake", err)
+	providers, err := s.redis.HGetAll("remote-access")
+	readOK := err == nil
+	if err != nil {
+		s.logger.Printf("Could not read remote-access providers: %v; keeping scooter awake", err)
 	}
-	return shouldBlockSuspendForRemoteAccess(suspendWhenOnline, status, statusKnown, withinGrace)
+	return shouldBlockSuspendForRemoteAccess(suspendWhenOnline, providers, readOK, withinGrace)
 }
 
 // onScheduledHibernateCronSetting passes a new cron expression to the scheduler.
