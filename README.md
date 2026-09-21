@@ -54,7 +54,7 @@ The service also watches these fields in the `settings` hash:
 | `pm.last-ditch-hibernate-enabled` | `true` | Enables automatic reserve-power last-ditch hibernation. `false` suppresses only this trigger; explicit/manual hibernate, hibernate-for, timers, suspend, reboot, and default-state handling are unchanged. Invalid values are logged and fail safe to enabled. |
 | `pm.hibernation-timer` | command-line value | Idle hibernation timer in seconds. |
 | `pm.default-state` | command-line value | Default low-power target. |
-| `pm.suspend-when-online` | `true` | Allows suspend while remotely reachable. |
+| `pm.suspend-when-online` | `true` | Only relevant without a main battery. "Online" means an active remote-access provider (`remote-access[status] == connected`: radio-gaga/Sunshine, uplink-service, or a custom provider), not mere modem registration. Default `true` allows suspend while remotely reachable; `false` stays awake while remote access is connected, at the cost of draining the auxiliary battery within a few days. |
 | `pm.wake-timer-max-seconds` | configured cap | Maximum hibernate-for wake interval. |
 | `pm.wake-timer-ack-timeout` | configured timeout | nRF wake-timer acknowledgement timeout. |
 | `pm.scheduled-hibernate-enabled` | `false` | Enables cron-based hibernation. |
