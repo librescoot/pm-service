@@ -40,8 +40,10 @@ func (m *mockActions) EnterIssuingLowPower(c *librefsm.Context) error {
 	}
 	return nil
 }
-func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error  { return nil }
-func (m *mockActions) CanEnterLowPowerState(c *librefsm.Context) bool { return m.canEnterLowPower }
+func (m *mockActions) ExitIssuingLowPower(c *librefsm.Context) error          { return nil }
+func (m *mockActions) CanEnterLowPowerState(c *librefsm.Context) bool         { return m.canEnterLowPower }
+func (m *mockActions) CanAcceptExplicitHibernate(c *librefsm.Context) bool    { return true }
+func (m *mockActions) OnHibernatePreparationFailed(c *librefsm.Context) error { return nil }
 func (m *mockActions) HasNoBlockingInhibitors(c *librefsm.Context) bool {
 	return !m.hasBlockingInhibitors
 }

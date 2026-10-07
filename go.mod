@@ -3,6 +3,7 @@ module github.com/librescoot/pm-service
 go 1.25.0
 
 require (
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/librescoot/librefsm v0.6.1
 	github.com/robfig/cron/v3 v3.0.1
@@ -10,6 +11,7 @@ require (
 
 require (
 	github.com/redis/go-redis/v9 v9.18.0 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/sys v0.27.0 // indirect
 )

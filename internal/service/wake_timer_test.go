@@ -22,7 +22,7 @@ func newHibernateForService(t *testing.T) *Service {
 			DryRun:              true,
 			WakeTimerAckTimeout: 50 * time.Millisecond,
 		},
-		wakeTimerAcks: make(chan bool, 1),
+		wakeTimerAcks: make(chan uint32, 1),
 		fsmData:       &fsm.FSMData{},
 	}
 	s.fsmData.TargetPowerState = fsm.TargetHibernateFor
@@ -35,8 +35,8 @@ func newHibernateForService(t *testing.T) *Service {
 // the second pass must not wait for another one.
 func TestWakeTimerAckLatchSurvivesReentry(t *testing.T) {
 	s := newHibernateForService(t)
-	if err := s.onWakeTimerArmed("true"); err != nil {
-		t.Fatalf("onWakeTimerArmed: %v", err)
+	if err := s.onWakeTimerAckSeconds("3600"); err != nil {
+		t.Fatalf("onWakeTimerAckSeconds: %v", err)
 	}
 
 	if err := s.EnterIssuingLowPower(nil); err != nil {
@@ -63,8 +63,23 @@ func TestWakeTimerAckLatchSurvivesReentry(t *testing.T) {
 	}
 }
 
-// A power command with a different target must not carry a stale ACK from the
-// previous hibernate-for round into the next one.
+func TestWakeTimerWaitIgnoresDisarmEcho(t *testing.T) {
+	s := newHibernateForService(t)
+	s.onWakeTimerAckSeconds("0")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(5 * time.Millisecond)
+		s.onWakeTimerAckSeconds("3600")
+	}()
+	if !s.waitForWakeTimer(time.Second) {
+		t.Fatal("a disarm echo prevented confirmation of the requested duration")
+	}
+	<-done
+}
+
+// A power command with a different target must not carry an ACK from another
+// hibernate-for round into the next one.
 func TestWakeTimerLatchClearedByNewTarget(t *testing.T) {
 	s := newHibernateForService(t)
 	s.wakeTimerArmed = true

@@ -18,13 +18,19 @@ The Power Management Service coordinates the vehicle's low-power lifecycle. It o
 
 The service consumes list commands from `scooter:power`:
 
-- `run`, `suspend`, `hibernate`, `hibernate-manual`, `hibernate-timer`, and `reboot`
+- `run`, `suspend`, `hibernate`, `hibernate-manual`, `hibernate-auto`, `hibernate-timer`, and `reboot`
 - `hibernate-for:<seconds>` to request a timed hibernation
 - `hibernate-cancel` to return to `run` and disarm the wake timer
 
+Explicit `hibernate`, `hibernate-manual`, and `hibernate-for:<seconds>` requests are accepted only in `parked` or `stand-by`. Ordinary explicit requests use the manual-hibernation priority. From `parked`, PM records the intent and asks vehicle-service to prepare a graceful shutdown; actual power-off still requires `stand-by`. Timed preparation preserves its duration and requires the nRF to echo that duration. No GPS fix or wall-clock synchronization is needed for a relative timed request.
+
+`hibernate-auto`, the idle timer, reserve-power protection, and scheduled hibernation do not initiate vehicle locking. Scheduled hibernation retains its clock-validity gate and deferred wake-by deadline.
+
+Vehicle preparation uses `scooter:state` command `prepare-hibernate:<request-id>` and a matching `power-manager[hibernate-request-id]`. Vehicle rejection reports `hibernate-preparation-failed:<request-id>` on `scooter:power`. Preparation times out after 30 seconds. Cancellation, shutdown interruption, and PM restart invalidate outstanding preparation; cancellation also disarms the wake timer and does not unlock the vehicle.
+
 It accepts `ondemand`, `powersave`, and `performance` from `scooter:governor`.
 
-Power state is published in the `power-manager` hash. The same hash carries the nRF52 wake-timer request/acknowledgement fields used for timed hibernation. Active inhibitor summaries are published under `power-manager:busy-services`.
+Power state is published in the `power-manager` hash. It also carries `wake-timer-seconds`, the exact nRF echo `wake-timer-ack-seconds`, and the legacy `wake-timer-armed` telemetry flag. Explicit request progress is exposed as `hibernate-status` (`idle`, `preparing-vehicle`, `preparing-power`, `waiting-inhibitors`, `waiting-wake-timer`, `powering-off`, `rejected`, `cancelled`, or `failed`) and `hibernate-error`. Command-queue acceptance is not confirmation of shutdown. Active inhibitor summaries are published under `power-manager:busy-services`.
 
 Redis/Valkey inhibitors are stored as JSON values in the `power:inhibits` hash and synchronized when the `power:inhibits` channel is published. Inhibitors may be `delay`, `suspend-only`, or the default blocking type. Blocking inhibitors are honored by automatic last-ditch hibernation as well as explicit transitions. A `suspend-only` inhibitor does not block any hibernation/poweroff path, including last-ditch; services performing an OTA install, boot-region write, activation, or commit that cannot tolerate power loss must hold a blocking inhibitor for the whole critical section. The current inhibitor protocol does not communicate update phase, resumability, or reserve-power deadlines. The local inhibitor listener uses the path selected by `--socket-path`.
 
@@ -85,6 +91,8 @@ Production operation requires:
 - a system D-Bus and systemd/logind capable of the requested power actions;
 - permission to access the configured Unix socket and power-management sysfs interfaces; and
 - the Bluetooth/nRF52 path for timed hibernation wake-timer handshakes.
+
+Deploy PM, vehicle-service's correlated preparation handler, and bluetooth-service's `wake-timer-ack-seconds` publisher together. Timed hibernation fails closed if the matching bridge is unavailable. The nRF wire protocol uses its existing duration echo.
 
 Use `--dry-run` for integration checks that must not change the machine power state.
 

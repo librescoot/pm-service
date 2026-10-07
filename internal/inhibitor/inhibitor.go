@@ -187,14 +187,19 @@ func (m *Manager) GetInhibitors() []*Inhibitor {
 	return inhibitors
 }
 
+func IsHibernatePath(target string) bool {
+	switch target {
+	case "hibernate", "hibernate-manual", "hibernate-timer", "hibernate-for", "reboot":
+		return true
+	}
+	return false
+}
+
 func (m *Manager) HasBlockingInhibitors(targetPowerState string) bool {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	isHibernatePath := targetPowerState == "hibernate" ||
-		targetPowerState == "hibernate-manual" ||
-		targetPowerState == "hibernate-timer" ||
-		targetPowerState == "reboot"
+	isHibernatePath := IsHibernatePath(targetPowerState)
 
 	for _, inh := range m.inhibitors {
 		if inh.Type == TypeSuspendOnly && isHibernatePath {

@@ -127,6 +127,9 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 		Transition(StateRunning, EvPowerRun, StateRunning,
 			librefsm.WithAction(actions.OnPowerCommand),
 		).
+		Transition(StateRunning, EvHibernatePreparationFailed, StateRunning,
+			librefsm.WithAction(actions.OnHibernatePreparationFailed),
+		).
 
 		// Runtime pm.default-state change: store the new target so the follow-up
 		// EvVehicleStateChanged (sent by the settings handler) re-evaluates the
@@ -556,6 +559,28 @@ func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.D
 			librefsm.WithAction(actions.OnBatteryStateChanged),
 		).
 
+		// Explicit requests record their intent before vehicle preparation. A
+		// follow-up vehicle event enters low power only after standby is confirmed.
+		Transition(StateRunning, EvExplicitHibernate, StateRunning,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanAcceptExplicitHibernate),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StatePreSuspend, EvExplicitHibernate, StateRunning,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanAcceptExplicitHibernate),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateSuspendImminent, EvExplicitHibernate, StateRunning,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanAcceptExplicitHibernate),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateLowPowerImminent, EvExplicitHibernate, StateRunning,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanAcceptExplicitHibernate),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
+		Transition(StateWaitingInhibitors, EvExplicitHibernate, StateRunning,
+			librefsm.WithGuards(actions.IsPowerCommandHigherPriority, actions.CanAcceptExplicitHibernate),
+			librefsm.WithAction(actions.OnPowerCommand),
+		).
 		// Initial state
 		Initial(StateRunning)
 }

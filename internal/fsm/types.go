@@ -25,13 +25,15 @@ const (
 // Events
 const (
 	// Power commands (from Redis)
-	EvPowerRun             librefsm.EventID = "power-run"
-	EvPowerSuspend         librefsm.EventID = "power-suspend"
-	EvPowerHibernate       librefsm.EventID = "power-hibernate"
-	EvPowerHibernateManual librefsm.EventID = "power-hibernate-manual"
-	EvPowerHibernateTimer  librefsm.EventID = "power-hibernate-timer"
-	EvPowerHibernateFor    librefsm.EventID = "power-hibernate-for"
-	EvPowerReboot          librefsm.EventID = "power-reboot"
+	EvPowerRun                   librefsm.EventID = "power-run"
+	EvPowerSuspend               librefsm.EventID = "power-suspend"
+	EvPowerHibernate             librefsm.EventID = "power-hibernate"
+	EvPowerHibernateManual       librefsm.EventID = "power-hibernate-manual"
+	EvPowerHibernateTimer        librefsm.EventID = "power-hibernate-timer"
+	EvPowerHibernateFor          librefsm.EventID = "power-hibernate-for"
+	EvPowerReboot                librefsm.EventID = "power-reboot"
+	EvHibernatePreparationFailed librefsm.EventID = "hibernate-preparation-failed"
+	EvExplicitHibernate          librefsm.EventID = "explicit-hibernate"
 
 	// State change events
 	EvVehicleStateChanged   librefsm.EventID = "vehicle-state-changed"
@@ -114,13 +116,20 @@ type WakeupPayload struct {
 
 type PowerCommandPayload struct {
 	TargetState string
+	Explicit    bool
 	// WakeSeconds is non-zero only for the hibernate-for target: it carries the
 	// number of seconds from "now" at which the nRF52 should wake the iMX6.
 	WakeSeconds uint32
 }
 
-// FSMData holds runtime data for the FSM context
+type HibernatePreparationResult struct {
+	RequestID string
+	Error     string
+}
+
+// FSMData holds runtime data for the FSM context.
 type FSMData struct {
+	HibernateRequestID  string
 	TargetPowerState    string // run, suspend, hibernate, hibernate-manual, hibernate-timer, hibernate-for, reboot
 	VehicleState        string
 	BatteryState        string // derived: "active" if either slot is active
@@ -153,6 +162,7 @@ type Actions interface {
 
 	// Guards
 	CanEnterLowPowerState(c *librefsm.Context) bool
+	CanAcceptExplicitHibernate(c *librefsm.Context) bool
 	HasNoBlockingInhibitors(c *librefsm.Context) bool
 	HasOnlyModemInhibitors(c *librefsm.Context) bool
 	CanProceedPastModemWait(c *librefsm.Context) bool
@@ -176,6 +186,7 @@ type Actions interface {
 	OnVehicleLeftLowPowerState(c *librefsm.Context) error
 	OnBatteryStateChanged(c *librefsm.Context) error
 	OnPowerCommand(c *librefsm.Context) error
+	OnHibernatePreparationFailed(c *librefsm.Context) error
 	OnLastDitchTriggered(c *librefsm.Context) error
 	OnLastDitchWakeup(c *librefsm.Context) error
 	OnLastDitchDisabled(c *librefsm.Context) error

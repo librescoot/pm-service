@@ -158,11 +158,9 @@ type Service struct {
 	suspendWhenOnline      bool
 	remoteAccessGraceUntil time.Time
 
-	// wakeTimerAcks receives the nRF52's wake-timer-set acknowledgement: true
-	// when the timer is armed, false when it was disarmed. Buffered with size 1
-	// so the watcher goroutine never blocks. Consumers drain stale values
-	// before each wait.
-	wakeTimerAcks chan bool
+	// Wake-timer ACKs echo the programmed duration. Consumers reject echoes for
+	// another duration, including disarm echoes from a superseded request.
+	wakeTimerAcks chan uint32
 
 	// wakeTimerArmed latches the ACK for the current hibernate-for round.
 	// EnterIssuingLowPower can be entered more than once per round (a late
@@ -170,7 +168,8 @@ type Service struct {
 	// is consumed from wakeTimerAcks on the first pass. Without the latch the
 	// retry waits for an ACK that will never come again, times out and aborts
 	// the hibernate-for. Only the FSM goroutine touches it.
-	wakeTimerArmed bool
+	wakeTimerArmed            bool
+	hibernatePreparationTimer *time.Timer
 
 	// suspendQuiesceAcks receives bluetooth-service's confirmation (the
 	// power-state-sent field) that it forwarded "suspending" to the nRF52.
@@ -212,7 +211,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Service, error) {
 		busyServicesPub:     redisClient.NewHashPublisher("power-manager:busy-services"),
 		scheduledMarkerPath: scheduledHibernateMarkerPath,
 		bootElapsedFn:       bootElapsed,
-		wakeTimerAcks:       make(chan bool, 1),
+		wakeTimerAcks:       make(chan uint32, 1),
 		suspendQuiesceAcks:  make(chan struct{}, 1),
 		suspendWhenOnline:   true,
 		lastDitchEnabled:    defaultLastDitchHibernateEnabled,
@@ -255,6 +254,12 @@ func (s *Service) Run(ctx context.Context) error {
 	defer cancel()
 	s.ctx = ctx
 	s.ctxCancel = cancel
+	// Preparation commands cannot outlive the PM session that admitted them.
+	if err := s.powerManagerPub.SetMany(map[string]any{
+		"hibernate-request-id": "", "hibernate-status": "idle", "hibernate-error": "",
+	}, redis_ipc.Sync()); err != nil {
+		return fmt.Errorf("failed to initialize hibernation request state: %w", err)
+	}
 
 	// Read initial states directly before starting any goroutines.
 	// This populates fsmData for startup decisions (hibernation timer, initial trigger)
@@ -508,7 +513,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// Watch power-manager hash for the nRF52 wake-timer ACK so EnterIssuingLowPower
 	// can confirm the wake source is armed before issuing systemctl poweroff.
 	if err := s.redis.NewHashWatcher("power-manager").
-		OnField("wake-timer-armed", s.onWakeTimerArmed).
+		OnField("wake-timer-ack-seconds", s.onWakeTimerAckSeconds).
 		OnField("power-state-sent", s.onPowerStateSent).
 		Start(); err != nil {
 		return fmt.Errorf("failed to start power-manager watcher: %v", err)
@@ -521,6 +526,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.machine.Stop(); err != nil {
 		s.logger.Printf("Failed to stop state machine: %v", err)
 	}
+	s.stopHibernatePreparationTimer()
 	s.hibernationTimer.Close()
 	if s.scheduler != nil {
 		s.scheduler.Close()
@@ -938,6 +944,9 @@ func parseNonNegativeInt(v string) int {
 
 func (s *Service) onPowerCommand(command string) error {
 	s.logger.Printf("Received power command: %s", command)
+	if id, ok := strings.CutPrefix(command, "hibernate-preparation-failed:"); ok {
+		return s.onHibernatePreparationResult(id + ":vehicle rejected hibernation preparation")
+	}
 
 	// hibernate-for:<seconds> arms a wake timer on the nRF52 and then enters
 	// hibernation; the iMX6 is brought back up by the nRF52 after the duration.
@@ -954,9 +963,10 @@ func (s *Service) onPowerCommand(command string) error {
 		}
 		if s.machine != nil {
 			s.machine.Send(librefsm.Event{
-				ID: fsm.EvPowerHibernateFor,
+				ID: fsm.EvExplicitHibernate,
 				Payload: fsm.PowerCommandPayload{
 					TargetState: fsm.TargetHibernateFor,
+					Explicit:    true,
 					WakeSeconds: uint32(secs),
 				},
 			})
@@ -967,7 +977,7 @@ func (s *Service) onPowerCommand(command string) error {
 	// hibernate-cancel returns to run AND disarms any wake timer programmed on
 	// the nRF52, so a previously-issued hibernate-for doesn't fire later.
 	if command == "hibernate-cancel" {
-		if err := s.powerManagerPub.Set("wake-timer-seconds", "0"); err != nil {
+		if err := s.powerManagerPub.Set("wake-timer-seconds", "0", redis_ipc.Sync()); err != nil {
 			s.logger.Printf("Failed to disarm wake timer on cancel: %v", err)
 		}
 		if s.machine != nil {
@@ -985,10 +995,12 @@ func (s *Service) onPowerCommand(command string) error {
 		eventID = fsm.EvPowerRun
 	case "suspend":
 		eventID = fsm.EvPowerSuspend
-	case "hibernate":
+	case "hibernate", "hibernate-manual":
+		eventID = fsm.EvExplicitHibernate
+		command = fsm.TargetHibernateManual
+	case "hibernate-auto":
 		eventID = fsm.EvPowerHibernate
-	case "hibernate-manual":
-		eventID = fsm.EvPowerHibernateManual
+		command = fsm.TargetHibernate
 	case "hibernate-timer":
 		eventID = fsm.EvPowerHibernateTimer
 	case "reboot":
@@ -1001,7 +1013,7 @@ func (s *Service) onPowerCommand(command string) error {
 	if s.machine != nil {
 		s.machine.Send(librefsm.Event{
 			ID:      eventID,
-			Payload: fsm.PowerCommandPayload{TargetState: command},
+			Payload: fsm.PowerCommandPayload{TargetState: command, Explicit: eventID == fsm.EvExplicitHibernate},
 		})
 	}
 
@@ -1178,6 +1190,9 @@ func (s *Service) EnterSuspendImminent(c *librefsm.Context) error {
 
 func (s *Service) EnterLowPowerImminent(c *librefsm.Context) error {
 	s.logger.Printf("Entering low-power-imminent state (target: %s)", s.fsmData.TargetPowerState)
+	if s.fsmData.HibernateRequestID != "" {
+		s.setHibernateStatus("preparing-power", "")
+	}
 	// Kick the wake-timer ARM as early as possible so the ACK has time to
 	// arrive before we hit EnterIssuingLowPower. Drain stale ACKs first so the
 	// wait there sees only this round's response.
@@ -1188,7 +1203,7 @@ func (s *Service) EnterLowPowerImminent(c *librefsm.Context) error {
 		default:
 		}
 		val := strconv.FormatUint(uint64(s.fsmData.HibernateForWakeSeconds), 10)
-		if err := s.powerManagerPub.Set("wake-timer-seconds", val); err != nil {
+		if err := s.powerManagerPub.Set("wake-timer-seconds", val, redis_ipc.Sync()); err != nil {
 			s.logger.Printf("Failed to publish wake-timer-seconds: %v", err)
 		} else {
 			s.logger.Printf("Requested nRF wake timer: %s seconds", val)
@@ -1199,6 +1214,9 @@ func (s *Service) EnterLowPowerImminent(c *librefsm.Context) error {
 
 func (s *Service) EnterWaitingInhibitors(c *librefsm.Context) error {
 	s.logger.Printf("Entering waiting-for-inhibitors state")
+	if s.fsmData.HibernateRequestID != "" {
+		s.setHibernateStatus("waiting-inhibitors", "")
+	}
 
 	target := s.fsmData.TargetPowerState
 
@@ -1230,29 +1248,18 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 		!s.wakeTimerArmed {
 		timeout := s.wakeTimerAckTimeout()
 		s.logger.Printf("Waiting up to %v for nRF wake-timer ACK", timeout)
-		select {
-		case armed := <-s.wakeTimerAcks:
-			if !armed {
-				s.logger.Printf("nRF reported wake timer disarmed; aborting hibernate-for")
-				c.Send(librefsm.Event{
-					ID:      fsm.EvPowerRun,
-					Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
-				})
-				return nil
-			}
-			s.wakeTimerArmed = true
-			s.logger.Printf("nRF wake timer armed; proceeding to poweroff")
-		case <-time.After(timeout):
+		s.setHibernateStatus("waiting-wake-timer", "")
+		if !s.waitForWakeTimer(timeout) {
 			s.logger.Printf("Timed out waiting for nRF wake-timer ACK; aborting hibernate-for")
-			if err := s.powerManagerPub.Set("wake-timer-seconds", "0"); err != nil {
-				s.logger.Printf("Failed to clear wake-timer-seconds on timeout: %v", err)
-			}
+			s.clearHibernateRequest("failed", "wake timer acknowledgement timed out")
 			c.Send(librefsm.Event{
 				ID:      fsm.EvPowerRun,
 				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
 			})
 			return nil
 		}
+		s.wakeTimerArmed = true
+		s.logger.Printf("nRF wake timer armed; proceeding to poweroff")
 	}
 
 	if s.config.DryRun {
@@ -1287,6 +1294,10 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	}
 
 	s.fsmData.LowPowerStateIssued = true
+
+	if s.fsmData.HibernateRequestID != "" {
+		s.setHibernateStatus("powering-off", "")
+	}
 
 	// Before suspending, announce the suspending state and wait until
 	// bluetooth-service confirms it forwarded it to the nRF52. Receiving
@@ -1686,6 +1697,17 @@ func (s *Service) OnVehicleStateChanged(c *librefsm.Context) error {
 	}
 
 	s.fsmData.VehicleState = newState
+	if newState == "stand-by" {
+		s.stopHibernatePreparationTimer()
+		if s.fsmData.HibernateRequestID != "" {
+			s.setHibernateStatus("preparing-power", "")
+		}
+	} else if s.fsmData.HibernateRequestID != "" &&
+		(newState == "ready-to-drive" || oldState == "stand-by" ||
+			(oldState == "shutting-down" && newState != "shutting-down")) {
+		s.clearHibernateRequest("cancelled", "vehicle shutdown interrupted")
+		s.fsmData.TargetPowerState = fsm.TargetRun
+	}
 
 	// Manage hibernation timer: runs in all idle states (everything except ready-to-drive)
 	isActive := newState == "ready-to-drive"
@@ -1715,6 +1737,7 @@ func (s *Service) OnVehicleStateChanged(c *librefsm.Context) error {
 
 func (s *Service) OnVehicleLeftLowPowerState(c *librefsm.Context) error {
 	s.logger.Printf("Vehicle left low power state, aborting")
+	s.clearHibernateRequest("cancelled", "vehicle left stand-by")
 
 	// Update vehicle state and manage timer (same as OnVehicleStateChanged)
 	if p, ok := c.Event.Payload.(fsm.VehicleStatePayload); ok {
@@ -1758,6 +1781,18 @@ func (s *Service) OnBatteryStateChanged(c *librefsm.Context) error {
 // OnPowerCommand updates fsmData.TargetPowerState from the event payload.
 func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 	if p, ok := c.Event.Payload.(fsm.PowerCommandPayload); ok {
+		state := ""
+		if p.Explicit {
+			var err error
+			state, err = s.explicitHibernateState(p.TargetState)
+			if err != nil {
+				s.clearHibernateRequest("cancelled", "request superseded")
+				s.fsmData.TargetPowerState = fsm.TargetRun
+				s.setHibernateStatus("rejected", err.Error())
+				return nil
+			}
+		}
+		s.clearHibernateRequest("cancelled", "request superseded")
 		if s.fsmData.TargetPowerState != p.TargetState {
 			s.logger.Printf("Target power state: %s -> %s", s.fsmData.TargetPowerState, p.TargetState)
 		}
@@ -1776,6 +1811,17 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 		}
 		// A new target invalidates any latched ACK from the previous round.
 		s.wakeTimerArmed = false
+		if p.Explicit {
+			s.fsmData.VehicleState = state
+			if err := s.prepareExplicitHibernate(state); err != nil {
+				s.clearHibernateRequest("failed", err.Error())
+				s.fsmData.TargetPowerState = fsm.TargetRun
+				return nil
+			}
+			if state == "stand-by" {
+				c.Send(librefsm.Event{ID: fsm.EvVehicleStateChanged, Payload: fsm.VehicleStatePayload{State: state}})
+			}
+		}
 	}
 	return nil
 }
@@ -1958,10 +2004,7 @@ func (s *Service) mapPowerStateToRedis(state string) string {
 func (s *Service) hasOnlyModemBlockingInhibitors(targetPowerState string) bool {
 	inhibitors := s.inhibitorManager.GetInhibitors()
 
-	isHibernatePath := targetPowerState == "hibernate" ||
-		targetPowerState == "hibernate-manual" ||
-		targetPowerState == "hibernate-timer" ||
-		targetPowerState == "reboot"
+	isHibernatePath := inhibitor.IsHibernatePath(targetPowerState)
 
 	hasModemInhibitor := false
 	hasOtherInhibitors := false
@@ -2637,15 +2680,13 @@ func (s *Service) onPowerStateSent(value string) error {
 	return nil
 }
 
-// onWakeTimerArmed is invoked by the power-manager hash watcher whenever
-// bluetooth-service writes the wake-timer-armed field in response to an ACK
-// from the nRF52. The value is a Go bool string: "true" when the timer is
-// armed, "false" when it was disarmed. Non-blocking; only the latest signal
-// is kept in the buffered channel.
-func (s *Service) onWakeTimerArmed(value string) error {
-	armed := value == "true"
+func (s *Service) onWakeTimerAckSeconds(value string) error {
+	seconds, err := strconv.ParseUint(value, 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid wake timer acknowledgement %q: %w", value, err)
+	}
 	select {
-	case s.wakeTimerAcks <- armed:
+	case s.wakeTimerAcks <- uint32(seconds):
 	default:
 		// Drop oldest, push newest so the waiter always sees the latest signal.
 		select {
@@ -2653,7 +2694,7 @@ func (s *Service) onWakeTimerArmed(value string) error {
 		default:
 		}
 		select {
-		case s.wakeTimerAcks <- armed:
+		case s.wakeTimerAcks <- uint32(seconds):
 		default:
 		}
 	}
