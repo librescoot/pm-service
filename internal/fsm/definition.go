@@ -20,7 +20,24 @@ const inhibitorWaitTimeout = 15 * time.Second
 // inactive while in stand-by with target=suspend) uses the pre-suspend delay.
 // Explicit commands and the hibernate path go directly to the imminent state.
 func NewDefinition(actions Actions, preSuspendDelay, suspendImminentDelay time.Duration) *librefsm.Definition {
-	return librefsm.NewDefinition().
+	def := librefsm.NewDefinition()
+	// Recheck before advancing a countdown or inhibitor wait. These transitions
+	// precede the normal edges so restored power or connectivity cancels first.
+	for _, state := range []librefsm.StateID{StatePreSuspend, StateSuspendImminent, StateLowPowerImminent, StateWaitingInhibitors, StateIssuingLowPower} {
+		for _, event := range []librefsm.EventID{EvPowerEligibilityChanged, EvPreSuspendTimeout, EvSuspendImminentTimeout, EvInhibitorsChanged, EvInhibitorWaitTimeout} {
+			def.Transition(state, event, StateRunning,
+				librefsm.WithGuard(actions.ShouldCancelLowPower),
+				librefsm.WithAction(actions.OnLowPowerCancelled),
+			)
+		}
+	}
+	for _, state := range []librefsm.StateID{StateWaitingInhibitors, StateIssuingLowPower} {
+		def.Transition(state, EvSuspendCancelled, StateRunning,
+			librefsm.WithGuard(actions.IsTargetSuspend),
+			librefsm.WithAction(actions.OnLowPowerCancelled),
+		)
+	}
+	return def.
 		// === Main States ===
 
 		State(StateRunning).

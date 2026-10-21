@@ -34,7 +34,9 @@ Power state is published in the `power-manager` hash. It also carries `wake-time
 
 Redis/Valkey inhibitors are stored as JSON values in the `power:inhibits` hash and synchronized when the `power:inhibits` channel is published. Inhibitors may be `delay`, `suspend-only`, or the default blocking type. Blocking inhibitors are honored by automatic last-ditch hibernation as well as explicit transitions. A `suspend-only` inhibitor does not block any hibernation/poweroff path, including last-ditch; services performing an OTA install, boot-region write, activation, or commit that cannot tolerate power loss must hold a blocking inhibitor for the whole critical section. The current inhibitor protocol does not communicate update phase, resumability, or reserve-power deadlines. The local inhibitor listener uses the path selected by `--socket-path`.
 
-Low-power entry is guarded by live vehicle and battery state. In particular, suspend is restricted to stand-by and is not entered while a main battery is present or active. Hibernation and reboot are system-changing operations; their requests should be issued only by trusted services.
+Low-power entry is guarded by live vehicle and battery state. In particular, suspend is restricted to stand-by and is not entered while a main battery is present or active. Battery presence and remote-access policy are rechecked during preparation and after the nRF suspend acknowledgement. When battery recovery or changed suspend eligibility cancels a pending transition, PM restores any modem it disabled for that transition.
+
+Automatic reserve-power hibernation is cancelled if its emergency condition clears before poweroff, restoring the previous target. This includes recovery of a charged main battery during the countdown or inhibitor wait. The condition is checked again immediately before poweroff. Battery recovery does not cancel explicit hibernation, timer, or reboot requests. These are system-changing operations and should be issued only by trusted services.
 
 ## Configuration
 

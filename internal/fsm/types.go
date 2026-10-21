@@ -39,6 +39,10 @@ const (
 	EvVehicleStateChanged   librefsm.EventID = "vehicle-state-changed"
 	EvBatteryBecameActive   librefsm.EventID = "battery-became-active"
 	EvBatteryBecameInactive librefsm.EventID = "battery-became-inactive"
+	// Re-evaluate pending power transitions against live battery and policy inputs.
+	EvPowerEligibilityChanged librefsm.EventID = "power-eligibility-changed"
+	// Entry aborted; leave the state without overriding a replacement power request.
+	EvSuspendCancelled librefsm.EventID = "suspend-cancelled"
 
 	// Inhibitor events
 	EvInhibitorsChanged librefsm.EventID = "inhibitors-changed"
@@ -57,8 +61,8 @@ const (
 	EvLastDitchCheck librefsm.EventID = "last-ditch-check"
 
 	// EvLastDitchDisabled cancels only a transition whose provenance is an
-	// automatic last-ditch check. Explicit power commands clear that provenance
-	// before this event can act, so a runtime setting change cannot cancel them.
+	// automatic last-ditch check, after a setting disable or condition recovery.
+	// Explicit power commands clear that provenance before this event can act.
 	EvLastDitchDisabled librefsm.EventID = "last-ditch-disabled"
 
 	// pm.default-state changed at runtime. In Running, the action stores the new
@@ -143,8 +147,8 @@ type FSMData struct {
 	// from the EvPowerHibernateFor payload and cleared on return to Running.
 	HibernateForWakeSeconds uint32
 	// AutomaticLastDitch records the provenance of the current hibernate target.
-	// LastDitchFallbackTarget is restored if the runtime setting disables an
-	// automatic transition before the poweroff command is committed.
+	// LastDitchFallbackTarget is restored if recovery or a setting change cancels
+	// an automatic transition before the poweroff command is committed.
 	AutomaticLastDitch      bool
 	LastDitchFallbackTarget string
 }
@@ -162,6 +166,7 @@ type Actions interface {
 
 	// Guards
 	CanEnterLowPowerState(c *librefsm.Context) bool
+	ShouldCancelLowPower(c *librefsm.Context) bool
 	CanAcceptExplicitHibernate(c *librefsm.Context) bool
 	HasNoBlockingInhibitors(c *librefsm.Context) bool
 	HasOnlyModemInhibitors(c *librefsm.Context) bool
@@ -180,6 +185,7 @@ type Actions interface {
 	OnPreSuspendTimeout(c *librefsm.Context) error
 	OnSuspendImminentTimeout(c *librefsm.Context) error
 	OnInhibitorsChanged(c *librefsm.Context) error
+	OnLowPowerCancelled(c *librefsm.Context) error
 	OnWakeup(c *librefsm.Context) error
 	OnDisableModem(c *librefsm.Context) error
 	OnVehicleStateChanged(c *librefsm.Context) error

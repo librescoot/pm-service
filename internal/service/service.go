@@ -579,6 +579,7 @@ func (s *Service) onBatteryStateChanged(slot, newState string) error {
 		} else {
 			s.machine.Send(librefsm.Event{ID: fsm.EvBatteryBecameInactive, Payload: payload})
 		}
+		s.machine.Send(librefsm.Event{ID: fsm.EvPowerEligibilityChanged})
 	}
 	return nil
 }
@@ -689,9 +690,9 @@ func (s *Service) lastDitchTriggeredLocked() bool {
 	return true
 }
 
-// sendLastDitchCheck enqueues EvLastDitchCheck when the trigger condition
-// currently holds and the vehicle is in stand-by. The FSM guards re-evaluate
-// authoritatively at transition time; this pre-check only keeps no-op events
+// sendLastDitchCheck rechecks pending power transitions on every input update
+// and enqueues EvLastDitchCheck when the emergency condition holds in stand-by.
+// The FSM guards re-evaluate at transition time; this pre-check keeps no-op events
 // out of the queue (and CanEnterLowPowerState's rejection log quiet while
 // e.g. a battery swap is in progress with the seatbox open). The payload
 // carries the plain hibernate target so the priority guard and
@@ -700,6 +701,7 @@ func (s *Service) sendLastDitchCheck() {
 	if s.machine == nil {
 		return
 	}
+	s.machine.Send(librefsm.Event{ID: fsm.EvPowerEligibilityChanged})
 	s.lastDitchMu.Lock()
 	triggered := s.lastDitchTriggeredLocked() && s.lastDitchVehicleStandby
 	s.lastDitchMu.Unlock()
@@ -1213,6 +1215,9 @@ func (s *Service) EnterLowPowerImminent(c *librefsm.Context) error {
 }
 
 func (s *Service) EnterWaitingInhibitors(c *librefsm.Context) error {
+	if s.cancelIneligibleLowPower(c) {
+		return nil
+	}
 	s.logger.Printf("Entering waiting-for-inhibitors state")
 	if s.fsmData.HibernateRequestID != "" {
 		s.setHibernateStatus("waiting-inhibitors", "")
@@ -1233,11 +1238,7 @@ func (s *Service) EnterWaitingInhibitors(c *librefsm.Context) error {
 func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 	s.logger.Printf("Entering issuing-low-power state")
 
-	// A runtime disable can race with the transition into this state. Re-check
-	// immediately and again at the final poweroff commit below. The event keeps
-	// all FSM data mutation on the FSM goroutine.
-	if s.automaticLastDitchDisabled() {
-		c.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	if s.cancelIneligibleLowPower(c) {
 		return nil
 	}
 
@@ -1363,18 +1364,9 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 			})
 			return nil
 		}
-		// Same ground-truth re-check for the batteries: a slot that went active
-		// while the FSM was blocked on the quiesce ACK would otherwise be
-		// suspended out from under an active scooter, and its EvBatteryBecameActive
-		// cancel is still queued behind this commit.
-		if s.liveBatteryActive() {
-			s.logger.Printf("Aborting suspend after quiesce: a battery is active")
-			s.fsmData.LowPowerStateIssued = false
-			s.enableModem()
-			c.Send(librefsm.Event{
-				ID:      fsm.EvPowerRun,
-				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
-			})
+		// Battery presence and remote-access policy can change during the ACK
+		// wait too; recheck all suspend eligibility before committing.
+		if s.cancelIneligibleLowPower(c) {
 			return nil
 		}
 		// Block on logind's PrepareForSleep cycle so the return only means
@@ -1399,11 +1391,9 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 		return nil
 	}
 
-	// This is the last point where a runtime disable can be honored before the
-	// irreversible systemd poweroff request. A setting update after this check
-	// may already be too late to cancel.
-	if target == "poweroff" && s.automaticLastDitchDisabled() {
-		c.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	// Re-read the emergency condition immediately before irreversible poweroff.
+	// Explicit hibernation and reboot requests are independent of battery recovery.
+	if target == "poweroff" && s.cancelIneligibleLowPower(c) {
 		return nil
 	}
 
@@ -1517,6 +1507,38 @@ func (s *Service) handleWakeupAfterSuspend(c *librefsm.Context) {
 }
 
 // Guards
+
+func (s *Service) ShouldCancelLowPower(c *librefsm.Context) bool {
+	if s.fsmData.AutomaticLastDitch {
+		return s.automaticLastDitchDisabled() || !s.IsLastDitchTriggered(c)
+	}
+	return s.fsmData.TargetPowerState == fsm.TargetSuspend &&
+		(!s.liveVehicleInStandby() || !s.CanEnterLowPowerState(c))
+}
+
+func (s *Service) cancelIneligibleLowPower(c *librefsm.Context) bool {
+	if !s.ShouldCancelLowPower(c) {
+		return false
+	}
+	s.fsmData.LowPowerStateIssued = false
+	// Once entry aborts, leave the state even if eligibility changes again
+	// before this queued event runs. Explicit replacement commands retain priority.
+	if s.fsmData.AutomaticLastDitch {
+		c.Send(librefsm.Event{ID: fsm.EvLastDitchDisabled})
+	} else {
+		c.Send(librefsm.Event{ID: fsm.EvSuspendCancelled})
+	}
+	return true
+}
+
+func (s *Service) OnLowPowerCancelled(c *librefsm.Context) error {
+	s.fsmData.LowPowerStateIssued = false
+	if s.fsmData.AutomaticLastDitch {
+		return s.OnLastDitchDisabled(c)
+	}
+	s.enableModem()
+	return nil
+}
 
 func (s *Service) CanEnterLowPowerState(c *librefsm.Context) bool {
 	targetState := s.targetPowerStateFromContext(c)
@@ -1773,6 +1795,9 @@ func (s *Service) OnBatteryStateChanged(c *librefsm.Context) error {
 		} else {
 			s.fsmData.BatteryState = p.State
 		}
+		if s.fsmData.TargetPowerState == fsm.TargetSuspend && s.fsmData.BatteryState == "active" {
+			s.enableModem()
+		}
 		s.logger.Printf("Battery %s state -> %s (any active: %v)", p.Slot, p.State, s.fsmData.BatteryState == "active")
 	}
 	return nil
@@ -1826,8 +1851,8 @@ func (s *Service) OnPowerCommand(c *librefsm.Context) error {
 	return nil
 }
 
-// OnLastDitchDisabled restores the target that an automatic last-ditch
-// transition replaced, then queues the same vehicle-state event used for normal
+// OnLastDitchDisabled restores the target after an automatic last-ditch
+// transition is cancelled by recovery or a setting change, then queues normal
 // target evaluation. The FSM transition first returns to Running, so a suspend
 // fallback must pass CanEnterLowPowerState's live eligibility checks again.
 func (s *Service) OnLastDitchDisabled(c *librefsm.Context) error {
@@ -1835,14 +1860,13 @@ func (s *Service) OnLastDitchDisabled(c *librefsm.Context) error {
 	if fallback == "" {
 		fallback = s.config.DefaultState
 	}
-	s.logger.Printf("Automatic last-ditch hibernate disabled while pending; restoring target %s", fallback)
+	s.logger.Printf("Automatic last-ditch hibernate cancelled; restoring target %s", fallback)
 	s.fsmData.TargetPowerState = fallback
 	s.fsmData.HibernateForWakeSeconds = 0
 	s.wakeTimerArmed = false
 	s.clearAutomaticLastDitch()
-	if fallback == fsm.TargetRun {
-		s.enableModem()
-	}
+	s.fsmData.LowPowerStateIssued = false
+	s.enableModem()
 
 	vehicleState := s.fsmData.VehicleState
 	if liveState, err := s.redis.HGet("vehicle", "state"); err == nil && liveState != "" {
@@ -2273,6 +2297,9 @@ func (s *Service) onSuspendWhenOnlineSetting(value string) error {
 	s.settingsMu.Lock()
 	s.suspendWhenOnline = (value == "true")
 	s.settingsMu.Unlock()
+	if s.machine != nil {
+		s.machine.Send(librefsm.Event{ID: fsm.EvPowerEligibilityChanged})
+	}
 	return nil
 }
 
