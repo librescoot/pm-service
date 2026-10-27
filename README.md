@@ -32,7 +32,7 @@ It accepts `ondemand`, `powersave`, and `performance` from `scooter:governor`.
 
 Power state is published in the `power-manager` hash. It also carries `wake-timer-seconds`, the exact nRF echo `wake-timer-ack-seconds`, and the legacy `wake-timer-armed` telemetry flag. Explicit request progress is exposed as `hibernate-status` (`idle`, `preparing-vehicle`, `preparing-power`, `waiting-inhibitors`, `waiting-wake-timer`, `powering-off`, `rejected`, `cancelled`, or `failed`) and `hibernate-error`. Command-queue acceptance is not confirmation of shutdown. Active inhibitor summaries are published under `power-manager:busy-services`.
 
-Redis/Valkey inhibitors are stored as JSON values in the `power:inhibits` hash and synchronized when the `power:inhibits` channel is published. Inhibitors may be `delay`, `suspend-only`, or the default blocking type. Blocking inhibitors are honored by automatic last-ditch hibernation as well as explicit transitions. A `suspend-only` inhibitor does not block any hibernation/poweroff path, including last-ditch; services performing an OTA install, boot-region write, activation, or commit that cannot tolerate power loss must hold a blocking inhibitor for the whole critical section. The current inhibitor protocol does not communicate update phase, resumability, or reserve-power deadlines. The local inhibitor listener uses the path selected by `--socket-path`.
+Redis/Valkey inhibitors are stored as JSON values in the `power:inhibits` hash and synchronized when the `power:inhibits` channel is published. Inhibitors may be `delay`, `suspend-only`, or the default blocking type. Blocking inhibitors are honored by automatic last-ditch hibernation as well as explicit transitions. A `suspend-only` inhibitor does not block any hibernation/poweroff path, including last-ditch; services performing an OTA install, boot-region write, activation, or commit that cannot tolerate power loss must hold a blocking inhibitor for the whole critical section. The current inhibitor protocol does not communicate update phase, resumability, or reserve-power deadlines. The local inhibitor listener uses the path selected by `--socket-path`. A connection is registered as a blocking inhibitor before its acknowledgment is sent.
 
 Low-power entry is guarded by live vehicle and battery state. In particular, suspend is restricted to stand-by and is not entered while a main battery is present or active. Battery presence and remote-access policy are rechecked during preparation and after the nRF suspend acknowledgement. When battery recovery or changed suspend eligibility cancels a pending transition, PM restores any modem it disabled for that transition.
 
@@ -85,7 +85,14 @@ make test
 
 ## Deployment and runtime dependencies
 
-The image recipe installs `/usr/bin/pm-service` and `librescoot-pm.service`. The unit runs as `root`, requires `valkey.service`, starts after the vehicle, battery, settings, and Valkey services, and restarts on failure.
+The image recipe installs `/usr/bin/pm-service` and `librescoot-pm.service`. The unit runs as `root`, requires `valkey.service`, starts after the vehicle, settings, and Valkey services, and restarts on failure.
+
+The unit uses `Type=notify`: readiness is sent only after the inhibitor socket,
+FSM and Redis watchers are initialized. It orders PM before battery-service;
+enabling the unit also installs a battery-service requirement on PM. Battery
+startup therefore waits for readiness and fails if PM cannot start. Existing
+battery retry handling remains available for transient runtime failures. No
+readiness notification is needed when running PM outside systemd.
 
 Production operation requires:
 

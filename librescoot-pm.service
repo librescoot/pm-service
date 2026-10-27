@@ -2,12 +2,13 @@
 Description=Librescoot Power Management Service
 After=valkey.service
 After=librescoot-vehicle.service
-After=librescoot-battery.service
+Before=librescoot-battery.service
 After=librescoot-settings.service
 Requires=valkey.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
 ExecStart=/usr/bin/pm-service
 Restart=on-failure
 RestartSec=5
@@ -16,3 +17,4 @@ Group=root
 
 [Install]
 WantedBy=multi-user.target
+RequiredBy=librescoot-battery.service

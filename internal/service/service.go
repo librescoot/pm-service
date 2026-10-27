@@ -519,6 +519,11 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start power-manager watcher: %v", err)
 	}
 
+	// Dependents may acquire inhibitors once the socket, FSM and watchers are ready.
+	if err := systemd.NotifyReady(); err != nil {
+		return err
+	}
+
 	// Wait for context cancellation
 	<-ctx.Done()
 

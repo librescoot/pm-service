@@ -7,6 +7,34 @@ import (
 	"testing"
 )
 
+type ackCheckingConn struct {
+	net.Conn
+	write func([]byte) (int, error)
+}
+
+func (c ackCheckingConn) Write(p []byte) (int, error) { return c.write(p) }
+
+func TestRegisterBeforeAcknowledgment(t *testing.T) {
+	for _, failAck := range []bool{false, true} {
+		m := &Manager{logger: log.New(io.Discard, "", 0), inhibitors: make(map[net.Conn]*Inhibitor)}
+		server, client := net.Pipe()
+		_ = client.Close()
+		conn := ackCheckingConn{Conn: server, write: func(p []byte) (int, error) {
+			if !m.HasBlockingInhibitors("suspend") || !m.HasBlockingInhibitors("hibernate") {
+				t.Error("ACK sent before the inhibitor was registered")
+			}
+			if failAck {
+				return 0, io.ErrClosedPipe
+			}
+			return len(p), nil
+		}}
+		m.handleConnection(&conn)
+		if m.HasBlockingInhibitors("suspend") {
+			t.Errorf("connection leaked an inhibitor (failed ACK: %v)", failAck)
+		}
+	}
+}
+
 func TestHibernateTargetInhibitorMatrix(t *testing.T) {
 	for _, target := range []string{"hibernate", "hibernate-manual", "hibernate-timer", "hibernate-for", "reboot", "suspend", "run", "unknown"} {
 		for _, kind := range []InhibitorType{TypeBlock, TypeSuspendOnly, TypeDelay} {

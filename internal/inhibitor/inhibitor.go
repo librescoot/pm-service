@@ -85,14 +85,6 @@ func (m *Manager) acceptConnections() {
 }
 
 func (m *Manager) handleConnection(conn net.Conn) {
-	if _, err := conn.Write([]byte{0}); err != nil {
-		m.logger.Printf("Failed to send acknowledgment: %v", err)
-		if closeErr := conn.Close(); closeErr != nil {
-			m.logger.Printf("Failed to close inhibitor connection: %v", closeErr)
-		}
-		return
-	}
-
 	inhibitor := &Inhibitor{
 		Who:  "connection-based",
 		What: "connection-based",
@@ -104,6 +96,23 @@ func (m *Manager) handleConnection(conn net.Conn) {
 	m.mutex.Lock()
 	m.inhibitors[conn] = inhibitor
 	m.mutex.Unlock()
+	defer func() {
+		m.mutex.Lock()
+		delete(m.inhibitors, conn)
+		m.mutex.Unlock()
+		if m.onChange != nil {
+			m.onChange()
+		}
+		if err := conn.Close(); err != nil {
+			m.logger.Printf("Failed to close inhibitor connection: %v", err)
+		}
+	}()
+
+	// The client may start its protected work as soon as it receives the ACK.
+	if _, err := conn.Write([]byte{0}); err != nil {
+		m.logger.Printf("Failed to send acknowledgment: %v", err)
+		return
+	}
 
 	// Connection-based inhibitors are anonymous and high-churn (e.g.
 	// battery-service opens one per NFC write), so we don't log each
@@ -119,18 +128,6 @@ func (m *Manager) handleConnection(conn net.Conn) {
 		if err != nil {
 			break
 		}
-	}
-
-	m.mutex.Lock()
-	delete(m.inhibitors, conn)
-	m.mutex.Unlock()
-
-	if m.onChange != nil {
-		m.onChange()
-	}
-
-	if err := conn.Close(); err != nil {
-		m.logger.Printf("Failed to close inhibitor connection: %v", err)
 	}
 }
 
