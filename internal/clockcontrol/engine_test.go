@@ -878,8 +878,19 @@ func TestUnknownNRFStepReconcilesAfterRestart(t *testing.T) {
 	c.advance(6*time.Hour, 0)
 	ch.done <- errors.New("lost reply")
 	waitOutcome(t, e, "unknown")
+	e.mu.Lock()
+	e.state.Preparing = true
+	e.state.PrepareBaselineValid = false
+	if err := e.save(); err != nil {
+		e.mu.Unlock()
+		t.Fatal(err)
+	}
+	e.mu.Unlock()
 	restarted, err := NewEngine(path, "boot", c, ch, ref)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Resume("boot", 1); err != nil {
 		t.Fatal(err)
 	}
 	c.advance(11*time.Second, 11*time.Second)
