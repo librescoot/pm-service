@@ -401,3 +401,29 @@ func TestLocalTrackingCannotStep(t *testing.T) {
 		t.Fatal("local reference stepped")
 	}
 }
+
+type dispatchDelayClock struct {
+	base  *fakeClock
+	calls int
+}
+
+func (c *dispatchDelayClock) Now() (time.Time, time.Duration, error) {
+	c.calls++
+	if c.calls == 4 {
+		c.base.advance(100*time.Second, 100*time.Second)
+	}
+	return c.base.Now()
+}
+func TestDispatchRechecksDeadlineAfterPersistence(t *testing.T) {
+	base := &fakeClock{utc: time.Unix(1700000000, 0), boot: 10 * time.Second}
+	clock := &dispatchDelayClock{base: base}
+	ch := &fakeChrony{t: Tracking{Source: "ntp", External: true, Age: time.Second, Residual: 10, Uncertainty: .1, Valid: true}, done: make(chan error, 1)}
+	e, err := NewEngine(filepath.Join(t.TempDir(), "state"), "boot", clock, ch, &fakeRef{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.refresh(context.Background())
+	if ch.count() != 0 || e.Status().Outcome != "expired" {
+		t.Fatal(ch.count(), e.Status())
+	}
+}
