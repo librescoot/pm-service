@@ -39,6 +39,18 @@ esac
 	if err = <-done; err != nil {
 		t.Fatal(err)
 	}
+	for _, reference := range []string{"47505300 (GPS)", "47505331 (GPS1)"} {
+		t.Run(reference, func(t *testing.T) {
+			externalScript := strings.Replace(script, "47505300 (GPS)", reference, 1)
+			if err := os.WriteFile(path, []byte(externalScript), 0700); err != nil {
+				t.Fatal(err)
+			}
+			q, err := c.Tracking(context.Background(), time.Unix(1700000000, 0))
+			if err != nil || q.Source != "ntp" || !q.External {
+				t.Fatal(q, err)
+			}
+		})
+	}
 	for _, reference := range []string{"7F7F0101 (LOCAL)", "4C4F434C (LOCL)", "4E524631 (NRF1)", "55535231 (USR1)"} {
 		t.Run(reference, func(t *testing.T) {
 			localScript := strings.Replace(script, "47505300 (GPS)", reference, 1)
