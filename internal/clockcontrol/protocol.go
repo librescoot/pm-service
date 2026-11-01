@@ -15,14 +15,15 @@ const (
 
 // Request uses CLOCK_BOOTTIME nanoseconds for receipt and age fields.
 type Request struct {
-	Op            string `json:"op"`
-	BootID        string `json:"boot_id,omitempty"`
-	Generation    uint64 `json:"generation,omitempty"`
-	Source        string `json:"source,omitempty"`
-	UTCUnixNS     int64  `json:"utc_unix_ns,omitempty"`
-	ReceiptBootNS int64  `json:"receipt_boot_ns,omitempty"`
-	SampleAgeNS   int64  `json:"sample_age_ns,omitempty"`
-	UncertaintyNS int64  `json:"uncertainty_ns,omitempty"`
+	Op             string `json:"op"`
+	BootID         string `json:"boot_id,omitempty"`
+	Generation     uint64 `json:"generation,omitempty"`
+	Source         string `json:"source,omitempty"`
+	UTCUnixNS      int64  `json:"utc_unix_ns,omitempty"`
+	ReceiptBootNS  int64  `json:"receipt_boot_ns,omitempty"`
+	DeadlineBootNS int64  `json:"deadline_boot_ns,omitempty"`
+	SampleAgeNS    int64  `json:"sample_age_ns,omitempty"`
+	UncertaintyNS  int64  `json:"uncertainty_ns,omitempty"`
 }
 
 type Quality struct {
@@ -32,6 +33,7 @@ type Quality struct {
 	Outcome            string  `json:"outcome"`
 	Preparing          bool    `json:"preparing"`
 	NRFEligible        bool    `json:"nrf_eligible"`
+	NRFDeadlineBootNS  int64   `json:"nrf_deadline_boot_ns"`
 	Source             string  `json:"source"`
 	External           bool    `json:"external"`
 	AgeNS              int64   `json:"age_ns"`

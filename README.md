@@ -165,8 +165,11 @@ fields are rejected. The response contains `ok`, optional `error`, and `quality`
 - `{"op":"status"}` returns the boot ID and generation needed by producers,
   source (`unknown`, `local`, `nrf`, `gps`, `user`, or `ntp`), `external`,
   `age_ns`, `residual_seconds`, `uncertainty_seconds`, `episode`, `outcome`,
-  `preparing`, and `nrf_eligible`. The latter is a snapshot of recovery admission;
-  a later submission is rechecked against the deadline and current state. `external` identifies a selected NTP or GPS source, not an
+  `preparing`, `nrf_eligible`, and `nrf_deadline_boot_ns`. Eligibility is a
+  snapshot of recovery admission;
+  a later submission is rechecked against the deadline and current state.
+  Established external time disables nRF recovery for the rest of the boot,
+  including coordinator restarts. `external` identifies a selected NTP or GPS source, not an
   unconditional trust assertion. NTP classification also checks the selected
   peer's reference ID using `chronyc ntpdata`, excluding local references.
   Consumers must check age, residual and
@@ -177,7 +180,9 @@ fields are rejected. The response contains `ok`, optional `error`, and `quality`
   are `nrf`, `gps` (already corrected by the producer), and `user` (explicit
   Bluetooth user time). `utc_unix_ns` is the UTC value at sample time;
   `receipt_boot_ns` is the producer's CLOCK_BOOTTIME at receipt, and
-  `sample_age_ns` is the age already elapsed at receipt. The coordinator adds
+  `sample_age_ns` is the age already elapsed at receipt. An optional
+  `deadline_boot_ns` rejects a sample at or after that CLOCK_BOOTTIME deadline.
+  The coordinator adds
   subsequent CLOCK_BOOTTIME elapsed time. Both age fields include suspend;
   samples older than 30 seconds, future receipt times, old boot/generation
   tokens and uncertainties over one second are rejected. GPS must not be a

@@ -17,17 +17,18 @@ const sampleMaxAge = 30 * time.Second
 const commandTimeout = 3 * time.Second
 
 type state struct {
-	BootID       string `json:"boot_id"`
-	Generation   uint64 `json:"generation"`
-	Episode      string `json:"episode"`
-	Deadline     int64  `json:"deadline_boot_ns"`
-	Outcome      string `json:"outcome"`
-	Attempts     int    `json:"attempts"`
-	LateUsed     bool   `json:"late_used"`
-	Preparing    bool   `json:"preparing"`
-	PrepareUTC   int64  `json:"prepare_utc_ns"`
-	PrepareBoot  int64  `json:"prepare_boot_ns"`
-	DispatchBoot int64  `json:"dispatch_boot_ns"`
+	BootID              string `json:"boot_id"`
+	Generation          uint64 `json:"generation"`
+	Episode             string `json:"episode"`
+	Deadline            int64  `json:"deadline_boot_ns"`
+	Outcome             string `json:"outcome"`
+	Attempts            int    `json:"attempts"`
+	LateUsed            bool   `json:"late_used"`
+	ExternalEstablished bool   `json:"external_established"`
+	Preparing           bool   `json:"preparing"`
+	PrepareUTC          int64  `json:"prepare_utc_ns"`
+	PrepareBoot         int64  `json:"prepare_boot_ns"`
+	DispatchBoot        int64  `json:"dispatch_boot_ns"`
 }
 type sample struct {
 	receipt, age int64
@@ -130,7 +131,8 @@ func (e *Engine) statusLocked() Quality {
 	q.Episode = e.state.Episode
 	q.Outcome = e.state.Outcome
 	q.Preparing = e.state.Preparing
-	q.NRFEligible = err == nil && bt >= e.qualityBoot && !e.state.Preparing &&
+	q.NRFDeadlineBootNS = e.state.Deadline
+	q.NRFEligible = err == nil && bt >= e.qualityBoot && !e.state.Preparing && !e.state.ExternalEstablished &&
 		(e.state.Episode == "initial" || e.state.Episode == "resume") &&
 		e.state.Outcome == "available" && int64(bt) < e.state.Deadline &&
 		!(q.External && q.AgeNS <= int64(sampleMaxAge) && math.Abs(q.ResidualSeconds)+q.UncertaintySeconds <= 5)
@@ -138,23 +140,48 @@ func (e *Engine) statusLocked() Quality {
 }
 func (e *Engine) Status() Quality { e.mu.Lock(); defer e.mu.Unlock(); return e.statusLocked() }
 func (e *Engine) Submit(r Request) error {
+	var observed Tracking
+	var observedBoot time.Duration
+	var observedOK bool
 	if r.Source == SourceNRF {
-		now, _, err := e.clock.Now()
+		now, bt, err := e.clock.Now()
 		if err != nil {
 			return err
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		t, err := e.chrony.Tracking(ctx, now)
+		observed, err = e.chrony.Tracking(ctx, now)
 		cancel()
-		if err == nil && t.Valid && t.Source == "ntp" && t.External && t.Age <= sampleMaxAge && math.Abs(t.Residual)+t.Uncertainty <= 5 {
-			return errors.New("external time already confirmed")
-		}
+		observedBoot, observedOK = bt, err == nil && observed.Valid
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now, bt, err := e.clock.Now()
 	if err != nil {
 		return err
+	}
+	if r.Source == SourceNRF && observedOK && bt >= observedBoot {
+		observed.Age += bt - observedBoot
+		external := observed.Source == "ntp" && observed.External
+		if observed.Source == SourceGPS {
+			sample, ok := e.samples[SourceGPS]
+			if ok && int64(bt) >= sample.receipt && int64(bt)-sample.receipt <= int64(sampleMaxAge)-sample.age {
+				age := time.Duration(int64(bt) - sample.receipt + sample.age)
+				if observed.Age <= age+2*time.Second {
+					if age > observed.Age {
+						observed.Age = age
+					}
+					observed.Uncertainty += float64(sample.uncertainty) / float64(time.Second)
+					external = true
+				}
+			}
+		}
+		if external && observed.Age <= sampleMaxAge && math.Abs(observed.Residual)+observed.Uncertainty <= 5 {
+			e.state.ExternalEstablished = true
+			if err = e.save(); err != nil {
+				return err
+			}
+			return errors.New("external time already confirmed")
+		}
 	}
 	if r.BootID != e.state.BootID || r.Generation != e.state.Generation {
 		return errors.New("stale boot or generation")
@@ -166,8 +193,15 @@ func (e *Engine) Submit(r Request) error {
 		return errors.New("unknown source")
 	}
 	q := e.statusLocked()
-	if r.Source == SourceNRF && !q.NRFEligible {
+	now, bt, err = e.clock.Now()
+	if err != nil {
+		return err
+	}
+	if r.Source == SourceNRF && (!q.NRFEligible || int64(bt) >= e.state.Deadline) {
 		return errors.New("nrf recovery unavailable")
+	}
+	if r.DeadlineBootNS != 0 && (r.DeadlineBootNS <= r.ReceiptBootNS || int64(bt) >= r.DeadlineBootNS) {
+		return errors.New("sample deadline expired")
 	}
 	if r.ReceiptBootNS < 0 || r.ReceiptBootNS > int64(bt) || r.SampleAgeNS < 0 || r.UncertaintyNS < 0 || r.UncertaintyNS > int64(time.Second) {
 		return errors.New("invalid sample metadata")
@@ -181,6 +215,9 @@ func (e *Engine) Submit(r Request) error {
 		return errors.New("invalid sample UTC")
 	}
 	offset := time.Unix(0, r.UTCUnixNS+age).Sub(now).Seconds()
+	if r.Source == SourceNRF && offset <= 0 {
+		return errors.New("nrf sample would not advance clock")
+	}
 	if math.Abs(offset) > float64(100*365*24*time.Hour/time.Second) {
 		return errors.New("implausible sample offset")
 	}
@@ -232,6 +269,13 @@ func (e *Engine) refresh(ctx context.Context) {
 			t.Age = time.Duration(age)
 		}
 		t.Uncertainty += float64(s.uncertainty) / float64(time.Second)
+	}
+	if t.External && t.Age <= sampleMaxAge && math.Abs(t.Residual)+t.Uncertainty <= 5 && !e.state.ExternalEstablished {
+		e.state.ExternalEstablished = true
+		if e.save() != nil {
+			e.quality = Quality{Source: "unknown"}
+			return
+		}
 	}
 	e.quality = Quality{Source: t.Source, External: t.External, AgeNS: int64(t.Age), ResidualSeconds: t.Residual, UncertaintySeconds: t.Uncertainty}
 	if e.state.Outcome == "unknown" && t.Source != "local" && int64(bt)-e.state.DispatchBoot >= int64(10*time.Second) && t.Age < 5*time.Second && math.Abs(t.Residual) < 0.1 && t.Uncertainty < 5 {

@@ -450,3 +450,89 @@ func TestDispatchRechecksDeadlineAfterPersistence(t *testing.T) {
 		t.Fatal(ch.count(), e.Status())
 	}
 }
+
+func TestNRFExternalEstablishmentSurvivesRestartAndResume(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	ch.t.Residual = .01
+	e.refresh(context.Background())
+	if e.Status().NRFEligible {
+		t.Fatal("external source did not close recovery")
+	}
+	c.advance(31*time.Second, 31*time.Second)
+	restarted, err := NewEngine(path, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Status().NRFEligible {
+		t.Fatal("restart reopened external recovery")
+	}
+	if err = restarted.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(0, 10*time.Second)
+	if err = restarted.Resume("boot", 1); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Status().NRFEligible {
+		t.Fatal("resume reopened external recovery")
+	}
+	_, bt, _ := c.Now()
+	now, _, _ := c.Now()
+	if restarted.Submit(Request{BootID: "boot", Generation: 2, Source: SourceNRF, UTCUnixNS: now.Add(time.Minute).UnixNano(), ReceiptBootNS: int64(bt)}) == nil {
+		t.Fatal("nrf admitted after external establishment")
+	}
+	newBoot, err := NewEngine(path, "new-boot", c, ch, ref)
+	if err != nil || !newBoot.Status().NRFEligible {
+		t.Fatal("new boot did not reset external latch", err)
+	}
+}
+func TestSubmitDeadlineAndCurrentClock(t *testing.T) {
+	e, c, _, ref, _ := newTestEngine(t)
+	now, bt, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(time.Second).UnixNano(), ReceiptBootNS: int64(bt), DeadlineBootNS: int64(bt + 2*time.Second)}
+	c.advance(2*time.Second, 2*time.Second)
+	if e.Submit(r) == nil || ref.calls != 0 {
+		t.Fatal("late sample delivered")
+	}
+	r.DeadlineBootNS = int64(bt + time.Minute)
+	// A separate wall-clock correction must prevent a backwards nRF sample.
+	c.advance(time.Minute, 0)
+	if e.Submit(r) == nil || ref.calls != 0 {
+		t.Fatal("backwards nrf sample delivered")
+	}
+}
+
+type advancingTracking struct {
+	*fakeChrony
+	clock *fakeClock
+	delay time.Duration
+}
+
+func (a *advancingTracking) Tracking(ctx context.Context, now time.Time) (Tracking, error) {
+	t, err := a.fakeChrony.Tracking(ctx, now)
+	a.clock.advance(a.delay, a.delay)
+	return t, err
+}
+func TestSubmitDeadlineAfterSlowTracking(t *testing.T) {
+	e, c, ch, ref, _ := newTestEngine(t)
+	now, bt, _ := c.Now()
+	e.chrony = &advancingTracking{fakeChrony: ch, clock: c, delay: 3 * time.Second}
+	err := e.Submit(Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(time.Minute).UnixNano(), ReceiptBootNS: int64(bt), DeadlineBootNS: int64(bt + 2*time.Second)})
+	if err == nil || ref.calls != 0 {
+		t.Fatal("slow tracking delivered expired sample")
+	}
+}
+func TestGPSSelectionInvalidatesPendingNRFSample(t *testing.T) {
+	e, c, ch, ref, _ := newTestEngine(t)
+	now, bt, _ := c.Now()
+	if err := e.Submit(Request{BootID: "boot", Generation: 1, Source: SourceGPS, UTCUnixNS: now.UnixNano(), ReceiptBootNS: int64(bt)}); err != nil {
+		t.Fatal(err)
+	}
+	ch.t = Tracking{Source: SourceGPS, Age: time.Second, Residual: .01, Uncertainty: .1, Valid: true}
+	if e.Submit(Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(time.Minute).UnixNano(), ReceiptBootNS: int64(bt)}) == nil {
+		t.Fatal("GPS transition did not invalidate nrf")
+	}
+	if ref.calls != 1 || e.Status().NRFEligible {
+		t.Fatal("GPS not latched")
+	}
+}
