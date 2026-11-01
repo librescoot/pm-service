@@ -130,6 +130,10 @@ func (e *Engine) statusLocked() Quality {
 	q.Episode = e.state.Episode
 	q.Outcome = e.state.Outcome
 	q.Preparing = e.state.Preparing
+	q.NRFEligible = err == nil && bt >= e.qualityBoot && !e.state.Preparing &&
+		(e.state.Episode == "initial" || e.state.Episode == "resume") &&
+		e.state.Outcome == "available" && int64(bt) < e.state.Deadline &&
+		!(q.External && q.AgeNS <= int64(sampleMaxAge) && math.Abs(q.ResidualSeconds)+q.UncertaintySeconds <= 5)
 	return q
 }
 func (e *Engine) Status() Quality { e.mu.Lock(); defer e.mu.Unlock(); return e.statusLocked() }
@@ -162,8 +166,8 @@ func (e *Engine) Submit(r Request) error {
 		return errors.New("unknown source")
 	}
 	q := e.statusLocked()
-	if r.Source == SourceNRF && q.External && q.AgeNS <= int64(sampleMaxAge) && math.Abs(q.ResidualSeconds)+q.UncertaintySeconds <= 5 {
-		return errors.New("external time already confirmed")
+	if r.Source == SourceNRF && !q.NRFEligible {
+		return errors.New("nrf recovery unavailable")
 	}
 	if r.ReceiptBootNS < 0 || r.ReceiptBootNS > int64(bt) || r.SampleAgeNS < 0 || r.UncertaintyNS < 0 || r.UncertaintyNS > int64(time.Second) {
 		return errors.New("invalid sample metadata")

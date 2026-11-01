@@ -165,7 +165,8 @@ fields are rejected. The response contains `ok`, optional `error`, and `quality`
 - `{"op":"status"}` returns the boot ID and generation needed by producers,
   source (`unknown`, `local`, `nrf`, `gps`, `user`, or `ntp`), `external`,
   `age_ns`, `residual_seconds`, `uncertainty_seconds`, `episode`, `outcome`,
-  and `preparing`. `external` identifies a selected NTP or GPS source, not an
+  `preparing`, and `nrf_eligible`. The latter is a snapshot of recovery admission;
+  a later submission is rechecked against the deadline and current state. `external` identifies a selected NTP or GPS source, not an
   unconditional trust assertion. NTP classification also checks the selected
   peer's reference ID using `chronyc ntpdata`, excluding local references.
   Consumers must check age, residual and

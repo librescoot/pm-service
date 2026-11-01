@@ -125,6 +125,29 @@ func TestSubmitAgeGenerationAndSources(t *testing.T) {
 		t.Fatal(ref.calls)
 	}
 }
+func TestNRFEligibilityExpiresAcrossSuspendAndRestart(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	if !e.Status().NRFEligible {
+		t.Fatal("initial recovery should be eligible")
+	}
+	c.advance(0, episodeWindow)
+	if e.Status().NRFEligible {
+		t.Fatal("suspend must count toward recovery deadline")
+	}
+	now, boot, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.UnixNano(), ReceiptBootNS: int64(boot)}
+	if e.Submit(r) == nil || ref.calls != 0 {
+		t.Fatal("expired recovery sample accepted")
+	}
+	restarted, err := NewEngine(path, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Status().NRFEligible || restarted.Submit(r) == nil {
+		t.Fatal("restart reopened recovery")
+	}
+}
+
 func TestStepPersistRestartAndDeadline(t *testing.T) {
 	e, c, ch, ref, p := newTestEngine(t)
 	e.refresh(context.Background())

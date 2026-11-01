@@ -31,6 +31,7 @@ type Quality struct {
 	Episode            string  `json:"episode"`
 	Outcome            string  `json:"outcome"`
 	Preparing          bool    `json:"preparing"`
+	NRFEligible        bool    `json:"nrf_eligible"`
 	Source             string  `json:"source"`
 	External           bool    `json:"external"`
 	AgeNS              int64   `json:"age_ns"`
