@@ -88,7 +88,7 @@ func NewEngine(path, boot string, clock Clock, chrony Chrony, ref Refclock) (*En
 	if err != nil {
 		return nil, err
 	}
-	e := &Engine{path: path, clock: clock, chrony: chrony, ref: ref, samples: make(map[string]sample)}
+	e := &Engine{path: path, clock: clock, chrony: chrony, ref: ref, samples: make(map[string]sample), quality: Quality{Source: "unknown"}}
 	b, err := os.ReadFile(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -413,6 +413,6 @@ func (e *Engine) Resume(boot string, generation uint64) error {
 		return err
 	}
 	e.samples = make(map[string]sample)
-	e.quality = Quality{}
+	e.quality = Quality{Source: "unknown"}
 	return nil
 }
