@@ -87,33 +87,6 @@ func TestLoadBuildTimestamp(t *testing.T) {
 	}
 }
 
-func TestTimeSyncEvidence(t *testing.T) {
-	floor := time.Unix(1_700_000_000, 0)
-	tests := []struct {
-		name  string
-		gps   bool
-		ntp   bool
-		now   time.Time
-		floor time.Time
-		want  bool
-	}{
-		{name: "gps only", gps: true, now: floor.Add(time.Hour), floor: floor, want: true},
-		{name: "ntp only", ntp: true, now: floor.Add(time.Hour), floor: floor, want: true},
-		{name: "neither", now: floor.Add(time.Hour), floor: floor, want: false},
-		{name: "gps but implausible", gps: true, now: floor.Add(-time.Hour), floor: floor, want: false},
-		{name: "ntp but implausible", ntp: true, now: floor.Add(-time.Hour), floor: floor, want: false},
-		{name: "no floor disables plausibility", gps: true, now: time.Unix(0, 0), want: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := timeSyncEvidence(tt.gps, tt.ntp, tt.now, tt.floor); got != tt.want {
-				t.Errorf("timeSyncEvidence(%v, %v, %v, %v) = %v, want %v",
-					tt.gps, tt.ntp, tt.now, tt.floor, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestLoadHWClock(t *testing.T) {
 	dir := t.TempDir()
 

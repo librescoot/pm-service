@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/librescoot/librefsm"
+	"github.com/librescoot/pm-service/internal/clockcontrol"
 	"github.com/librescoot/pm-service/internal/config"
 	"github.com/librescoot/pm-service/internal/fsm"
 	"github.com/librescoot/pm-service/internal/hibernation"
@@ -129,12 +130,7 @@ type Service struct {
 	wakeTimerMaxSecondsOver uint32
 	wakeTimerAckTimeoutOver time.Duration
 
-	// clockFloor is the earliest wall-clock reading that can be considered
-	// correct: the newest of the image build time (/etc/build-timestamp) and the
-	// fake-hwclock saved time (/data or /etc fake-hwclock.data). The clock can
-	// never predate the image build, and fake-hwclock only ever advances the
-	// clock on load, so a reading before this floor has not been synced. Set once
-	// in Run().
+	// clockFloor is the image build time; saved fake-hwclock values are provisional.
 	clockFloor time.Time
 	// clockGuard anchors the validated wall clock to CLOCK_BOOTTIME so a suspend
 	// that froze the clock is detected even though the time-sync gate stays
@@ -254,6 +250,9 @@ func (s *Service) Run(ctx context.Context) error {
 	defer cancel()
 	s.ctx = ctx
 	s.ctxCancel = cancel
+	if err := recoverClockPreparation(); err != nil {
+		s.logger.Printf("Clock preparation recovery: %v", err)
+	}
 	// Preparation commands cannot outlive the PM session that admitted them.
 	if err := s.powerManagerPub.SetMany(map[string]any{
 		"hibernate-request-id": "", "hibernate-status": "idle", "hibernate-error": "",
@@ -266,7 +265,7 @@ func (s *Service) Run(ctx context.Context) error {
 	// without racing against FSM action writers.
 	buildTs := loadBuildTimestamp(buildTimestampPath)
 	hwClock := loadHWClock(hwClockPersistPath, hwClockSeedPath)
-	s.clockFloor = laterOf(buildTs, hwClock)
+	s.clockFloor = buildTs
 	s.logger.Printf("Clock plausibility floor: build=%s hwclock=%s -> %s",
 		formatOptionalTime(buildTs), formatOptionalTime(hwClock), formatOptionalTime(s.clockFloor))
 	if vehicleState, err := s.redis.HGet("vehicle", "state"); err == nil && vehicleState != "" {
@@ -488,15 +487,7 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to start settings watcher: %v", err)
 	}
 
-	// Wait until the wall clock is trustworthy before the scheduler may fire.
-	// Two independent signals are accepted: a confirmed GPS `chronyc settime`
-	// or chronyd syncing to a real external source. Both require the reading to
-	// be past the clock plausibility floor.
-	//
-	// We poll instead of pub/sub-watching: modem-service writes the clock hash
-	// with SetMany(NoPublish), which does not fire an OnField subscription. The
-	// poller does an immediate first check, then every 30 s; once the clock is
-	// validated the scheduler is latched and the poller exits.
+	// Keep calendar decisions tied to current coordinator quality.
 	go s.pollForTimeSync(ctx)
 
 	// Re-check the last-ditch condition once the boot grace expires, so a
@@ -1374,12 +1365,33 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 		if s.cancelIneligibleLowPower(c) {
 			return nil
 		}
+		recoveryErr := recoverClockPreparation()
+		var quality clockcontrol.Quality
+		err := recoveryErr
+		if err == nil {
+			quality, err = coordinatorRequest(clockcontrol.Request{Op: "prepare"})
+		}
+		bootID, bootErr := os.ReadFile(clockBootID)
+		if err == nil && (bootErr != nil || quality.BootID == "" || quality.BootID != strings.TrimSpace(string(bootID)) || quality.Generation == 0 || !quality.Preparing) {
+			_, _ = coordinatorRequest(clockcontrol.Request{Op: "abort"})
+			err = fmt.Errorf("invalid clock preparation token")
+		}
+		if err != nil {
+			s.logger.Printf("Clock coordinator did not admit suspend: %v", err)
+			s.fsmData.LowPowerStateIssued = false
+			s.enableModem()
+			c.Send(librefsm.Event{ID: fsm.EvPowerRun, Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun}})
+			return nil
+		}
 		// Block on logind's PrepareForSleep cycle so the return only means
 		// "the system slept and resumed". `systemctl suspend` alone returns
 		// when the job is enqueued, which used to make the FSM read a stale
 		// wakeup reason and cycle through pre-suspend while the kernel was
 		// still on its way down.
 		if err := s.systemdClient.SuspendAndWaitResume(s.ctx, suspendEnterTimeout); err != nil {
+			if _, abortErr := coordinatorRequest(clockcontrol.Request{Op: "abort"}); abortErr != nil {
+				s.logger.Printf("Clock suspend abort: %v", abortErr)
+			}
 			s.fsmData.LowPowerStateIssued = false
 			if s.ctx.Err() != nil {
 				return nil
@@ -1391,6 +1403,9 @@ func (s *Service) EnterIssuingLowPower(c *librefsm.Context) error {
 				Payload: fsm.PowerCommandPayload{TargetState: fsm.TargetRun},
 			})
 			return nil
+		}
+		if _, err := coordinatorRequest(clockcontrol.Request{Op: "resume", BootID: quality.BootID, Generation: quality.Generation}); err != nil {
+			s.logger.Printf("Clock resume coordination: %v", err)
 		}
 		s.handleWakeupAfterSuspend(c)
 		return nil
@@ -2384,83 +2399,38 @@ func (s *Service) onScheduledHibernateDurationSetting(value string) error {
 	return nil
 }
 
-// pollForTimeSync polls until the wall clock is trustworthy, then latches the
-// scheduler's time-synced gate and exits.
-//
-// Two independent signals are accepted, because the two time paths behave
-// differently on the MDB: NTP reaches chronyd directly, while GPS arrives via
-// `chronyc settime`, which steps the clock without creating a chrony reference
-// (so chronyc tracking stays "Not synchronised" on a GPS-only scooter).
-//
-//   - GPS: modem-service confirmed a successful `chronyc settime` (the clock
-//     hash). This is deliberately not `gps.active`: a fix can exist while the
-//     settime fails, which leaves the wall clock unset.
-//   - NTP: chronyd reports a real external reference (see ntpSynced).
-//
-// Both require the clock to be past the plausibility floor.
+// pollForTimeSync refreshes the guard only from current external quality.
 func (s *Service) pollForTimeSync(ctx context.Context) {
-	check := func() bool {
+	check := func() {
 		if s.scheduler == nil {
-			return true
+			return
+		}
+		quality, err := currentClockQuality()
+		if err != nil {
+			return
 		}
 		now := time.Now()
-		gpsSynced := s.gpsClockSynced()
-		ntpOK := false
-		if !gpsSynced {
-			ntpOK = ntpSynced()
+		if !calendarClockPlausible(now, s.clockFloor, quality) {
+			return
 		}
-		if !timeSyncEvidence(gpsSynced, ntpOK, now, s.clockFloor) {
-			if !s.clockImplausibleLogged && !clockPlausible(now, s.clockFloor) {
-				s.logger.Printf("Wall clock %s predates the plausibility floor %s; waiting for time sync",
-					now.UTC().Format(time.RFC3339), formatOptionalTime(s.clockFloor))
-				s.clockImplausibleLogged = true
-			}
-			return false
+		boot, err := s.bootElapsed()
+		if err != nil {
+			return
 		}
-		if gpsSynced {
-			s.logger.Printf("Wall clock validated by GPS (chronyc settime confirmed)")
-		} else {
-			s.logger.Printf("Wall clock validated by NTP")
-		}
-		if boot, err := s.bootElapsed(); err != nil {
-			s.logger.Printf("Wall clock validated but boot time unreadable (%v); clock guard not anchored", err)
-		} else {
-			s.clockGuard.mark(now, boot)
-		}
+		s.clockGuard.mark(now, boot)
 		s.scheduler.SetTimeSynced(true)
-		return true
 	}
-	if check() {
-		return
-	}
-	ticker := time.NewTicker(30 * time.Second)
+	check()
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if check() {
-				return
-			}
+			check()
 		}
 	}
-}
-
-// gpsClockSynced reports whether modem-service confirmed that chronyc accepted
-// a GPS time sample this boot. modem-service writes the clock hash only after a
-// successful `chronyc settime`; Redis is not persistent, so the field cannot be
-// stale from a previous boot.
-func (s *Service) gpsClockSynced() bool {
-	val, err := s.redis.HGet("clock", "synced-at")
-	return err == nil && val != ""
-}
-
-// timeSyncEvidence reports whether the clock can be trusted given the two
-// independent signals. The plausibility floor is required for both: a
-// "synchronised" clock can be wrong if it is pinned to a local pseudo-source.
-func timeSyncEvidence(gpsSettime, ntp bool, now, floor time.Time) bool {
-	return clockPlausible(now, floor) && (gpsSettime || ntp)
 }
 
 const (
@@ -2468,7 +2438,7 @@ const (
 	// can tell a merely plausible clock from a synced one.
 	buildTimestampPath = "/etc/build-timestamp"
 	// fake-hwclock keeps a persistent copy under /data and a build-time seed
-	// under /etc; either is a valid clock lower bound.
+	// under /etc; both are provisional boot fallbacks.
 	hwClockPersistPath = "/data/fake-hwclock.data"
 	hwClockSeedPath    = "/etc/fake-hwclock.data"
 	// scheduledHibernateMarkerPath records that the last shutdown was a
@@ -2476,6 +2446,10 @@ const (
 	// trusted across the poweroff, so the guard it feeds is uptime based.
 	scheduledHibernateMarkerPath = "/data/pm-scheduled-hibernate"
 )
+
+func calendarClockPlausible(now, build time.Time, quality clockcontrol.Quality) bool {
+	return clockPlausible(now, build) && quality.External && (quality.Source == "ntp" || quality.Source == "gps")
+}
 
 // clockPlausible reports whether the wall clock is at least as new as floor.
 // A zero floor disables the check.
@@ -2503,9 +2477,7 @@ func loadBuildTimestamp(path string) time.Time {
 
 // loadHWClock returns the newest timestamp across the fake-hwclock files. The
 // files hold UTC "YYYY-MM-DD HH:MM:SS" strings (see the fake-hwclock script);
-// missing or malformed entries are skipped. fake-hwclock only advances the
-// clock on load, so the newest entry is a valid lower bound for the booted
-// system clock.
+// missing or malformed entries are skipped. The newest entry is provisional.
 func loadHWClock(paths ...string) time.Time {
 	var newest time.Time
 	for _, path := range paths {
@@ -2610,6 +2582,9 @@ func (s *Service) clockValid() bool {
 	boot, err := s.bootElapsed()
 	if err != nil {
 		s.logger.Printf("Cannot read boot time for clock guard: %v; suppressing scheduled hibernation", err)
+		return false
+	}
+	if _, err := currentClockQuality(); err != nil {
 		return false
 	}
 	return s.clockGuard.valid(time.Now(), boot)
