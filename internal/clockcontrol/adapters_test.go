@@ -58,7 +58,7 @@ esac
 				t.Fatal(err)
 			}
 			q, err := c.Tracking(context.Background(), time.Unix(1700000000, 0))
-			if err != nil || q.Source != "local" || q.External {
+			if err != nil || q.Source != SourceNetworkHoldover || q.External {
 				t.Fatal(q, err)
 			}
 		})

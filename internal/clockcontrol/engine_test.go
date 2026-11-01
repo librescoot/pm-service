@@ -644,3 +644,39 @@ func TestGPSOnlyOfflineConvergesFromSelectedQuality(t *testing.T) {
 		t.Fatalf("GPS quality: %+v", q)
 	}
 }
+
+func TestNetworkHoldoverLateThenExternalRecovery(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	c.advance(2*time.Hour, 2*time.Hour)
+	ch.t = Tracking{Source: SourceNetworkHoldover, Age: time.Second, Residual: 6 * 3600, Uncertainty: .1, Valid: true}
+	e.refresh(context.Background())
+	if ch.count() != 1 || e.Status().Episode != "late-holdover" {
+		t.Fatal(e.Status(), ch.count())
+	}
+	ch.done <- nil
+	waitOutcome(t, e, "completed")
+	e.refresh(context.Background())
+	if e.Status().External || e.Status().Source != SourceNetworkHoldover {
+		t.Fatal(e.Status())
+	}
+	c.advance(episodeWindow+time.Second, episodeWindow+time.Second)
+	e.refresh(context.Background())
+	if ch.count() != 1 {
+		t.Fatal("repeated holdover recovery")
+	}
+	restarted, err := NewEngine(path, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.refresh(context.Background())
+	if ch.count() != 1 {
+		t.Fatal("restart repeated holdover recovery")
+	}
+	ch.t = Tracking{Source: "ntp", External: true, Age: time.Second, Residual: -4 * 3600, Uncertainty: .1, Valid: true}
+	restarted.refresh(context.Background())
+	if ch.count() != 2 || restarted.Status().Episode != "late-external" {
+		t.Fatal(restarted.Status(), ch.count())
+	}
+	ch.done <- nil
+	waitOutcome(t, restarted, "completed")
+}

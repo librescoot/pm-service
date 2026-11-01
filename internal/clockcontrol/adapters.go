@@ -184,6 +184,8 @@ func (c Chronyc) Tracking(ctx context.Context, now time.Time) (Tracking, error) 
 			if peerID != 0 && peerID>>24 != 127 && peerID != 0x4c4f434c && peerID != 0x4e524631 && peerID != 0x55535231 {
 				q.Source = "ntp"
 				q.External = true
+			} else if peerID != 0 {
+				q.Source = SourceNetworkHoldover
 			}
 		}
 	}

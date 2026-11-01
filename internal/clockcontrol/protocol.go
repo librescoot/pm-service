@@ -8,9 +8,10 @@ import (
 )
 
 const (
-	SourceNRF  = "nrf"
-	SourceGPS  = "gps"
-	SourceUser = "user"
+	SourceNRF             = "nrf"
+	SourceGPS             = "gps"
+	SourceUser            = "user"
+	SourceNetworkHoldover = "network-holdover"
 )
 
 // Request uses CLOCK_BOOTTIME nanoseconds for receipt and age fields.

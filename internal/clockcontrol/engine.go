@@ -24,6 +24,7 @@ type state struct {
 	Outcome             string `json:"outcome"`
 	Attempts            int    `json:"attempts"`
 	LateUsed            bool   `json:"late_used"`
+	LateHoldoverUsed    bool   `json:"late_holdover_used"`
 	ExternalEstablished bool   `json:"external_established"`
 	ExternalAfterBoot   int64  `json:"external_after_boot_ns"`
 	Preparing           bool   `json:"preparing"`
@@ -323,10 +324,17 @@ func (e *Engine) refresh(ctx context.Context) {
 	if e.state.Preparing {
 		return
 	}
-	if t.External && t.Age <= sampleMaxAge && t.Uncertainty <= 5 && !e.state.LateUsed && math.Abs(t.Residual) > 1 && int64(bt) >= e.state.Deadline {
+	lateExternal := t.External && !e.state.LateUsed
+	lateHoldover := t.Source == SourceNetworkHoldover && !e.state.LateHoldoverUsed && !e.state.ExternalEstablished
+	if (lateExternal || lateHoldover) && t.Age <= sampleMaxAge && t.Uncertainty <= 5 && math.Abs(t.Residual) > 1 && int64(bt) >= e.state.Deadline {
 		old := e.state
-		e.state.LateUsed = true
-		e.state.Episode = "late-external"
+		if lateExternal {
+			e.state.LateUsed = true
+			e.state.Episode = "late-external"
+		} else {
+			e.state.LateHoldoverUsed = true
+			e.state.Episode = "late-holdover"
+		}
 		e.state.Deadline = int64(bt + episodeWindow)
 		e.state.Outcome = "available"
 		e.state.Attempts = 0
@@ -335,7 +343,7 @@ func (e *Engine) refresh(ctx context.Context) {
 			return
 		}
 	}
-	if (t.Source != "ntp" && t.Source != SourceNRF && t.Source != SourceGPS && t.Source != SourceUser) || e.state.Outcome != "available" || int64(bt) >= e.state.Deadline || t.Age > sampleMaxAge || t.Uncertainty > 5 || math.Abs(t.Residual) < 1 {
+	if (t.Source != "ntp" && t.Source != SourceNRF && t.Source != SourceGPS && t.Source != SourceUser && t.Source != SourceNetworkHoldover) || (t.Source == SourceNetworkHoldover && e.state.ExternalEstablished) || e.state.Outcome != "available" || int64(bt) >= e.state.Deadline || t.Age > sampleMaxAge || t.Uncertainty > 5 || math.Abs(t.Residual) < 1 {
 		return
 	}
 	old := e.state
