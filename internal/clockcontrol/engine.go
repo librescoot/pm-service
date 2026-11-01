@@ -172,7 +172,7 @@ func (e *Engine) Submit(r Request) error {
 					if age > observed.Age {
 						observed.Age = age
 					}
-					observed.Uncertainty += float64(sample.uncertainty) / float64(time.Second)
+					observed.Uncertainty = math.Max(observed.Uncertainty, float64(sample.uncertainty)/float64(time.Second))
 					external = true
 				}
 			}
@@ -294,7 +294,7 @@ func (e *Engine) refresh(ctx context.Context) {
 		if time.Duration(age) > t.Age {
 			t.Age = time.Duration(age)
 		}
-		t.Uncertainty += float64(s.uncertainty) / float64(time.Second)
+		t.Uncertainty = math.Max(t.Uncertainty, float64(s.uncertainty)/float64(time.Second))
 	}
 	if t.External && !e.externalObservationFresh(t, bt) {
 		e.quality = Quality{Source: "unknown"}

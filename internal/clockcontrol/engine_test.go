@@ -643,6 +643,13 @@ func TestGPSOnlyOfflineConvergesFromSelectedQuality(t *testing.T) {
 	if q.Source != "gps" || !q.External || q.UncertaintySeconds < 2 {
 		t.Fatalf("GPS quality: %+v", q)
 	}
+	ch.mu.Lock()
+	ch.t.Uncertainty = 4.1
+	ch.mu.Unlock()
+	e.refresh(context.Background())
+	if q = e.Status(); q.UncertaintySeconds != 4.1 || !q.External {
+		t.Fatalf("configured precision was counted twice: %+v", q)
+	}
 }
 
 func TestNetworkHoldoverLateThenExternalRecovery(t *testing.T) {

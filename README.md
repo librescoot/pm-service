@@ -127,11 +127,10 @@ Made with ❤️ by the Librescoot community
 
 ## Clock coordinator core
 
-`clock-coordinator` is a separate executable. This core is not wired into the
-production units or chrony configuration yet. Chronyd remains the only system
-clock writer; configure it without any automatic `makestep` directive before
-using the coordinator's recovery policy. Keep chronyd running during source
-probes. The coordinator does not set the system clock directly.
+`clock-coordinator` is a separate executable installed on MDB and DBC. Chronyd
+is the only system clock writer after the fake-hwclock boot fallback. Automatic
+`makestep` is disabled; the coordinator admits individual recovery commands.
+Chronyd remains running during source probes.
 
 The daemon requires root and exclusively locks `/run/clock-coordinator/owner.lock`.
 Its state and socket are in that root-owned, non-group/world-writable directory.
@@ -147,7 +146,7 @@ Configure chrony to create these three SOCK refclocks in `/run/chrony` (or the
 
 ```
 refclock SOCK /run/chrony/nrf.sock refid NRF1 precision 1 poll 0 filter 1 minsamples 1 maxsamples 1
-refclock SOCK /run/chrony/gps.sock refid GPS1 precision 4 poll 0 filter 1 minsamples 1 maxsamples 1
+refclock SOCK /run/chrony/gps.sock refid GPS1 precision 4 poll 0 filter 1 minsamples 4 maxsamples 8
 refclock SOCK /run/chrony/user.sock refid USR1 precision 1 poll 0 filter 1 minsamples 1 maxsamples 1
 ```
 
@@ -163,7 +162,7 @@ bytes, 16 concurrent connections, and four seconds per connection. Unknown
 fields are rejected. The response contains `ok`, optional `error`, and `quality`.
 
 - `{"op":"status"}` returns the boot ID and generation needed by producers,
-  source (`unknown`, `local`, `nrf`, `gps`, `user`, or `ntp`), `external`,
+  source (`unknown`, `local`, `network-holdover`, `nrf`, `gps`, `user`, or `ntp`), `external`,
   `age_ns`, `residual_seconds`, `uncertainty_seconds`, `episode`, `outcome`,
   `preparing`, `nrf_eligible`, and `nrf_deadline_boot_ns`. Eligibility is a
   snapshot of recovery admission;
@@ -204,7 +203,9 @@ start failure exhausts the attempt. A timeout or other error after process start
 is `unknown`; it is never blindly retried. A fresh tracking observation after
 at least ten seconds, residual below 0.1 seconds and uncertainty below five
 seconds reconciles it. A single late external episode per boot is possible after
-an earlier deadline for a fresh large external residual. A resume episode is
+an earlier deadline for a fresh large external residual. A separate one-time
+late network-holdover episode permits offline DBC recovery before external time
+is established; holdover is never external confirmation. A resume episode is
 opened only when CLOCK_BOOTTIME advanced over two seconds more than UTC during
 preparation/suspend. A command admitted before a deadline may complete later;
 there is no persistent chrony step permission.
