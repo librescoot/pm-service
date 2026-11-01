@@ -124,3 +124,80 @@ Original Librescoot code in this repository is available, at your option, under
 Third-party code retains its existing license.
 
 Made with ❤️ by the Librescoot community
+
+## Clock coordinator core
+
+`clock-coordinator` is a separate executable. This core is not wired into the
+production units or chrony configuration yet. Chronyd remains the only system
+clock writer; configure it without any automatic `makestep` directive before
+using the coordinator's recovery policy. Keep chronyd running during source
+probes. The coordinator does not set the system clock directly.
+
+The daemon requires root and exclusively locks `/run/clock-coordinator/owner.lock`.
+Its state and socket are in that root-owned, non-group/world-writable directory.
+The lock file must not be removed while the daemon is running. A restart in the
+same boot reloads the episode and spent budget; an in-flight command becomes
+`unknown`. `--run-dir` changes the runtime directory and `--refclock-dir` changes
+the directory for the chrony sockets. Run `clock-coordinator --wait=10s` as a
+bounded local startup wait. It exits successfully when quality becomes available
+or when the deadline expires; absence of a clock source never blocks startup.
+
+Configure chrony to create these three SOCK refclocks in `/run/chrony` (or the
+`--refclock-dir` directory), with the indicated reference IDs:
+
+```
+refclock SOCK /run/chrony/nrf.sock refid NRF1 precision 1 poll 0 filter 1 minsamples 1 maxsamples 1
+refclock SOCK /run/chrony/gps.sock refid GPS1 precision 1 poll 0 filter 1 minsamples 1 maxsamples 1
+refclock SOCK /run/chrony/user.sock refid USR1 precision 1 poll 0 filter 1 minsamples 1 maxsamples 1
+```
+
+SOCK has no per-sample uncertainty field. The one-second configured precision
+is a conservative floor for the accepted producer uncertainty. The packet uses
+the native Linux timeval layout; this assumes chronyd uses the native ABI of
+its process (32-bit timeval on ARMv7 and 64-bit timeval on 64-bit Linux).
+
+The socket protocol is one UTF-8 JSON object followed by a newline per Unix
+stream connection at `/run/clock-coordinator/control.sock`; the response is one
+JSON object and newline. The socket mode is 0600. Requests are limited to 4096
+bytes, 16 concurrent connections, and four seconds per connection. Unknown
+fields are rejected. The response contains `ok`, optional `error`, and `quality`.
+
+- `{"op":"status"}` returns the boot ID and generation needed by producers,
+  source (`unknown`, `local`, `nrf`, `gps`, `user`, or `ntp`), `external`,
+  `age_ns`, `residual_seconds`, `uncertainty_seconds`, `episode`, `outcome`,
+  and `preparing`. `external` identifies a selected NTP or GPS source, not an
+  unconditional trust assertion. NTP classification also checks the selected
+  peer's reference ID using `chronyc ntpdata`, excluding local references.
+  Consumers must check age, residual and
+  uncertainty. Unknown/in-flight outcomes do not publish source quality.
+- `{"op":"submit","boot_id":"...","generation":1,"source":"nrf",
+  "utc_unix_ns":1700000000000000000,"receipt_boot_ns":10000000000,
+  "sample_age_ns":0,"uncertainty_ns":1000000000}` submits a sample. Sources
+  are `nrf`, `gps` (already corrected by the producer), and `user` (explicit
+  Bluetooth user time). `utc_unix_ns` is the UTC value at sample time;
+  `receipt_boot_ns` is the producer's CLOCK_BOOTTIME at receipt, and
+  `sample_age_ns` is the age already elapsed at receipt. The coordinator adds
+  subsequent CLOCK_BOOTTIME elapsed time. Both age fields include suspend;
+  samples older than 30 seconds, future receipt times, old boot/generation
+  tokens and uncertainties over one second are rejected. GPS must not be a
+  fallback value derived from the system clock. A successful submission means
+  the datagram was delivered, not that chronyd selected the source. User and
+  nRF samples are holdover, never external confirmation.
+- `{"op":"prepare"}` fences new dispatches and waits up to 3.5 seconds for an
+  in-flight command. An unresolved outcome aborts preparation and returns an
+  error; PM must not suspend on that error. `{"op":"abort"}` cancels a
+  successful preparation. `{"op":"resume","boot_id":"...","generation":1}`
+  completes it using the token obtained before preparation and increments the
+  generation even if no clock loss was found. Producers must fetch the new token.
+
+Episodes have a 90-second admission window. A selected fresh source, residual of
+at least one second, and uncertainty at most five seconds are required for the
+one immediate, parameterless `chronyc makestep`. A second known pre-dispatch
+start failure exhausts the attempt. A timeout or other error after process start
+is `unknown`; it is never blindly retried. A fresh tracking observation after
+at least ten seconds, residual below 0.1 seconds and uncertainty below one
+second reconciles it. A single late external episode per boot is possible after
+an earlier deadline for a fresh large external residual. A resume episode is
+opened only when CLOCK_BOOTTIME advanced over two seconds more than UTC during
+preparation/suspend. A command admitted before a deadline may complete later;
+there is no persistent chrony step permission.

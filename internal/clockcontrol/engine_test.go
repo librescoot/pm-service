@@ -1,0 +1,403 @@
+package clockcontrol
+
+import (
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"math"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+type fakeClock struct {
+	mu   sync.Mutex
+	utc  time.Time
+	boot time.Duration
+}
+
+func (c *fakeClock) Now() (time.Time, time.Duration, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.utc, c.boot, nil
+}
+func (c *fakeClock) advance(wall, boot time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.utc = c.utc.Add(wall)
+	c.boot += boot
+}
+
+type fakeChrony struct {
+	mu       sync.Mutex
+	t        Tracking
+	started  int
+	startErr error
+	done     chan error
+}
+
+func (c *fakeChrony) Tracking(context.Context, time.Time) (Tracking, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t, nil
+}
+func (c *fakeChrony) StartStep(context.Context) (<-chan error, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.started++
+	if c.startErr != nil {
+		return nil, c.startErr
+	}
+	return c.done, nil
+}
+func (c *fakeChrony) count() int { c.mu.Lock(); defer c.mu.Unlock(); return c.started }
+
+type fakeRef struct {
+	offset float64
+	calls  int
+}
+
+func (r *fakeRef) Send(_ string, _ time.Time, v float64) error { r.offset = v; r.calls++; return nil }
+func newTestEngine(t *testing.T) (*Engine, *fakeClock, *fakeChrony, *fakeRef, string) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "state")
+	clock := &fakeClock{utc: time.Unix(1700000000, 0), boot: 10 * time.Second}
+	ch := &fakeChrony{t: Tracking{Source: "ntp", External: true, Age: time.Second, Residual: 10, Uncertainty: .1, Valid: true}, done: make(chan error, 2)}
+	ref := &fakeRef{}
+	e, err := NewEngine(p, "boot", clock, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e, clock, ch, ref, p
+}
+func waitOutcome(t *testing.T, e *Engine, out string) {
+	t.Helper()
+	end := time.Now().Add(time.Second)
+	for time.Now().Before(end) {
+		if e.Status().Outcome == out {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("outcome %s want %s", e.Status().Outcome, out)
+}
+func TestSOCKLayout(t *testing.T) {
+	for _, tc := range []struct{ word, size, off int }{{4, 32, 8}, {8, 40, 16}} {
+		b, err := EncodeSOCK(time.Unix(42, 123456000), -1.5, tc.word, binary.LittleEndian)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(b) != tc.size || binary.LittleEndian.Uint32(b[0:4]) != 42 || math.Float64frombits(binary.LittleEndian.Uint64(b[tc.off:])) != -1.5 || binary.LittleEndian.Uint32(b[tc.off+20:]) != 0x534f434b {
+			t.Fatalf("wrong %d-bit layout: %x", tc.word*8, b)
+		}
+		for _, v := range b[tc.off+8 : tc.off+20] {
+			if v != 0 {
+				t.Fatal("nonzero flags")
+			}
+		}
+	}
+}
+func TestSubmitAgeGenerationAndSources(t *testing.T) {
+	e, c, _, ref, _ := newTestEngine(t)
+	now, boot, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(5 * time.Second).UnixNano(), ReceiptBootNS: int64(boot - 2*time.Second), SampleAgeNS: int64(time.Second)}
+	if err := e.Submit(r); err != nil {
+		t.Fatal(err)
+	}
+	if ref.offset != 8 {
+		t.Fatalf("offset=%f", ref.offset)
+	}
+	r.Generation = 2
+	if e.Submit(r) == nil {
+		t.Fatal("old generation accepted")
+	}
+	r.Generation = 1
+	r.SampleAgeNS = int64(time.Minute)
+	if e.Submit(r) == nil {
+		t.Fatal("stale sample accepted")
+	}
+	if ref.calls != 1 {
+		t.Fatal(ref.calls)
+	}
+}
+func TestStepPersistRestartAndDeadline(t *testing.T) {
+	e, c, ch, ref, p := newTestEngine(t)
+	e.refresh(context.Background())
+	if ch.count() != 1 || e.Status().Outcome != "in-flight" {
+		t.Fatal(e.Status())
+	}
+	restarted, err := NewEngine(p, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.Status().Outcome != "unknown" {
+		t.Fatal(restarted.Status())
+	}
+	restarted.refresh(context.Background())
+	if ch.count() != 1 {
+		t.Fatal("replayed step")
+	}
+	ch.done <- nil
+	waitOutcome(t, e, "completed")
+	e2, c2, ch2, _, _ := newTestEngine(t)
+	c2.advance(91*time.Second, 91*time.Second)
+	ch2.t.External = false
+	e2.refresh(context.Background())
+	if ch2.count() != 0 {
+		t.Fatal("dispatched after deadline")
+	}
+}
+func TestPredispatchRetryBound(t *testing.T) {
+	e, _, ch, _, _ := newTestEngine(t)
+	ch.startErr = errors.New("missing executable")
+	e.refresh(context.Background())
+	if e.Status().Outcome != "available" {
+		t.Fatal(e.Status())
+	}
+	e.refresh(context.Background())
+	e.refresh(context.Background())
+	if ch.count() != 2 || e.Status().Outcome != "failed" {
+		t.Fatal(ch.count(), e.Status())
+	}
+}
+func TestUnknownPrepareAndReconciliation(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	e.refresh(context.Background())
+	ch.done <- errors.New("response lost")
+	waitOutcome(t, e, "unknown")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if e.Prepare(ctx) == nil || e.Status().Preparing {
+		t.Fatal("unknown allowed suspend")
+	}
+	c.advance(11*time.Second, 11*time.Second)
+	ch.mu.Lock()
+	ch.t.Residual = .01
+	ch.mu.Unlock()
+	e.refresh(context.Background())
+	if e.Status().Outcome != "reconciled" {
+		t.Fatal(e.Status())
+	}
+}
+func TestPrepareWaitAndResume(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	e.refresh(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		result <- e.Prepare(ctx)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if !e.Status().Preparing {
+		t.Fatal("prepare did not fence")
+	}
+	e.refresh(context.Background())
+	if ch.count() != 1 {
+		t.Fatal("step during prepare")
+	}
+	ch.done <- nil
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	c.advance(time.Second, 11*time.Second)
+	if e.Resume("boot", 1) != nil {
+		t.Fatal("resume failed")
+	}
+	q := e.Status()
+	if q.Generation != 2 || q.Episode != "resume" || q.Outcome != "available" {
+		t.Fatal(q)
+	}
+	if e.Resume("boot", 1) == nil {
+		t.Fatal("duplicate resume")
+	}
+}
+func TestResumeWithoutLoss(t *testing.T) {
+	e, c, _, _, _ := newTestEngine(t)
+	ctx := context.Background()
+	if err := e.Prepare(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(10*time.Second, 10*time.Second)
+	if err := e.Resume("boot", 1); err != nil {
+		t.Fatal(err)
+	}
+	if e.Status().Episode != "initial" {
+		t.Fatal(e.Status())
+	}
+}
+func TestSocketStatusAndBounds(t *testing.T) {
+	e, _, _, _, _ := newTestEngine(t)
+	path := filepath.Join(t.TempDir(), "control.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, path, e) }()
+	var conn net.Conn
+	var err error
+	for i := 0; i < 100; i++ {
+		conn, err = net.Dial("unix", path)
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = conn.Write([]byte("{\"op\":\"status\"}\n"))
+	var response Response
+	if err = json.NewDecoder(conn).Decode(&response); err != nil || !response.OK || response.Quality.BootID != "boot" {
+		t.Fatal(response, err)
+	}
+	conn.Close()
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatal(info, err)
+	}
+	cancel()
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+func TestLateExternalBudgetAndFreshness(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	ch.t.Residual = .01
+	e.refresh(context.Background())
+	if ch.count() != 0 {
+		t.Fatal("small correction stepped")
+	}
+	c.advance(91*time.Second, 91*time.Second)
+	ch.t.Residual = 10
+	e.refresh(context.Background())
+	if ch.count() != 1 || e.Status().Episode != "late-external" {
+		t.Fatal(ch.count(), e.Status())
+	}
+	ch.done <- nil
+	waitOutcome(t, e, "completed")
+	c.advance(100*time.Second, 100*time.Second)
+	e.refresh(context.Background())
+	if ch.count() != 1 {
+		t.Fatal("late budget renewed")
+	}
+}
+func TestPrepareTimeoutFencesUnknown(t *testing.T) {
+	e, _, ch, _, _ := newTestEngine(t)
+	e.refresh(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if e.Prepare(ctx) == nil {
+		t.Fatal("unresolved step allowed suspend")
+	}
+	if e.Status().Preparing {
+		t.Fatal("preparation not aborted")
+	}
+	ch.done <- errors.New("late failure")
+	waitOutcome(t, e, "unknown")
+}
+func TestRestartChangesBoot(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	e.refresh(context.Background())
+	newBoot, err := NewEngine(path, "new-boot", c, ch, ref)
+	if err != nil || newBoot.Status().BootID != "new-boot" || newBoot.Status().Outcome != "available" {
+		t.Fatal(newBoot, err)
+	}
+	ch.done <- nil
+	waitOutcome(t, e, "completed")
+}
+func TestTimeoutAfterDispatchIsUnknown(t *testing.T) {
+	e, _, ch, _, _ := newTestEngine(t)
+	e.refresh(context.Background())
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && e.Status().Outcome != "unknown" {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if e.Status().Outcome != "unknown" || ch.count() != 1 {
+		t.Fatal(e.Status(), ch.count())
+	}
+	e.refresh(context.Background())
+	if ch.count() != 1 {
+		t.Fatal("timeout was retried")
+	}
+}
+func TestHoldoverNeverExternal(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	now, bt, _ := c.Now()
+	if err := e.Submit(Request{BootID: "boot", Generation: 1, Source: SourceUser, UTCUnixNS: now.UnixNano(), ReceiptBootNS: int64(bt)}); err != nil {
+		t.Fatal(err)
+	}
+	ch.t = Tracking{Source: SourceUser, External: true, Age: 0, Residual: 0, Uncertainty: 0, Valid: true}
+	e.refresh(context.Background())
+	if q := e.Status(); q.Source != SourceUser || q.External {
+		t.Fatal(q)
+	}
+	c.advance(31*time.Second, 31*time.Second)
+	if e.Status().Source != "unknown" {
+		t.Fatal("stale quality")
+	}
+}
+func TestSocketRejectsOversizedAndUnknownFields(t *testing.T) {
+	e, _, _, _, _ := newTestEngine(t)
+	path := filepath.Join(t.TempDir(), "control.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, path, e) }()
+	defer func() { cancel(); <-done }()
+	var c net.Conn
+	var err error
+	for i := 0; i < 100; i++ {
+		c, err = net.Dial("unix", path)
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = c.Write([]byte("{\"op\":\"status\",\"bogus\":1}\n"))
+	var r Response
+	if err = json.NewDecoder(c).Decode(&r); err != nil || r.OK {
+		t.Fatal(r, err)
+	}
+	c.Close()
+	c, err = net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = c.Write([]byte(strings.Repeat("x", MaxRequest+1) + "\n"))
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	var buf [1]byte
+	if n, _ := c.Read(buf[:]); n != 0 {
+		t.Fatal("oversized request answered")
+	}
+	c.Close()
+}
+func TestExternalTimeInvalidatesNRF(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	ch.t.Residual = .01
+	e.refresh(context.Background())
+	now, bt, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.UnixNano(), ReceiptBootNS: int64(bt)}
+	if e.Submit(r) == nil {
+		t.Fatal("nrf accepted after external confirmation")
+	}
+	r.Source = SourceUser
+	if err := e.Submit(r); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestLocalTrackingCannotStep(t *testing.T) {
+	e, _, ch, _, _ := newTestEngine(t)
+	ch.t.Source = "local"
+	ch.t.External = false
+	e.refresh(context.Background())
+	if ch.count() != 0 {
+		t.Fatal("local reference stepped")
+	}
+}
