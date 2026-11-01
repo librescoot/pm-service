@@ -10,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestChronycAdapter(t *testing.T) {
@@ -91,8 +94,9 @@ func TestSOCKDatagram(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 40 && n != 32 {
-		t.Fatal(n)
+	wantSize := 24 + 2*int(unsafe.Sizeof(unix.Timeval{}.Sec))
+	if n != wantSize {
+		t.Fatalf("native timeval packet size %d, want %d", n, wantSize)
 	}
 	off := n - 24
 	if math.Float64frombits(binary.NativeEndian.Uint64(buf[off:])) != 3.5 || binary.NativeEndian.Uint32(buf[off+20:]) != 0x534f434b {
