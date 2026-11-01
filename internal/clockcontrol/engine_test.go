@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net"
 	"os"
@@ -779,5 +780,163 @@ func TestControlSocketTransportAndSuspendUnknown(t *testing.T) {
 	restarted.refresh(context.Background())
 	if chrony.count() != 1 || restarted.Status().Outcome != "unknown" {
 		t.Fatal("unknown step replayed", restarted.Status())
+	}
+}
+
+func TestPrepareBaselineAfterInFlightClockStep(t *testing.T) {
+	for _, step := range []time.Duration{-6 * time.Hour, 6 * time.Hour} {
+		for _, lost := range []bool{false, true} {
+			t.Run(fmt.Sprintf("step=%s/lost=%t", step, lost), func(t *testing.T) {
+				e, c, ch, _, _ := newTestEngine(t)
+				e.refresh(context.Background())
+				prepared := make(chan error, 1)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					defer cancel()
+					prepared <- e.Prepare(ctx)
+				}()
+				deadline := time.Now().Add(time.Second)
+				for !e.Status().Preparing {
+					if time.Now().After(deadline) {
+						t.Fatal("no preparation fence")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				c.advance(step, 0)
+				ch.done <- nil
+				if err := <-prepared; err != nil {
+					t.Fatal(err)
+				}
+				if lost {
+					c.advance(time.Second, 11*time.Second)
+				} else {
+					c.advance(time.Second, time.Second)
+				}
+				if err := e.Resume("boot", 1); err != nil {
+					t.Fatal(err)
+				}
+				if got := e.Status().Episode; (got == "resume") != lost {
+					t.Fatalf("episode=%s", got)
+				}
+			})
+		}
+	}
+}
+
+func TestRestartDuringPrepareWaitDoesNotCreateResumeEpisode(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	e.state.Preparing = true
+	e.state.PrepareBaselineValid = false
+	e.state.Outcome = "in-flight"
+	e.state.DispatchBoot = int64(10 * time.Second)
+	if err := e.save(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewEngine(path, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.advance(-6*time.Hour, 10*time.Second)
+	if err := restarted.Resume("boot", 1); err != nil {
+		t.Fatal(err)
+	}
+	q := restarted.Status()
+	if q.Preparing || q.Episode != "initial" || q.Outcome != "unknown" {
+		t.Fatal(q)
+	}
+}
+
+func TestNRFSampleSurvivesCoordinatorRestartBeforeDispatch(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	now, boot, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(6 * time.Hour).UnixNano(), ReceiptBootNS: int64(boot), UncertaintyNS: int64(time.Second)}
+	if err := e.Submit(r); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewEngine(path, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch.t = Tracking{Source: SourceNRF, Age: 0, Residual: (6 * time.Hour).Seconds(), Uncertainty: 6, SkewPPM: 1e6, Valid: true}
+	restarted.refresh(context.Background())
+	if ch.count() != 1 || restarted.Status().Outcome != "in-flight" {
+		t.Fatal(restarted.Status(), ch.count())
+	}
+	ch.done <- nil
+	waitOutcome(t, restarted, "completed")
+}
+
+func TestUnknownNRFStepReconcilesAfterRestart(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	now, boot, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(6 * time.Hour).UnixNano(), ReceiptBootNS: int64(boot), UncertaintyNS: int64(time.Second)}
+	if err := e.Submit(r); err != nil {
+		t.Fatal(err)
+	}
+	ch.t = Tracking{Source: SourceNRF, Age: 0, Residual: (6 * time.Hour).Seconds(), Uncertainty: 6, SkewPPM: 1e6, Valid: true}
+	e.refresh(context.Background())
+	c.advance(6*time.Hour, 0)
+	ch.done <- errors.New("lost reply")
+	waitOutcome(t, e, "unknown")
+	restarted, err := NewEngine(path, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.advance(11*time.Second, 11*time.Second)
+	ch.t.Residual = .01
+	restarted.refresh(context.Background())
+	if q := restarted.Status(); q.Outcome != "reconciled" || ch.count() != 1 {
+		t.Fatal(q, ch.count())
+	}
+	if err := restarted.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnknownNRFStepDoesNotReconcileWithoutObservedMovement(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	now, boot, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(6 * time.Hour).UnixNano(), ReceiptBootNS: int64(boot), UncertaintyNS: int64(time.Second)}
+	if err := e.Submit(r); err != nil {
+		t.Fatal(err)
+	}
+	ch.t = Tracking{Source: SourceNRF, Residual: (6 * time.Hour).Seconds(), Uncertainty: 6, SkewPPM: 1e6, Valid: true}
+	e.refresh(context.Background())
+	ch.done <- errors.New("lost reply")
+	waitOutcome(t, e, "unknown")
+	c.advance(11*time.Second, 11*time.Second)
+	ch.t.Residual = .01
+	e.refresh(context.Background())
+	if q := e.Status(); q.Outcome != "unknown" || ch.count() != 1 {
+		t.Fatal(q, ch.count())
+	}
+	if err := e.Prepare(context.Background()); err == nil {
+		t.Fatal("unresolved outcome permitted suspend")
+	}
+}
+
+func TestPersistedNRFSampleExpiresAndDoesNotCrossBoot(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	now, boot, _ := c.Now()
+	if err := e.Submit(Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(time.Hour).UnixNano(), ReceiptBootNS: int64(boot), UncertaintyNS: int64(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewEngine(path, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.advance(31*time.Second, 31*time.Second)
+	ch.t = Tracking{Source: SourceNRF, Residual: 3600, Valid: true}
+	restarted.refresh(context.Background())
+	if ch.count() != 0 {
+		t.Fatal("expired sample dispatched")
+	}
+	rebooted, err := NewEngine(path, "new-boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebooted.refresh(context.Background())
+	if ch.count() != 0 {
+		t.Fatal("cross-boot sample dispatched")
 	}
 }

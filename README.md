@@ -135,8 +135,9 @@ Chronyd remains running during source probes.
 The daemon requires root and exclusively locks `/run/clock-coordinator/owner.lock`.
 Its state and socket are in that root-owned, non-group/world-writable directory.
 The lock file must not be removed while the daemon is running. A restart in the
-same boot reloads the episode and spent budget; an in-flight command becomes
-`unknown`. `--run-dir` changes the runtime directory and `--refclock-dir` changes
+same boot reloads the episode, spent budget and accepted sample metadata; an
+in-flight command becomes `unknown`. Sample evidence remains boot- and
+generation-bound and expires after 30 seconds. `--run-dir` changes the runtime directory and `--refclock-dir` changes
 the directory for the chrony sockets. Run `clock-coordinator --wait=10s` as a
 bounded local startup wait. It exits successfully when quality becomes available
 or when the deadline expires; absence of a clock source never blocks startup.
@@ -191,8 +192,10 @@ fields are rejected. The response contains `ok`, optional `error`, and `quality`
   nRF samples are holdover, never external confirmation.
 - `{"op":"prepare"}` fences new dispatches and waits up to 3.5 seconds for an
   in-flight command. An unresolved outcome aborts preparation and returns an
-  error; PM must not suspend on that error. `{"op":"abort"}` cancels a
-  successful preparation. `{"op":"resume","boot_id":"...","generation":1}`
+  error; PM must not suspend on that error. The wall/BOOTTIME baseline is
+  recorded only after an in-flight attempt resolves. An interrupted preparation
+  without a baseline cannot create a resume recovery episode.
+  `{"op":"abort"}` cancels a successful preparation. `{"op":"resume","boot_id":"...","generation":1}`
   completes it using the token obtained before preparation and increments the
   generation even if no clock loss was found. Producers must fetch the new token.
 
@@ -202,7 +205,10 @@ one immediate, parameterless `chronyc makestep`. A second known pre-dispatch
 start failure exhausts the attempt. A timeout or other error after process start
 is `unknown`; it is never blindly retried. A fresh tracking observation after
 at least ten seconds, residual below 0.1 seconds and uncertainty below five
-seconds reconciles it. A single late external episode per boot is possible after
+seconds reconciles it. A single-shot nRF or user observation can also reconcile
+within its sample lifetime when the observed wall-clock movement matches the
+persisted dispatched correction and chrony reports the same source converged.
+Neither case retries the consumed command. A single late external episode per boot is possible after
 an earlier deadline for a fresh large external residual. A separate one-time
 late network-holdover episode permits offline DBC recovery before external time
 is established; holdover is never external confirmation. A resume episode is

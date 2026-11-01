@@ -17,24 +17,34 @@ const sampleMaxAge = 30 * time.Second
 const commandTimeout = 3 * time.Second
 
 type state struct {
-	BootID              string `json:"boot_id"`
-	Generation          uint64 `json:"generation"`
-	Episode             string `json:"episode"`
-	Deadline            int64  `json:"deadline_boot_ns"`
-	Outcome             string `json:"outcome"`
-	Attempts            int    `json:"attempts"`
-	LateUsed            bool   `json:"late_used"`
-	LateHoldoverUsed    bool   `json:"late_holdover_used"`
-	ExternalEstablished bool   `json:"external_established"`
-	ExternalAfterBoot   int64  `json:"external_after_boot_ns"`
-	Preparing           bool   `json:"preparing"`
-	PrepareUTC          int64  `json:"prepare_utc_ns"`
-	PrepareBoot         int64  `json:"prepare_boot_ns"`
-	DispatchBoot        int64  `json:"dispatch_boot_ns"`
+	BootID               string                     `json:"boot_id"`
+	Generation           uint64                     `json:"generation"`
+	Episode              string                     `json:"episode"`
+	Deadline             int64                      `json:"deadline_boot_ns"`
+	Outcome              string                     `json:"outcome"`
+	Attempts             int                        `json:"attempts"`
+	LateUsed             bool                       `json:"late_used"`
+	LateHoldoverUsed     bool                       `json:"late_holdover_used"`
+	ExternalEstablished  bool                       `json:"external_established"`
+	ExternalAfterBoot    int64                      `json:"external_after_boot_ns"`
+	Preparing            bool                       `json:"preparing"`
+	PrepareBaselineValid bool                       `json:"prepare_baseline_valid"`
+	PrepareUTC           int64                      `json:"prepare_utc_ns"`
+	PrepareBoot          int64                      `json:"prepare_boot_ns"`
+	DispatchBoot         int64                      `json:"dispatch_boot_ns"`
+	DispatchUTC          int64                      `json:"dispatch_utc_ns"`
+	DispatchResidual     float64                    `json:"dispatch_residual_seconds"`
+	DispatchSource       string                     `json:"dispatch_source"`
+	Samples              map[string]persistedSample `json:"samples,omitempty"`
 }
 type sample struct {
 	receipt, age int64
 	uncertainty  int64
+}
+type persistedSample struct {
+	Receipt     int64 `json:"receipt_boot_ns"`
+	Age         int64 `json:"age_ns"`
+	Uncertainty int64 `json:"uncertainty_ns"`
 }
 type Engine struct {
 	mu          sync.Mutex
@@ -108,6 +118,14 @@ func NewEngine(path, boot string, clock Clock, chrony Chrony, ref Refclock) (*En
 			return nil, errors.New("invalid persisted state")
 		} else if e.state.Outcome == "in-flight" {
 			e.state.Outcome = "unknown"
+		}
+	}
+	if e.state.Samples == nil {
+		e.state.Samples = make(map[string]persistedSample)
+	}
+	for source, s := range e.state.Samples {
+		if (source == SourceNRF || source == SourceGPS || source == SourceUser) && s.Receipt >= 0 && s.Age >= 0 && s.Age <= int64(sampleMaxAge) && s.Uncertainty >= 0 && s.Uncertainty <= int64(3*time.Second) {
+			e.samples[source] = sample{s.Receipt, s.Age, s.Uncertainty}
 		}
 	}
 	if err = persist(path, e.state); err != nil {
@@ -231,10 +249,23 @@ func (e *Engine) Submit(r Request) error {
 	if math.Abs(offset) > float64(100*365*24*time.Hour/time.Second) {
 		return errors.New("implausible sample offset")
 	}
+	// Invalidate old evidence before delivery so a crash cannot associate a
+	// newly delivered sample with older persisted metadata.
+	delete(e.samples, r.Source)
+	delete(e.state.Samples, r.Source)
+	if err = e.save(); err != nil {
+		return err
+	}
 	if err = e.ref.Send(r.Source, now, offset); err != nil {
 		return err
 	}
 	e.samples[r.Source] = sample{r.ReceiptBootNS, r.SampleAgeNS, r.UncertaintyNS}
+	e.state.Samples[r.Source] = persistedSample{r.ReceiptBootNS, r.SampleAgeNS, r.UncertaintyNS}
+	if err = e.save(); err != nil {
+		delete(e.samples, r.Source)
+		delete(e.state.Samples, r.Source)
+		return err
+	}
 	return nil
 }
 
@@ -318,7 +349,14 @@ func (e *Engine) refresh(ctx context.Context) {
 		}
 	}
 	e.quality = Quality{Source: t.Source, External: t.External, AgeNS: int64(t.Age), ResidualSeconds: t.Residual, UncertaintySeconds: t.Uncertainty}
-	if e.state.Outcome == "unknown" && t.Source != "local" && int64(bt)-e.state.DispatchBoot >= int64(10*time.Second) && t.Age < 5*time.Second && math.Abs(t.Residual) < 0.1 && t.Uncertainty < 5 {
+	holdoverReconciled := false
+	if (t.Source == SourceNRF || t.Source == SourceUser) && t.Source == e.state.DispatchSource && e.state.DispatchUTC != 0 && int64(bt) >= e.state.DispatchBoot && t.Age <= sampleMaxAge {
+		wallElapsed := now.Sub(time.Unix(0, e.state.DispatchUTC)).Seconds()
+		bootElapsed := time.Duration(int64(bt) - e.state.DispatchBoot).Seconds()
+		holdoverReconciled = math.Abs(wallElapsed-bootElapsed-e.state.DispatchResidual) < 1
+	}
+	freshReconciled := t.Source != "local" && t.Age < 5*time.Second && t.Uncertainty < 5
+	if e.state.Outcome == "unknown" && int64(bt)-e.state.DispatchBoot >= int64(10*time.Second) && math.Abs(t.Residual) < 0.1 && (freshReconciled || holdoverReconciled) {
 		e.state.Outcome = "reconciled"
 		if e.save() != nil {
 			e.state.Outcome = "unknown"
@@ -361,6 +399,9 @@ func (e *Engine) refresh(ctx context.Context) {
 	e.quality = Quality{Source: "unknown"}
 	e.state.Attempts++
 	e.state.DispatchBoot = int64(bt)
+	e.state.DispatchUTC = now.UnixNano()
+	e.state.DispatchResidual = t.Residual
+	e.state.DispatchSource = t.Source
 	if e.save() != nil {
 		e.state = old
 		return
@@ -427,15 +468,9 @@ func (e *Engine) Prepare(ctx context.Context) error {
 		e.mu.Unlock()
 		return errors.New("already preparing")
 	}
-	now, bt, err := e.clock.Now()
-	if err != nil {
-		e.mu.Unlock()
-		return err
-	}
 	e.state.Preparing = true
-	e.state.PrepareUTC = now.UnixNano()
-	e.state.PrepareBoot = int64(bt)
-	if err = e.save(); err != nil {
+	e.state.PrepareBaselineValid = false
+	if err := e.save(); err != nil {
 		e.state.Preparing = false
 		e.mu.Unlock()
 		return err
@@ -448,22 +483,38 @@ func (e *Engine) Prepare(ctx context.Context) error {
 		case <-ctx.Done():
 			e.mu.Lock()
 			e.state.Preparing = false
-			err = e.save()
+			saveErr := e.save()
 			e.mu.Unlock()
-			if err != nil {
-				return err
+			if saveErr != nil {
+				return saveErr
 			}
 			return ctx.Err()
 		}
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if !e.state.Preparing {
+		return errors.New("suspend preparation cancelled")
+	}
 	if e.state.Outcome == "unknown" || e.state.Outcome == "in-flight" {
 		e.state.Preparing = false
-		if err = e.save(); err != nil {
+		if err := e.save(); err != nil {
 			return err
 		}
 		return errors.New("step outcome unresolved")
+	}
+	now, bt, err := e.clock.Now()
+	if err != nil {
+		e.state.Preparing = false
+		_ = e.save()
+		return err
+	}
+	e.state.PrepareUTC = now.UnixNano()
+	e.state.PrepareBoot = int64(bt)
+	e.state.PrepareBaselineValid = true
+	if err := e.save(); err != nil {
+		e.state.PrepareBaselineValid = false
+		return err
 	}
 	return nil
 }
@@ -486,17 +537,30 @@ func (e *Engine) Resume(boot string, generation uint64) error {
 	if !e.state.Preparing || boot != e.state.BootID || generation != e.state.Generation {
 		return errors.New("invalid resume generation")
 	}
+	if !e.state.PrepareBaselineValid {
+		e.state.Preparing = false
+		if err := e.save(); err != nil {
+			e.state.Preparing = true
+			return err
+		}
+		return nil
+	}
 	now, bt, err := e.clock.Now()
 	if err != nil {
 		return err
 	}
-	if int64(bt) < e.state.PrepareBoot {
+	if e.state.PrepareBaselineValid && int64(bt) < e.state.PrepareBoot {
 		return errors.New("boottime went backwards")
 	}
-	loss := int64(bt) - e.state.PrepareBoot - (now.UnixNano() - e.state.PrepareUTC)
+	loss := int64(0)
+	if e.state.PrepareBaselineValid {
+		loss = int64(bt) - e.state.PrepareBoot - (now.UnixNano() - e.state.PrepareUTC)
+	}
 	old := e.state
 	e.state.Preparing = false
+	e.state.PrepareBaselineValid = false
 	e.state.Generation++
+	e.state.Samples = make(map[string]persistedSample)
 	if loss > int64(2*time.Second) {
 		e.state.ExternalEstablished = false
 		e.state.ExternalAfterBoot = int64(bt)
