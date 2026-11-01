@@ -195,8 +195,8 @@ at least one second, and uncertainty at most five seconds are required for the
 one immediate, parameterless `chronyc makestep`. A second known pre-dispatch
 start failure exhausts the attempt. A timeout or other error after process start
 is `unknown`; it is never blindly retried. A fresh tracking observation after
-at least ten seconds, residual below 0.1 seconds and uncertainty below one
-second reconciles it. A single late external episode per boot is possible after
+at least ten seconds, residual below 0.1 seconds and uncertainty below five
+seconds reconciles it. A single late external episode per boot is possible after
 an earlier deadline for a fresh large external residual. A resume episode is
 opened only when CLOCK_BOOTTIME advanced over two seconds more than UTC during
 preparation/suspend. A command admitted before a deadline may complete later;

@@ -230,10 +230,11 @@ func (e *Engine) refresh(ctx context.Context) {
 		t.Uncertainty += float64(s.uncertainty) / float64(time.Second)
 	}
 	e.quality = Quality{Source: t.Source, External: t.External, AgeNS: int64(t.Age), ResidualSeconds: t.Residual, UncertaintySeconds: t.Uncertainty}
-	if e.state.Outcome == "unknown" && t.Source != "local" && int64(bt)-e.state.DispatchBoot >= int64(10*time.Second) && t.Age < 5*time.Second && math.Abs(t.Residual) < 0.1 && t.Uncertainty < 1 {
+	if e.state.Outcome == "unknown" && t.Source != "local" && int64(bt)-e.state.DispatchBoot >= int64(10*time.Second) && t.Age < 5*time.Second && math.Abs(t.Residual) < 0.1 && t.Uncertainty < 5 {
 		e.state.Outcome = "reconciled"
 		if e.save() != nil {
 			e.state.Outcome = "unknown"
+			e.quality = Quality{Source: "unknown"}
 			return
 		}
 	}
@@ -260,6 +261,7 @@ func (e *Engine) refresh(ctx context.Context) {
 		return
 	}
 	old := e.state
+	admissionBoot := bt
 	e.state.Outcome = "in-flight"
 	e.quality = Quality{Source: "unknown"}
 	e.state.Attempts++
@@ -269,7 +271,7 @@ func (e *Engine) refresh(ctx context.Context) {
 		return
 	}
 	_, bt, err = e.clock.Now()
-	if err != nil || int64(bt) >= e.state.Deadline {
+	if err != nil || bt < admissionBoot || int64(bt) >= e.state.Deadline || t.Age+(bt-admissionBoot) > sampleMaxAge {
 		e.state.Outcome = "expired"
 		_ = e.save()
 		return
