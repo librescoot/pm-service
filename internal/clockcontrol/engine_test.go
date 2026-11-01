@@ -611,9 +611,9 @@ func TestResumeExternalRequiresPostResumeObservation(t *testing.T) {
 	if err := e.Resume("boot", 1); err != nil {
 		t.Fatal(err)
 	}
-	c.advance(3*time.Second, 3*time.Second)
+	c.advance(7*time.Second, 7*time.Second)
 	ch.mu.Lock()
-	ch.t.Age = 4 * time.Second
+	ch.t.Age = 8 * time.Second
 	ch.mu.Unlock()
 	e.refresh(context.Background())
 	if !e.Status().NRFEligible {

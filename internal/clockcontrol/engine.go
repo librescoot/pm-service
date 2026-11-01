@@ -250,7 +250,7 @@ func (e *Engine) externalObservationFresh(t Tracking, bt time.Duration) bool {
 		sample, ok := e.samples[SourceGPS]
 		return ok && sample.receipt > e.state.ExternalAfterBoot
 	}
-	return t.Source == "ntp" && t.Age >= 0 && int64(t.Age) < int64(bt)-e.state.ExternalAfterBoot
+	return t.Source == "ntp" && t.Age >= 0 && t.Age < time.Duration(int64(bt)-e.state.ExternalAfterBoot)-5*time.Second
 }
 func (e *Engine) refresh(ctx context.Context) {
 	e.mu.Lock()
