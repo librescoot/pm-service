@@ -62,23 +62,42 @@ func TestChronydSOCKSelection(t *testing.T) {
 				}
 			}
 			wrapper := filepath.Join(dir, "chronyc")
-			script := fmt.Sprintf("#!/bin/sh\nexec %q -h %q \"$@\"\n", client, cmdsocket)
+			// Observe dispatch without asking chronyd to change any clock.
+			marker := filepath.Join(dir, "steps")
+			script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = makestep ]; then echo step >> %q; echo '200 OK'; exit; fi\nexec %q -h %q \"$@\"\n", marker, client, cmdsocket)
 			if err := os.WriteFile(wrapper, []byte(script), 0700); err != nil {
 				t.Fatal(err)
 			}
 			adapter := Chronyc{Path: wrapper}
 			ref := SockRefclock{Dir: dir}
-			var q Tracking
+			clock := SystemClock{}
+			engine, err := NewEngine(filepath.Join(dir, "state"), "test-boot", clock, adapter, ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			submitted := false
 			for deadline := time.Now().Add(12 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
-				if err := ref.Send(tc.source, time.Now(), tc.offset); err != nil {
-					t.Fatal(err)
+				if !submitted || tc.source == SourceGPS {
+					now, boot, err := clock.Now()
+					if err != nil {
+						t.Fatal(err)
+					}
+					r := Request{BootID: "test-boot", Generation: 1, Source: tc.source, UTCUnixNS: now.Add(time.Duration(tc.offset * float64(time.Second))).UnixNano(), ReceiptBootNS: int64(boot), UncertaintyNS: int64(time.Second)}
+					if err := engine.Submit(r); err != nil {
+						t.Fatal(err)
+					}
+					submitted = true
 				}
-				q, err = adapter.Tracking(ctx, time.Now())
-				if err == nil && q.Source == tc.source && q.Valid && ((tc.source == SourceGPS && q.Uncertainty < 5) || (tc.source == SourceNRF && 1+q.Age.Seconds()*q.SkewPPM/1e6 < 5)) {
+				engine.refresh(ctx)
+				if engine.Status().Outcome == "completed" {
+					steps, err := os.ReadFile(marker)
+					if err != nil || string(steps) != "step\n" {
+						t.Fatal("unexpected step dispatch", string(steps), err)
+					}
 					return
 				}
 			}
-			t.Fatalf("source not selected/converged: %+v, %v; %s", q, err, logs.String())
+			t.Fatalf("source did not trigger recovery: %+v; %s", engine.Status(), logs.String())
 		})
 	}
 }
