@@ -402,7 +402,7 @@ func (e *Engine) refresh(ctx context.Context) {
 			return
 		}
 	}
-	if (t.Source != "ntp" && t.Source != SourceNRF && t.Source != SourceGPS && t.Source != SourceUser && t.Source != SourceNetworkHoldover) || (t.Source == SourceNetworkHoldover && e.state.ExternalEstablished) || e.state.Outcome != "available" || int64(bt) >= e.state.Deadline || t.Age > sampleMaxAge || t.Uncertainty > 5 || math.Abs(t.Residual) < 1 {
+	if (t.Source != "ntp" && t.Source != SourceNRF && t.Source != SourceGPS && t.Source != SourceUser && t.Source != SourceNetworkHoldover) || ((t.Source == SourceNetworkHoldover || t.Source == SourceNRF) && e.state.ExternalEstablished) || e.state.Outcome != "available" || int64(bt) >= e.state.Deadline || t.Age > sampleMaxAge || t.Uncertainty > 5 || math.Abs(t.Residual) < 1 {
 		return
 	}
 	old := e.state

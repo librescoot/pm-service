@@ -217,7 +217,7 @@ func (s SockRefclock) Send(source string, at time.Time, offset float64) error {
 	if *(*byte)(unsafe.Pointer(&probe)) == 0 {
 		order = binary.BigEndian
 	}
-	b, err := EncodeSOCK(at, offset, int(unsafe.Sizeof(unix.Timeval{}.Sec)), order)
+	b, err := EncodeSOCK(at, offset, 8, order)
 	if err != nil {
 		return err
 	}

@@ -977,3 +977,107 @@ func TestUnknownHoldoverDoesNotReconcileAgainstReplacementSample(t *testing.T) {
 		t.Fatal("replacement evidence reconciled old dispatch", e.Status())
 	}
 }
+
+func TestRetainedNRFDoesNotDispatchAfterExternalEstablishment(t *testing.T) {
+	for _, source := range []string{"ntp", SourceGPS} {
+		for _, restart := range []bool{false, true} {
+			for _, residual := range []float64{-20, 20} {
+				t.Run(fmt.Sprintf("%s/restart=%t/residual=%g", source, restart, residual), func(t *testing.T) {
+					e, c, ch, ref, path := newTestEngine(t)
+					now, bt, _ := c.Now()
+					ch.t.Valid = false
+					if err := e.Submit(Request{BootID: "boot", Generation: 1, Source: SourceNRF, UTCUnixNS: now.Add(20 * time.Second).UnixNano(), ReceiptBootNS: int64(bt)}); err != nil {
+						t.Fatal(err)
+					}
+					if source == SourceGPS {
+						if err := e.Submit(Request{BootID: "boot", Generation: 1, Source: SourceGPS, UTCUnixNS: now.UnixNano(), ReceiptBootNS: int64(bt)}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					ch.t = Tracking{Source: source, External: true, Residual: .1, Uncertainty: .1, Valid: true}
+					e.refresh(context.Background())
+					if !e.state.ExternalEstablished {
+						t.Fatal("external time not established")
+					}
+					if restart {
+						var err error
+						e, err = NewEngine(path, "boot", c, ch, ref)
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+					if _, ok := e.samples[SourceNRF]; !ok {
+						t.Fatal("retained NRF evidence missing")
+					}
+					ch.t = Tracking{Source: SourceNRF, Residual: residual, Uncertainty: .1, Valid: true}
+					e.refresh(context.Background())
+					if ch.count() != 0 || e.Status().Outcome != "available" {
+						t.Fatal("retained NRF authorized dispatch", ch.count(), e.Status())
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGPSSubmitFutureClockSOCKTime64(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	c.utc = time.Date(2040, 1, 1, 0, 0, 0, 123456000, time.UTC)
+	ch.t.Valid = false
+	dir := t.TempDir()
+	conn, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: filepath.Join(dir, "gps.sock"), Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	e.ref = SockRefclock{Dir: dir}
+	now, bt, _ := c.Now()
+	gps := time.Date(2026, 1, 1, 0, 0, 0, 123456000, time.UTC)
+	if err := e.Submit(Request{BootID: "boot", Generation: 1, Source: SourceGPS, UTCUnixNS: gps.UnixNano(), ReceiptBootNS: int64(bt)}); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 64)
+	n, _, err := conn.ReadFromUnix(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 40 || int64(binary.NativeEndian.Uint64(buf[:8])) != now.Unix() || binary.NativeEndian.Uint64(buf[8:16]) != 123456 || math.Float64frombits(binary.NativeEndian.Uint64(buf[16:24])) != gps.Sub(now).Seconds() || binary.NativeEndian.Uint32(buf[36:40]) != 0x534f434b {
+		t.Fatalf("invalid time64 packet: %x", buf[:n])
+	}
+}
+
+func TestNRFDispatchAfterLostTimeAndExternalChangeDuringDispatch(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	ch.t.Residual = .01
+	e.refresh(context.Background())
+	if !e.state.ExternalEstablished {
+		t.Fatal("external time not established")
+	}
+	if err := e.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(0, time.Hour)
+	if err := e.Resume("boot", 1); err != nil {
+		t.Fatal(err)
+	}
+	ch.t.Valid = false
+	now, bt, _ := c.Now()
+	if err := e.Submit(Request{BootID: "boot", Generation: 2, Source: SourceNRF, UTCUnixNS: now.Add(time.Hour).UnixNano(), ReceiptBootNS: int64(bt)}); err != nil {
+		t.Fatal(err)
+	}
+	ch.t = Tracking{Source: SourceNRF, Residual: 3600, Uncertainty: 1, Valid: true}
+	e.refresh(context.Background())
+	if ch.count() != 1 || e.Status().Outcome != "in-flight" {
+		t.Fatal("resume dispatch missing", e.Status())
+	}
+	// The source can change after admission; chrony applies its current correction.
+	c.advance(7*time.Second, 7*time.Second)
+	ch.t = Tracking{Source: "ntp", External: true, Age: time.Second, Residual: .01, Uncertainty: .1, Valid: true}
+	e.refresh(context.Background())
+	if !e.state.ExternalEstablished || ch.count() != 1 {
+		t.Fatal("external observation during dispatch", e.Status())
+	}
+	ch.done <- nil
+	waitOutcome(t, e, "completed")
+}

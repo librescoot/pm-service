@@ -47,8 +47,7 @@ type Response struct {
 	Quality Quality `json:"quality"`
 }
 
-// EncodeSOCK encodes chrony's native struct sock_sample. wordBytes is the
-// native Linux timeval word width, not the Go int width of the producer.
+// EncodeSOCK encodes a chrony SOCK sample with a 32- or 64-bit timeval.
 func EncodeSOCK(t time.Time, offset float64, wordBytes int, order binary.ByteOrder) ([]byte, error) {
 	if math.IsNaN(offset) || math.IsInf(offset, 0) {
 		return nil, errors.New("invalid offset")

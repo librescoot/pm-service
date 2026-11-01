@@ -153,8 +153,8 @@ refclock SOCK /run/chrony/user.sock refid USR1 precision 1 poll 0 filter 1 minsa
 
 SOCK has no per-sample uncertainty field. The configured precision must cover the producer uncertainty. GPS allows up to
 three seconds, so its example uses four seconds. Other producers allow one second. The packet uses
-the native Linux timeval layout; this assumes chronyd uses the native ABI of
-its process (32-bit timeval on ARMv7 and 64-bit timeval on 64-bit Linux).
+a 64-bit timeval layout. Chrony 4.8 accepts this layout on ARM with either
+time32 or time64 and on 64-bit Linux.
 
 The socket protocol is one UTF-8 JSON object followed by a newline per Unix
 stream connection at `/run/clock-coordinator/control.sock`; the response is one
