@@ -17,7 +17,7 @@ func TestChronycAdapter(t *testing.T) {
 	path := filepath.Join(dir, "chronyc")
 	script := `#!/bin/sh
 case "$*" in
- "-n -c tracking") echo '8E84C8F1,192.0.2.1,3,1699999999,2,0,0,0,0,0,0.2,0.1,10,Normal';;
+ "-n -c tracking") echo '8E84C8F1,192.0.2.1,3,1700000001,2,0,0,0,0,0,0.2,0.1,10,Normal';;
  "-n ntpdata 192.0.2.1") echo 'Reference ID    : 47505300 (GPS)';;
  "-n -c sources") echo '^,*,192.0.2.1,3,6,377,1,0,0,0';;
  makestep) echo '200 OK';;

@@ -687,3 +687,20 @@ func TestNetworkHoldoverLateThenExternalRecovery(t *testing.T) {
 	ch.done <- nil
 	waitOutcome(t, restarted, "completed")
 }
+
+func TestSingleHoldoverSampleUsesSkewBoundForStep(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	now, bt, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceUser, UTCUnixNS: now.Add(20 * time.Second).UnixNano(), ReceiptBootNS: int64(bt), UncertaintyNS: int64(time.Second)}
+	if err := e.Submit(r); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(time.Second, time.Second)
+	ch.t = Tracking{Source: SourceUser, Age: time.Second, Residual: 20, Uncertainty: 6, SkewPPM: 1e6, Valid: true}
+	e.refresh(context.Background())
+	if ch.count() != 1 {
+		t.Fatalf("single-sample recovery not dispatched: %+v", e.Status())
+	}
+	ch.done <- nil
+	waitOutcome(t, e, "completed")
+}

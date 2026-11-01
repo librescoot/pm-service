@@ -294,7 +294,16 @@ func (e *Engine) refresh(ctx context.Context) {
 		if time.Duration(age) > t.Age {
 			t.Age = time.Duration(age)
 		}
-		t.Uncertainty = math.Max(t.Uncertainty, float64(s.uncertainty)/float64(time.Second))
+		// A single holdover sample has no frequency estimate. Bound its error
+		// from the source precision and chrony's reported frequency skew instead
+		// of using the system tracking dispersion, which includes unrelated
+		// initial frequency uncertainty.
+		if t.Source == SourceNRF || t.Source == SourceUser {
+			t.Uncertainty = math.Max(1, float64(s.uncertainty)/float64(time.Second)) + t.Age.Seconds()*t.SkewPPM/1e6
+		} else {
+			// Chrony's GPS precision already includes the producer uncertainty.
+			t.Uncertainty = math.Max(t.Uncertainty, float64(s.uncertainty)/float64(time.Second))
+		}
 	}
 	if t.External && !e.externalObservationFresh(t, bt) {
 		e.quality = Quality{Source: "unknown"}

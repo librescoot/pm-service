@@ -37,6 +37,7 @@ type Tracking struct {
 	Age         time.Duration
 	Residual    float64
 	Uncertainty float64
+	SkewPPM     float64
 	Valid       bool
 }
 type Chrony interface {
@@ -118,6 +119,10 @@ func (c Chronyc) Tracking(ctx context.Context, now time.Time) (Tracking, error) 
 	if e != nil {
 		return q, e
 	}
+	skew, e := parse(f[9])
+	if e != nil || skew < 0 {
+		return q, errors.New("invalid skew")
+	}
 	delay, e := parse(f[10])
 	if e != nil || delay < 0 {
 		return q, errors.New("invalid delay")
@@ -126,14 +131,15 @@ func (c Chronyc) Tracking(ctx context.Context, now time.Time) (Tracking, error) 
 	if e != nil || dispersion < 0 {
 		return q, errors.New("invalid dispersion")
 	}
-	age := float64(now.UnixNano())/1e9 - stamp
+	// Tracking's reference timestamp is in chrony's corrected timescale.
+	age := float64(now.UnixNano())/1e9 + residual - stamp
 	if age < -5 || age > 7200 {
 		return q, errors.New("stale tracking")
 	}
 	if age < 0 {
 		age = 0
 	}
-	q = Tracking{Source: "local", Age: time.Duration(age * float64(time.Second)), Residual: residual, Uncertainty: delay/2 + dispersion, Valid: true}
+	q = Tracking{Source: "local", Age: time.Duration(age * float64(time.Second)), Residual: residual, Uncertainty: delay/2 + dispersion, SkewPPM: skew, Valid: true}
 	sources, err := c.command(ctx, "-n", "-c", "sources").Output()
 	if err != nil {
 		return Tracking{}, err

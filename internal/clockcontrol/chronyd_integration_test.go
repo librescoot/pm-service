@@ -22,11 +22,15 @@ func TestChronydSOCKSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct{ source, id, precision, samples string }{
-		{SourceNRF, "NRF1", "1", "minsamples 1 maxsamples 1"},
-		{SourceGPS, "GPS1", "4", "minsamples 4 maxsamples 8"},
+	for _, tc := range []struct {
+		source, id, precision, samples string
+		offset                         float64
+	}{
+		{SourceNRF, "NRF1", "1", "minsamples 1 maxsamples 1", 21600},
+		{SourceGPS, "GPS1", "4", "minsamples 4 maxsamples 8", 21600},
+		{SourceGPS, "GPS1", "4", "minsamples 4 maxsamples 8", -21600},
 	} {
-		t.Run(tc.source, func(t *testing.T) {
+		t.Run(fmt.Sprintf("%s_%g", tc.source, tc.offset), func(t *testing.T) {
 			dir, err := os.MkdirTemp("/tmp", "clock-chrony-")
 			if err != nil {
 				t.Fatal(err)
@@ -66,11 +70,11 @@ func TestChronydSOCKSelection(t *testing.T) {
 			ref := SockRefclock{Dir: dir}
 			var q Tracking
 			for deadline := time.Now().Add(12 * time.Second); time.Now().Before(deadline); time.Sleep(500 * time.Millisecond) {
-				if err := ref.Send(tc.source, time.Now(), .2); err != nil {
+				if err := ref.Send(tc.source, time.Now(), tc.offset); err != nil {
 					t.Fatal(err)
 				}
 				q, err = adapter.Tracking(ctx, time.Now())
-				if err == nil && q.Source == tc.source && q.Valid && (tc.source != SourceGPS || q.Uncertainty < 5) {
+				if err == nil && q.Source == tc.source && q.Valid && ((tc.source == SourceGPS && q.Uncertainty < 5) || (tc.source == SourceNRF && 1+q.Age.Seconds()*q.SkewPPM/1e6 < 5)) {
 					return
 				}
 			}
