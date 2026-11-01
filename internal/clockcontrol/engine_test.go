@@ -940,3 +940,29 @@ func TestPersistedNRFSampleExpiresAndDoesNotCrossBoot(t *testing.T) {
 		t.Fatal("cross-boot sample dispatched")
 	}
 }
+
+func TestUnknownHoldoverDoesNotReconcileAgainstReplacementSample(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	now, boot, _ := c.Now()
+	first := Request{BootID: "boot", Generation: 1, Source: SourceUser, UTCUnixNS: now.Add(time.Hour).UnixNano(), ReceiptBootNS: int64(boot), UncertaintyNS: int64(time.Second)}
+	if err := e.Submit(first); err != nil {
+		t.Fatal(err)
+	}
+	ch.t = Tracking{Source: SourceUser, Residual: 3600, Uncertainty: 1, Valid: true}
+	e.refresh(context.Background())
+	c.advance(time.Hour, 0)
+	ch.done <- errors.New("lost reply")
+	waitOutcome(t, e, "unknown")
+	c.advance(time.Second, time.Second)
+	now, boot, _ = c.Now()
+	replacement := Request{BootID: "boot", Generation: 1, Source: SourceUser, UTCUnixNS: now.Add(time.Second).UnixNano(), ReceiptBootNS: int64(boot), UncertaintyNS: int64(time.Second)}
+	if err := e.Submit(replacement); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(10*time.Second, 10*time.Second)
+	ch.t = Tracking{Valid: false}
+	e.refresh(context.Background())
+	if e.Status().Outcome != "unknown" {
+		t.Fatal("replacement evidence reconciled old dispatch", e.Status())
+	}
+}
