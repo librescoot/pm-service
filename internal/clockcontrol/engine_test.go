@@ -704,3 +704,80 @@ func TestSingleHoldoverSampleUsesSkewBoundForStep(t *testing.T) {
 	ch.done <- nil
 	waitOutcome(t, e, "completed")
 }
+
+func TestControlSocketTransportAndSuspendUnknown(t *testing.T) {
+	e, clock, chrony, _, statePath := newTestEngine(t)
+	dir := t.TempDir()
+	datagram, err := net.ListenUnixgram("unixgram", &net.UnixAddr{Name: filepath.Join(dir, "user.sock"), Net: "unixgram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer datagram.Close()
+	e.ref = SockRefclock{Dir: dir}
+	path := filepath.Join(dir, "control.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, path, e) }()
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("control socket unavailable")
+		}
+	}
+	call := func(req Request) Response {
+		t.Helper()
+		conn, err := net.Dial("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if err = json.NewEncoder(conn).Encode(req); err != nil {
+			t.Fatal(err)
+		}
+		var response Response
+		if err = json.NewDecoder(conn).Decode(&response); err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	status := call(Request{Op: "status"})
+	if !status.OK {
+		t.Fatal(status)
+	}
+	now, bt, _ := clock.Now()
+	result := call(Request{Op: "submit", BootID: status.Quality.BootID, Generation: status.Quality.Generation, Source: SourceUser, UTCUnixNS: now.Add(20 * time.Second).UnixNano(), ReceiptBootNS: int64(bt), UncertaintyNS: int64(time.Second)})
+	if !result.OK {
+		t.Fatal(result)
+	}
+	datagram.SetReadDeadline(time.Now().Add(time.Second))
+	packet := make([]byte, 64)
+	n, _, err := datagram.ReadFromUnix(packet)
+	if err != nil || n < 32 {
+		t.Fatal(n, err)
+	}
+	chrony.t = Tracking{Source: SourceUser, Age: time.Second, Residual: 20, Uncertainty: 1, Valid: true}
+	e.refresh(context.Background())
+	if chrony.count() != 1 {
+		t.Fatal("missing step")
+	}
+	chrony.done <- errors.New("response lost")
+	waitOutcome(t, e, "unknown")
+	if r := call(Request{Op: "prepare"}); r.OK || r.Quality.Preparing {
+		t.Fatal("unknown outcome allowed suspend", r)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewEngine(statePath, "boot", clock, chrony, e.ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.refresh(context.Background())
+	if chrony.count() != 1 || restarted.Status().Outcome != "unknown" {
+		t.Fatal("unknown step replayed", restarted.Status())
+	}
+}
