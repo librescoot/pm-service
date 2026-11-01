@@ -39,13 +39,17 @@ esac
 	if err = <-done; err != nil {
 		t.Fatal(err)
 	}
-	localScript := strings.Replace(script, "47505300 (GPS)", "7F7F0101 (LOCAL)", 1)
-	if err = os.WriteFile(path, []byte(localScript), 0700); err != nil {
-		t.Fatal(err)
-	}
-	q, err = c.Tracking(context.Background(), time.Unix(1700000000, 0))
-	if err != nil || q.Source != "local" || q.External {
-		t.Fatal(q, err)
+	for _, reference := range []string{"7F7F0101 (LOCAL)", "4C4F434C (LOCL)", "4E524631 (NRF1)", "55535231 (USR1)"} {
+		t.Run(reference, func(t *testing.T) {
+			localScript := strings.Replace(script, "47505300 (GPS)", reference, 1)
+			if err := os.WriteFile(path, []byte(localScript), 0700); err != nil {
+				t.Fatal(err)
+			}
+			q, err := c.Tracking(context.Background(), time.Unix(1700000000, 0))
+			if err != nil || q.Source != "local" || q.External {
+				t.Fatal(q, err)
+			}
+		})
 	}
 	if err = os.WriteFile(path, []byte(strings.Replace(script, "200 OK", "501 Failure", 1)), 0700); err != nil {
 		t.Fatal(err)
