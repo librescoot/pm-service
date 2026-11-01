@@ -25,6 +25,7 @@ type state struct {
 	Attempts            int    `json:"attempts"`
 	LateUsed            bool   `json:"late_used"`
 	ExternalEstablished bool   `json:"external_established"`
+	ExternalAfterBoot   int64  `json:"external_after_boot_ns"`
 	Preparing           bool   `json:"preparing"`
 	PrepareUTC          int64  `json:"prepare_utc_ns"`
 	PrepareBoot         int64  `json:"prepare_boot_ns"`
@@ -175,8 +176,9 @@ func (e *Engine) Submit(r Request) error {
 				}
 			}
 		}
-		if external && observed.Age <= sampleMaxAge && math.Abs(observed.Residual)+observed.Uncertainty <= 5 {
+		if external && e.externalObservationFresh(observed, bt) && observed.Age <= sampleMaxAge && math.Abs(observed.Residual)+observed.Uncertainty <= 5 {
 			e.state.ExternalEstablished = true
+			e.state.ExternalAfterBoot = 0
 			if err = e.save(); err != nil {
 				return err
 			}
@@ -203,7 +205,11 @@ func (e *Engine) Submit(r Request) error {
 	if r.DeadlineBootNS != 0 && (r.DeadlineBootNS <= r.ReceiptBootNS || int64(bt) >= r.DeadlineBootNS) {
 		return errors.New("sample deadline expired")
 	}
-	if r.ReceiptBootNS < 0 || r.ReceiptBootNS > int64(bt) || r.SampleAgeNS < 0 || r.UncertaintyNS < 0 || r.UncertaintyNS > int64(time.Second) {
+	maxUncertainty := time.Second
+	if r.Source == SourceGPS {
+		maxUncertainty = 3 * time.Second
+	}
+	if r.ReceiptBootNS < 0 || r.ReceiptBootNS > int64(bt) || r.SampleAgeNS < 0 || r.UncertaintyNS < 0 || r.UncertaintyNS > int64(maxUncertainty) {
 		return errors.New("invalid sample metadata")
 	}
 	age := int64(bt) - r.ReceiptBootNS
@@ -218,6 +224,9 @@ func (e *Engine) Submit(r Request) error {
 	if r.Source == SourceNRF && offset <= 0 {
 		return errors.New("nrf sample would not advance clock")
 	}
+	if r.Source == SourceGPS && q.Source == "ntp" && q.External && q.AgeNS >= 0 && q.AgeNS <= int64(sampleMaxAge) && q.UncertaintySeconds >= 0 && math.Abs(q.ResidualSeconds)+q.UncertaintySeconds <= 5 && math.Abs(offset) > math.Abs(q.ResidualSeconds)+q.UncertaintySeconds+float64(r.UncertaintyNS)/float64(time.Second) {
+		return errors.New("GPS sample disagrees with trusted NTP")
+	}
 	if math.Abs(offset) > float64(100*365*24*time.Hour/time.Second) {
 		return errors.New("implausible sample offset")
 	}
@@ -226,6 +235,22 @@ func (e *Engine) Submit(r Request) error {
 	}
 	e.samples[r.Source] = sample{r.ReceiptBootNS, r.SampleAgeNS, r.UncertaintyNS}
 	return nil
+}
+
+// After a clock-loss resume, tracking age must place the measurement after
+// resume, rather than merely appearing fresh against the frozen wall clock.
+func (e *Engine) externalObservationFresh(t Tracking, bt time.Duration) bool {
+	if e.state.ExternalAfterBoot == 0 {
+		return true
+	}
+	if int64(bt) <= e.state.ExternalAfterBoot {
+		return false
+	}
+	if t.Source == SourceGPS {
+		sample, ok := e.samples[SourceGPS]
+		return ok && sample.receipt > e.state.ExternalAfterBoot
+	}
+	return t.Source == "ntp" && t.Age >= 0 && int64(t.Age) < int64(bt)-e.state.ExternalAfterBoot
 }
 func (e *Engine) refresh(ctx context.Context) {
 	e.mu.Lock()
@@ -270,8 +295,13 @@ func (e *Engine) refresh(ctx context.Context) {
 		}
 		t.Uncertainty += float64(s.uncertainty) / float64(time.Second)
 	}
+	if t.External && !e.externalObservationFresh(t, bt) {
+		e.quality = Quality{Source: "unknown"}
+		return
+	}
 	if t.External && t.Age <= sampleMaxAge && math.Abs(t.Residual)+t.Uncertainty <= 5 && !e.state.ExternalEstablished {
 		e.state.ExternalEstablished = true
+		e.state.ExternalAfterBoot = 0
 		if e.save() != nil {
 			e.quality = Quality{Source: "unknown"}
 			return
@@ -451,6 +481,8 @@ func (e *Engine) Resume(boot string, generation uint64) error {
 	e.state.Preparing = false
 	e.state.Generation++
 	if loss > int64(2*time.Second) {
+		e.state.ExternalEstablished = false
+		e.state.ExternalAfterBoot = int64(bt)
 		e.state.Episode = "resume"
 		e.state.Deadline = int64(bt + episodeWindow)
 		e.state.Outcome = "available"

@@ -147,12 +147,12 @@ Configure chrony to create these three SOCK refclocks in `/run/chrony` (or the
 
 ```
 refclock SOCK /run/chrony/nrf.sock refid NRF1 precision 1 poll 0 filter 1 minsamples 1 maxsamples 1
-refclock SOCK /run/chrony/gps.sock refid GPS1 precision 1 poll 0 filter 1 minsamples 1 maxsamples 1
+refclock SOCK /run/chrony/gps.sock refid GPS1 precision 4 poll 0 filter 1 minsamples 1 maxsamples 1
 refclock SOCK /run/chrony/user.sock refid USR1 precision 1 poll 0 filter 1 minsamples 1 maxsamples 1
 ```
 
-SOCK has no per-sample uncertainty field. The one-second configured precision
-is a conservative floor for the accepted producer uncertainty. The packet uses
+SOCK has no per-sample uncertainty field. The configured precision must cover the producer uncertainty. GPS allows up to
+three seconds, so its example uses four seconds. Other producers allow one second. The packet uses
 the native Linux timeval layout; this assumes chronyd uses the native ABI of
 its process (32-bit timeval on ARMv7 and 64-bit timeval on 64-bit Linux).
 
@@ -168,8 +168,9 @@ fields are rejected. The response contains `ok`, optional `error`, and `quality`
   `preparing`, `nrf_eligible`, and `nrf_deadline_boot_ns`. Eligibility is a
   snapshot of recovery admission;
   a later submission is rechecked against the deadline and current state.
-  Established external time disables nRF recovery for the rest of the boot,
-  including coordinator restarts. `external` identifies a selected NTP or GPS source, not an
+  Established external time disables nRF recovery across ordinary restarts and
+  no-loss resume. A resume with detected wall-clock loss opens a new recovery
+  generation; pre-resume tracking cannot re-establish external trust. `external` identifies a selected NTP or GPS source, not an
   unconditional trust assertion. NTP classification also checks the selected
   peer's reference ID using `chronyc ntpdata`, excluding local references.
   Consumers must check age, residual and
@@ -185,7 +186,7 @@ fields are rejected. The response contains `ok`, optional `error`, and `quality`
   The coordinator adds
   subsequent CLOCK_BOOTTIME elapsed time. Both age fields include suspend;
   samples older than 30 seconds, future receipt times, old boot/generation
-  tokens and uncertainties over one second are rejected. GPS must not be a
+  tokens and uncertainties over one second (three seconds for GPS) are rejected. GPS must not be a
   fallback value derived from the system clock. A successful submission means
   the datagram was delivered, not that chronyd selected the source. User and
   nRF samples are holdover, never external confirmation.

@@ -469,7 +469,7 @@ func TestNRFExternalEstablishmentSurvivesRestartAndResume(t *testing.T) {
 	if err = restarted.Prepare(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	c.advance(0, 10*time.Second)
+	c.advance(10*time.Second, 10*time.Second)
 	if err = restarted.Resume("boot", 1); err != nil {
 		t.Fatal(err)
 	}
@@ -534,5 +534,113 @@ func TestGPSSelectionInvalidatesPendingNRFSample(t *testing.T) {
 	}
 	if ref.calls != 1 || e.Status().NRFEligible {
 		t.Fatal("GPS not latched")
+	}
+}
+
+func TestGPSUncertaintyAndNTPDisagreement(t *testing.T) {
+	e, c, ch, ref, _ := newTestEngine(t)
+	now, bt, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceGPS, UTCUnixNS: now.Add(2 * time.Second).UnixNano(), ReceiptBootNS: int64(bt), UncertaintyNS: int64(3 * time.Second)}
+	if err := e.Submit(r); err != nil {
+		t.Fatalf("bounded GPS uncertainty: %v", err)
+	}
+	r.UncertaintyNS = int64(3*time.Second) + 1
+	if err := e.Submit(r); err == nil {
+		t.Fatal("excess uncertainty accepted")
+	}
+	r.UncertaintyNS = int64(2 * time.Second)
+	ch.mu.Lock()
+	ch.t = Tracking{Source: "ntp", External: true, Age: time.Second, Residual: .1, Uncertainty: .1, Valid: true}
+	ch.mu.Unlock()
+	e.refresh(context.Background())
+	r.UTCUnixNS = now.Add(20 * time.Second).UnixNano()
+	if err := e.Submit(r); err == nil {
+		t.Fatal("GPS disagreement with trusted NTP accepted")
+	}
+	if ref.calls != 1 {
+		t.Fatalf("refclock writes: %d", ref.calls)
+	}
+}
+
+func TestNRFRecoveryAfterExternallySyncedClockLosesSuspendTime(t *testing.T) {
+	e, c, ch, ref, path := newTestEngine(t)
+	ch.t.Residual = .01
+	e.refresh(context.Background())
+	if e.Status().NRFEligible {
+		t.Fatal("external fence missing")
+	}
+	if err := e.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(0, 2*time.Hour)
+	if err := e.Resume("boot", 1); err != nil {
+		t.Fatal(err)
+	}
+	// A pre-suspend chrony reading that appears recent must not reestablish trust.
+	ch.t.Age = time.Second
+	e.refresh(context.Background())
+	if !e.Status().NRFEligible || e.Status().External {
+		t.Fatalf("stale tracking fenced recovery: %+v", e.Status())
+	}
+	restarted, err := NewEngine(path, "boot", c, ch, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, bt, _ := c.Now()
+	now, _, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 2, Source: SourceNRF, UTCUnixNS: now.Add(2 * time.Hour).UnixNano(), ReceiptBootNS: int64(bt)}
+	if err := restarted.Submit(r); err != nil {
+		t.Fatalf("nrf recovery: %v", err)
+	}
+	ch.mu.Lock()
+	ch.t = Tracking{Source: SourceNRF, Age: 0, Residual: .1, Uncertainty: .1, Valid: true}
+	ch.mu.Unlock()
+	restarted.refresh(context.Background())
+	if q := restarted.Status(); q.Source != SourceNRF || q.External {
+		t.Fatalf("wrong holdover: %+v", q)
+	}
+}
+func TestResumeExternalRequiresPostResumeObservation(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	ch.t.Residual = .01
+	e.refresh(context.Background())
+	if err := e.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(0, time.Hour)
+	if err := e.Resume("boot", 1); err != nil {
+		t.Fatal(err)
+	}
+	c.advance(3*time.Second, 3*time.Second)
+	ch.mu.Lock()
+	ch.t.Age = 4 * time.Second
+	ch.mu.Unlock()
+	e.refresh(context.Background())
+	if !e.Status().NRFEligible {
+		t.Fatal("pre-sleep observation accepted")
+	}
+	ch.mu.Lock()
+	ch.t.Age = time.Second
+	ch.mu.Unlock()
+	e.refresh(context.Background())
+	if e.Status().NRFEligible || !e.Status().External {
+		t.Fatal("new external observation not accepted")
+	}
+}
+
+func TestGPSOnlyOfflineConvergesFromSelectedQuality(t *testing.T) {
+	e, c, ch, _, _ := newTestEngine(t)
+	now, bt, _ := c.Now()
+	r := Request{BootID: "boot", Generation: 1, Source: SourceGPS, UTCUnixNS: now.Add(time.Second).UnixNano(), ReceiptBootNS: int64(bt), UncertaintyNS: int64(2 * time.Second)}
+	if err := e.Submit(r); err != nil {
+		t.Fatal(err)
+	}
+	ch.mu.Lock()
+	ch.t = Tracking{Source: SourceGPS, External: true, Age: 0, Residual: .1, Uncertainty: .1, Valid: true}
+	ch.mu.Unlock()
+	e.refresh(context.Background())
+	q := e.Status()
+	if q.Source != "gps" || !q.External || q.UncertaintySeconds < 2 {
+		t.Fatalf("GPS quality: %+v", q)
 	}
 }
