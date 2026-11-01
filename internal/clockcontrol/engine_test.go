@@ -883,7 +883,7 @@ func TestUnknownNRFStepReconcilesAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.advance(11*time.Second, 11*time.Second)
-	ch.t.Residual = .01
+	ch.t = Tracking{Valid: false}
 	restarted.refresh(context.Background())
 	if q := restarted.Status(); q.Outcome != "reconciled" || ch.count() != 1 {
 		t.Fatal(q, ch.count())

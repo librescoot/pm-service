@@ -207,7 +207,8 @@ is `unknown`; it is never blindly retried. A fresh tracking observation after
 at least ten seconds, residual below 0.1 seconds and uncertainty below five
 seconds reconciles it. A single-shot nRF or user observation can also reconcile
 within its sample lifetime when the observed wall-clock movement matches the
-persisted dispatched correction and chrony reports the same source converged.
+persisted dispatched correction and the original sample evidence still matches.
+This also works after chrony has stopped selecting the one-shot source.
 Neither case retries the consumed command. A single late external episode per boot is possible after
 an earlier deadline for a fresh large external residual. A separate one-time
 late network-holdover episode permits offline DBC recovery before external time

@@ -35,6 +35,7 @@ type state struct {
 	DispatchUTC          int64                      `json:"dispatch_utc_ns"`
 	DispatchResidual     float64                    `json:"dispatch_residual_seconds"`
 	DispatchSource       string                     `json:"dispatch_source"`
+	DispatchSample       persistedSample            `json:"dispatch_sample"`
 	Samples              map[string]persistedSample `json:"samples,omitempty"`
 }
 type sample struct {
@@ -303,6 +304,23 @@ func (e *Engine) refresh(ctx context.Context) {
 		return
 	}
 	e.qualityBoot = bt
+	// A one-shot refclock can disappear from chrony's selected sources before
+	// the unknown-outcome wait expires. The observed wall/BOOTTIME movement
+	// can still establish that the admitted correction was applied.
+	if e.state.Outcome == "unknown" && (e.state.DispatchSource == SourceNRF || e.state.DispatchSource == SourceUser) && e.state.DispatchUTC != 0 && int64(bt)-e.state.DispatchBoot >= int64(10*time.Second) {
+		if s, ok := e.samples[e.state.DispatchSource]; ok && (persistedSample{s.receipt, s.age, s.uncertainty}) == e.state.DispatchSample && int64(bt) >= s.receipt && int64(bt)-s.receipt <= int64(sampleMaxAge)-s.age {
+			wallElapsed := now.Sub(time.Unix(0, e.state.DispatchUTC)).Seconds()
+			bootElapsed := time.Duration(int64(bt) - e.state.DispatchBoot).Seconds()
+			if math.Abs(wallElapsed-bootElapsed-e.state.DispatchResidual) < 0.1 {
+				e.state.Outcome = "reconciled"
+				if e.save() != nil {
+					e.state.Outcome = "unknown"
+					e.quality = Quality{Source: "unknown"}
+					return
+				}
+			}
+		}
+	}
 	if err == nil {
 		t.Age += bt - startBoot
 	}
@@ -349,14 +367,8 @@ func (e *Engine) refresh(ctx context.Context) {
 		}
 	}
 	e.quality = Quality{Source: t.Source, External: t.External, AgeNS: int64(t.Age), ResidualSeconds: t.Residual, UncertaintySeconds: t.Uncertainty}
-	holdoverReconciled := false
-	if (t.Source == SourceNRF || t.Source == SourceUser) && t.Source == e.state.DispatchSource && e.state.DispatchUTC != 0 && int64(bt) >= e.state.DispatchBoot && t.Age <= sampleMaxAge {
-		wallElapsed := now.Sub(time.Unix(0, e.state.DispatchUTC)).Seconds()
-		bootElapsed := time.Duration(int64(bt) - e.state.DispatchBoot).Seconds()
-		holdoverReconciled = math.Abs(wallElapsed-bootElapsed-e.state.DispatchResidual) < 1
-	}
 	freshReconciled := t.Source != "local" && t.Age < 5*time.Second && t.Uncertainty < 5
-	if e.state.Outcome == "unknown" && int64(bt)-e.state.DispatchBoot >= int64(10*time.Second) && math.Abs(t.Residual) < 0.1 && (freshReconciled || holdoverReconciled) {
+	if e.state.Outcome == "unknown" && int64(bt)-e.state.DispatchBoot >= int64(10*time.Second) && math.Abs(t.Residual) < 0.1 && freshReconciled {
 		e.state.Outcome = "reconciled"
 		if e.save() != nil {
 			e.state.Outcome = "unknown"
@@ -402,6 +414,10 @@ func (e *Engine) refresh(ctx context.Context) {
 	e.state.DispatchUTC = now.UnixNano()
 	e.state.DispatchResidual = t.Residual
 	e.state.DispatchSource = t.Source
+	e.state.DispatchSample = persistedSample{}
+	if s, ok := e.samples[t.Source]; ok {
+		e.state.DispatchSample = persistedSample{s.receipt, s.age, s.uncertainty}
+	}
 	if e.save() != nil {
 		e.state = old
 		return
