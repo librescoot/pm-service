@@ -24,7 +24,7 @@ The service consumes list commands from `scooter:power`:
 
 Explicit `hibernate`, `hibernate-manual`, and `hibernate-for:<seconds>` requests are accepted only in `parked` or `stand-by`. Ordinary explicit requests use the manual-hibernation priority. From `parked`, PM records the intent and asks vehicle-service to prepare a graceful shutdown; actual power-off still requires `stand-by`. Timed preparation preserves its duration and requires the nRF to echo that duration. No GPS fix or wall-clock synchronization is needed for a relative timed request.
 
-`hibernate-auto`, the idle timer, reserve-power protection, and scheduled hibernation do not initiate vehicle locking. Scheduled hibernation retains its clock-validity gate and deferred wake-by deadline.
+`hibernate-auto`, the idle timer, reserve-power protection, and scheduled hibernation do not initiate vehicle locking. Scheduled hibernation waits for external time validation after PM starts, then trusts the clock as long as it keeps pace with elapsed boot time. Normal NTP polling intervals, loss of GPS or network access, and an unavailable clock coordinator do not revoke that calendar trust. A clock that falls behind elapsed boot time by more than two minutes, including time lost during suspend, requires revalidation. Deferred hibernation keeps its original wake-by deadline.
 
 Vehicle preparation uses `scooter:state` command `prepare-hibernate:<request-id>` and a matching `power-manager[hibernate-request-id]`. Vehicle rejection reports `hibernate-preparation-failed:<request-id>` on `scooter:power`. Preparation times out after 30 seconds. Cancellation, shutdown interruption, and PM restart invalidate outstanding preparation; cancellation also disarms the wake timer and does not unlock the vehicle.
 

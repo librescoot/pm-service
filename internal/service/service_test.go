@@ -288,6 +288,44 @@ func TestBootElapsed(t *testing.T) {
 	}
 }
 
+func TestClockValidWithoutFreshTimeSource(t *testing.T) {
+	oldSocket := clockSocket
+	clockSocket = filepath.Join(t.TempDir(), "unavailable-coordinator.sock")
+	t.Cleanup(func() { clockSocket = oldSocket })
+
+	for _, tc := range []struct {
+		name       string
+		validated  bool
+		wallPassed time.Duration
+		bootPassed time.Duration
+		want       bool
+	}{
+		{name: "unvalidated boot", wallPassed: time.Hour, bootPassed: time.Hour},
+		{name: "between NTP polls", validated: true, wallPassed: 15 * time.Minute, bootPassed: 15 * time.Minute, want: true},
+		{name: "offline overnight", validated: true, wallPassed: 12 * time.Hour, bootPassed: 12 * time.Hour, want: true},
+		{name: "offline for a week", validated: true, wallPassed: 7 * 24 * time.Hour, bootPassed: 7 * 24 * time.Hour, want: true},
+		{name: "clock advances through suspend", validated: true, wallPassed: 2 * time.Hour, bootPassed: 2 * time.Hour, want: true},
+		{name: "clock freezes through suspend", validated: true, bootPassed: 2 * time.Hour},
+		{name: "clock steps backward", validated: true, wallPassed: -time.Hour, bootPassed: time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const initialBoot = time.Minute
+			s := &Service{
+				logger: log.New(io.Discard, "", 0),
+				bootElapsedFn: func() (time.Duration, error) {
+					return initialBoot + tc.bootPassed, nil
+				},
+			}
+			if tc.validated {
+				s.clockGuard.mark(time.Now().Add(-tc.wallPassed), initialBoot)
+			}
+			if got := s.clockValid(); got != tc.want {
+				t.Fatalf("clockValid() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestClockValidUnreadableBootTime(t *testing.T) {
 	s := &Service{
 		logger:        log.New(io.Discard, "", 0),

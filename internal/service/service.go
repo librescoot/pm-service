@@ -2575,16 +2575,13 @@ func (s *Service) bootElapsed() (time.Duration, error) {
 	return s.bootElapsedFn()
 }
 
-// clockValid reports whether the wall clock is still consistent with elapsed
-// boot time. A read failure is treated as invalid so a scheduled hibernation is
-// not dispatched on an unverified clock.
+// clockValid retains calendar trust after external validation while the wall
+// clock keeps pace with boot time. NTP poll intervals and loss of GPS or network
+// access must not expire that trust; actual time loss still requires revalidation.
 func (s *Service) clockValid() bool {
 	boot, err := s.bootElapsed()
 	if err != nil {
 		s.logger.Printf("Cannot read boot time for clock guard: %v; suppressing scheduled hibernation", err)
-		return false
-	}
-	if _, err := currentClockQuality(); err != nil {
 		return false
 	}
 	return s.clockGuard.valid(time.Now(), boot)
