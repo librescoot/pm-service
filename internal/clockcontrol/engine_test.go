@@ -1081,3 +1081,52 @@ func TestNRFDispatchAfterLostTimeAndExternalChangeDuringDispatch(t *testing.T) {
 	ch.done <- nil
 	waitOutcome(t, e, "completed")
 }
+
+type countingChrony struct {
+	fakeChrony
+	calls int
+}
+
+func (c *countingChrony) Tracking(ctx context.Context, now time.Time) (Tracking, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return c.fakeChrony.Tracking(ctx, now)
+}
+
+// Quality is refreshed on request and shared by a burst of requests; nothing
+// queries chrony in between.
+func TestRefreshIfStaleSharesOneChronyQuery(t *testing.T) {
+	engine, clock, chrony, _, _ := newTestEngine(t)
+	counter := &countingChrony{fakeChrony: fakeChrony{t: chrony.t}}
+	engine.chrony = counter
+	ctx := context.Background()
+
+	engine.RefreshIfStale(ctx, time.Second)
+	engine.RefreshIfStale(ctx, time.Second)
+	clock.advance(500*time.Millisecond, 500*time.Millisecond)
+	engine.RefreshIfStale(ctx, time.Second)
+	if counter.calls != 1 {
+		t.Fatalf("chrony queried %d times within the window, want 1", counter.calls)
+	}
+	clock.advance(time.Second, time.Second)
+	engine.RefreshIfStale(ctx, time.Second)
+	if counter.calls != 2 {
+		t.Fatalf("stale sample not refreshed: %d queries", counter.calls)
+	}
+}
+
+func TestRunDoesNotPollChrony(t *testing.T) {
+	engine, _, chrony, _, _ := newTestEngine(t)
+	counter := &countingChrony{fakeChrony: fakeChrony{t: chrony.t}}
+	engine.chrony = counter
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { engine.Run(ctx); close(done) }()
+	time.Sleep(2500 * time.Millisecond)
+	cancel()
+	<-done
+	if counter.calls != 1 {
+		t.Fatalf("Run queried chrony %d times in 2.5s, want only the initial sample", counter.calls)
+	}
+}

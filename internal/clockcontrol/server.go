@@ -14,6 +14,9 @@ import (
 
 const MaxRequest = 4096
 
+// statusMaxAge is how old the chrony sample in a status response may be.
+const statusMaxAge = 2 * time.Second
+
 func Serve(ctx context.Context, path string, e *Engine) error {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -80,6 +83,7 @@ func handle(c net.Conn, e *Engine) {
 			err = errors.New("unknown operation")
 		}
 	}
+	e.RefreshIfStale(context.Background(), statusMaxAge)
 	out := Response{OK: err == nil, Quality: e.Status()}
 	if err != nil {
 		out.Error = err.Error()

@@ -58,6 +58,12 @@ type Engine struct {
 	quality     Quality
 	qualityBoot time.Duration
 	inFlight    chan struct{}
+
+	// refreshMu serializes quality refreshes; lastRefresh is the BOOTTIME of the
+	// last one, so a burst of requests shares a single chrony query.
+	refreshMu   sync.Mutex
+	lastRefresh time.Duration
+	refreshed   bool
 }
 
 func persist(path string, s state) error {
@@ -466,16 +472,26 @@ func (e *Engine) refresh(ctx context.Context) {
 		e.inFlight = nil
 	}()
 }
+// Run takes the initial quality sample and then idles. Quality is refreshed
+// when a request asks for it, not on a timer: nothing consumes it between
+// requests, and each chrony query is a process start.
 func (e *Engine) Run(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		e.refresh(ctx)
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
+	e.RefreshIfStale(ctx, 0)
+	<-ctx.Done()
+}
+
+// RefreshIfStale re-reads chrony's tracking state unless it was read less than
+// maxAge ago.
+func (e *Engine) RefreshIfStale(ctx context.Context, maxAge time.Duration) {
+	e.refreshMu.Lock()
+	defer e.refreshMu.Unlock()
+	_, bt, err := e.clock.Now()
+	if err == nil && e.refreshed && bt >= e.lastRefresh && bt-e.lastRefresh < maxAge {
+		return
+	}
+	e.refresh(ctx)
+	if err == nil {
+		e.lastRefresh, e.refreshed = bt, true
 	}
 }
 func (e *Engine) Prepare(ctx context.Context) error {
