@@ -15,6 +15,7 @@ import (
 const episodeWindow = 90 * time.Second
 const sampleMaxAge = 30 * time.Second
 const commandTimeout = 3 * time.Second
+const recoveryPollInterval = 5 * time.Second
 
 type state struct {
 	BootID               string                     `json:"boot_id"`
@@ -472,12 +473,43 @@ func (e *Engine) refresh(ctx context.Context) {
 		e.inFlight = nil
 	}()
 }
-// Run takes the initial quality sample and then idles. Quality is refreshed
-// when a request asks for it, not on a timer: nothing consumes it between
-// requests, and each chrony query is a process start.
+
+// Run refreshes chrony while an external time source has not yet established
+// the clock. This covers sources that become reachable after startup waits end.
 func (e *Engine) Run(ctx context.Context) {
+	e.run(ctx, recoveryPollInterval)
+}
+
+func (e *Engine) run(ctx context.Context, interval time.Duration) {
 	e.RefreshIfStale(ctx, 0)
-	<-ctx.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if e.recoveryRefreshNeeded() {
+				e.RefreshIfStale(ctx, 0)
+			}
+		}
+	}
+}
+
+func (e *Engine) recoveryRefreshNeeded() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.state.Preparing || e.state.Outcome == "in-flight" {
+		return false
+	}
+	if e.state.Outcome == "unknown" {
+		return true
+	}
+	if e.state.ExternalEstablished {
+		return false
+	}
+	_, bt, err := e.clock.Now()
+	return err == nil && int64(bt) < e.state.Deadline
 }
 
 // RefreshIfStale re-reads chrony's tracking state unless it was read less than

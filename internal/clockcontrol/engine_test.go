@@ -1094,8 +1094,7 @@ func (c *countingChrony) Tracking(ctx context.Context, now time.Time) (Tracking,
 	return c.fakeChrony.Tracking(ctx, now)
 }
 
-// Quality is refreshed on request and shared by a burst of requests; nothing
-// queries chrony in between.
+// Quality is refreshed on request and shared by a burst of requests.
 func TestRefreshIfStaleSharesOneChronyQuery(t *testing.T) {
 	engine, clock, chrony, _, _ := newTestEngine(t)
 	counter := &countingChrony{fakeChrony: fakeChrony{t: chrony.t}}
@@ -1116,17 +1115,75 @@ func TestRefreshIfStaleSharesOneChronyQuery(t *testing.T) {
 	}
 }
 
-func TestRunDoesNotPollChrony(t *testing.T) {
-	engine, _, chrony, _, _ := newTestEngine(t)
-	counter := &countingChrony{fakeChrony: fakeChrony{t: chrony.t}}
+func TestRunPollsUntilLateExternalSourceAppears(t *testing.T) {
+	engine, _, _, _, _ := newTestEngine(t)
+	counter := &countingChrony{}
+	counter.t = Tracking{Source: "unknown"}
+	counter.done = make(chan error, 1)
 	engine.chrony = counter
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { engine.Run(ctx); close(done) }()
-	time.Sleep(2500 * time.Millisecond)
+	go func() { engine.run(ctx, 10*time.Millisecond); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		counter.mu.Lock()
+		calls := counter.calls
+		counter.mu.Unlock()
+		if calls >= 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	counter.mu.Lock()
+	if counter.calls < 2 {
+		counter.mu.Unlock()
+		t.Fatal("coordinator did not retry chrony after the initial unavailable sample")
+	}
+	counter.t = Tracking{Source: "ntp", External: true, Age: time.Second, Residual: 10, Uncertainty: .1, Valid: true}
+	counter.mu.Unlock()
+	waitOutcome(t, engine, "in-flight")
+	counter.done <- nil
+	waitOutcome(t, engine, "completed")
+}
+
+func TestRunStopsPollingAfterExternalTimeIsEstablished(t *testing.T) {
+	engine, _, chrony, _, _ := newTestEngine(t)
+	chrony.t.Residual = .01
+	counter := &countingChrony{}
+	counter.t = chrony.t
+	engine.chrony = counter
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { engine.run(ctx, 10*time.Millisecond); close(done) }()
+	time.Sleep(50 * time.Millisecond)
 	cancel()
 	<-done
-	if counter.calls != 1 {
-		t.Fatalf("Run queried chrony %d times in 2.5s, want only the initial sample", counter.calls)
+	counter.mu.Lock()
+	calls := counter.calls
+	counter.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("Run queried chrony %d times after external time was established, want only the initial sample", calls)
+	}
+}
+
+func TestRunStopsPollingAfterRecoveryWindow(t *testing.T) {
+	engine, clock, _, _, _ := newTestEngine(t)
+	counter := &countingChrony{}
+	counter.t = Tracking{Source: "unknown"}
+	engine.chrony = counter
+	clock.advance(episodeWindow+time.Second, episodeWindow+time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { engine.run(ctx, 10*time.Millisecond); close(done) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	<-done
+	counter.mu.Lock()
+	calls := counter.calls
+	counter.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("Run queried chrony %d times after the recovery window, want only the initial sample", calls)
 	}
 }
